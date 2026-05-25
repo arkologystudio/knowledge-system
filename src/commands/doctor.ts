@@ -566,6 +566,12 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // v0.41 Bug 2 / Eng D8 — subagent_health surfaces rate-lease pressure to the operator.
   checks.push(await checkSubagentHealth(engine));
 
+  // v0.41.2.1 — embedding_env_override (cross-surface parity with
+  // buildChecks). Surfaces when GBRAIN_EMBEDDING_* env vars disagree
+  // with DB config; closes the silent-override class that caused the
+  // 716K-chunk damage incident from PR #1421's description.
+  checks.push(await checkEmbeddingEnvOverride(engine));
+
   // v0.31.12 subagent runtime enforcement (Layer 3 of 3 — Codex F13).
   // The subagent loop is Anthropic-only. If models.tier.subagent or
   // models.default is explicitly set to a non-Anthropic provider, warn here
@@ -1816,6 +1822,75 @@ export async function checkEvalDrift(engine: BrainEngine): Promise<Check> {
  * the loop at runtime. This check makes the configuration drift visible
  * before a job is submitted.
  */
+
+/**
+ * v0.41.2.1 — embedding_env_override (D9 #9). Defense-in-depth for the
+ * ze-switch env-override class (the 716K-chunk damage incident from
+ * PR #1421's description).
+ *
+ * GBRAIN_EMBEDDING_MODEL / GBRAIN_EMBEDDING_DIMENSIONS win over DB+file
+ * config in loadConfig(). When env disagrees with DB, the gateway embeds
+ * with the env-selected model — even after ze-switch wrote a different
+ * value to DB. This check surfaces that disagreement on every hourly
+ * doctor run so users can spot the drift before the embed sweep corrupts
+ * vectors at the wrong width.
+ *
+ * Uses Check.details (NOT Check.issues, which has a different schema)
+ * so the structured `mismatches[]` payload is consumable by monitoring
+ * pipelines without ad-hoc type widening.
+ *
+ * Cross-surface parity: wired into BOTH buildChecks() and
+ * doctorReportRemote() — operators running thin-client doctor against
+ * a remote brain see the server's env, which is the env that matters
+ * for the embed pipeline running there.
+ */
+async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Check> {
+  const envModel = process.env.GBRAIN_EMBEDDING_MODEL?.trim();
+  const envDim = process.env.GBRAIN_EMBEDDING_DIMENSIONS?.trim();
+  if (!envModel && !envDim) {
+    return {
+      name: 'embedding_env_override',
+      status: 'ok',
+      message: 'no embedding env overrides set',
+    };
+  }
+  let dbModel: string | null = null;
+  let dbDim: string | null = null;
+  try {
+    dbModel = await engine.getConfig('embedding_model');
+    dbDim = await engine.getConfig('embedding_dimensions');
+  } catch (err) {
+    return {
+      name: 'embedding_env_override',
+      status: 'warn',
+      message: `couldn't read DB config to compare env: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  const mismatches: Array<{ key: string; env: string; db: string }> = [];
+  if (envModel && dbModel && envModel !== dbModel) {
+    mismatches.push({ key: 'GBRAIN_EMBEDDING_MODEL', env: envModel, db: dbModel });
+  }
+  if (envDim && dbDim && envDim !== dbDim) {
+    mismatches.push({ key: 'GBRAIN_EMBEDDING_DIMENSIONS', env: envDim, db: dbDim });
+  }
+  if (mismatches.length === 0) {
+    return {
+      name: 'embedding_env_override',
+      status: 'ok',
+      message: 'env vars agree with DB config',
+    };
+  }
+  return {
+    name: 'embedding_env_override',
+    status: 'warn',
+    message:
+      `${mismatches.length} embedding env var(s) disagree with DB config (env wins at runtime). ` +
+      `Fix: \`unset ${mismatches.map((m) => m.key).join(' ')}\` in your shell profile / .env, ` +
+      `or update DB config to match.`,
+    details: { mismatches },
+  };
+}
+
 async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
   try {
     const { classifyCapabilities } = await import('../core/ai/capabilities.ts');
@@ -3454,6 +3529,14 @@ export async function buildChecks(
       message: `Could not check embedding column registry: ${(err as Error).message}`,
     });
   }
+
+  // 8b. v0.41.2.1 embedding_env_override (D9 #9 — uses Check.details, NOT
+  //     Check.issues). Defense in depth for users who bypass ze-switch
+  //     entirely; surfaces on every hourly doctor run when env disagrees
+  //     with DB config. Mirrored in doctorReportRemote() via the shared
+  //     checkEmbeddingEnvOverride() helper.
+  progress.heartbeat('embedding_env_override');
+  checks.push(await checkEmbeddingEnvOverride(engine));
 
   // 9. Graph health (link + timeline coverage on entity pages).
   // dead_links removed in v0.10.1: ON DELETE CASCADE on link FKs makes it always 0.

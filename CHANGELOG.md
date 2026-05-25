@@ -2,6 +2,120 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.10.1] - 2026-05-25
+
+**Background sweeps stop silently losing rows, `dream.*` config you set actually reaches the cycle, and switching embedding providers won't quietly corrupt your brain when env vars override the switch.** Three production reliability fixes landed in one wave, rebuilt from three closed community PRs (#1414, #1416, #1421 from `@garrytan-agents`) with structural improvements from `/plan-eng-review` + codex outside-voice review.
+
+You can now configure `dream.synthesize.session_corpus_dir` (and 6 other dream.* keys) via `gbrain config set` and have it actually reach the cycle phase that reads it. Pre-fix the cycle silently skipped with "no transcripts to process" even though the config wrote successfully to the DB. The `extract` and `sync` commands now retry batched inserts once on transient PgBouncer connection drops instead of losing the whole batch — closes a ~30% data-loss rate observed on 96K-page brains during heavy cycles. And `gbrain ze-switch` now refuses to start a schema transition when `GBRAIN_EMBEDDING_MODEL` is pinned to a model that disagrees with the target, instead of silently corrupting 716K chunks the way the original incident did.
+
+To turn it on: `gbrain upgrade`.
+
+What you'd see in a concrete example.
+
+- **Before:** Set `dream.synthesize.session_corpus_dir /Users/me/transcripts` via `gbrain config set`. Run `gbrain dream --phase extract_atoms`. It skips with "no transcripts to process" — config never reached the phase because `extract-atoms.ts` read via file-plane-only `loadConfig()`, not `loadConfigWithEngine(engine)`.
+- **After:** Same setup, the phase actually walks the directory.
+
+- **Before:** Run `gbrain extract all` on a brain hitting PgBouncer pool recycles. ~30% of batched inserts throw "No database connection: connect() has not been called" and silently drop 100 rows each — visible in stderr but easy to miss in a long run.
+- **After:** Same setup, transient connection errors trigger one 500ms retry. Stderr shows `[extract.links_fs] connection blip, retrying 100 rows in 500ms (Connection terminated unexpectedly)` and the retry succeeds. Snapshot-before-clear contract means the retry sends the same data even if the producer wrote more during the delay.
+
+- **Before:** `GBRAIN_EMBEDDING_MODEL=openai:text-embedding-3-large gbrain ze-switch --non-interactive --force`. Schema migrates to 2560-dim ZE columns. Embed sweep reads env, embeds with OpenAI's 1536-dim model, writes 1536d vectors into 2560d columns. Brain corrupts.
+- **After:** Same command refuses pre-apply with an ASCII warning box: schema not mutated, paste-ready `unset GBRAIN_EMBEDDING_MODEL` command surfaced. Apply with `--ignore-env-override` if you really mean it. The gate fires on `--resume` too, so there's no bypass path.
+
+Things to know about. **(1)** Idempotency upgrade for `extract_atoms`. The phase now checks "do any atoms already exist for this content hash?" before calling Haiku, replacing the date-stamped slug that caused duplicate atoms when re-discovered on a new day. Page-side and transcript-side both covered. Re-running the cycle on unchanged content produces zero new atoms; the original incident is closed. **(2)** Known limitation: if Haiku writes atom 1 of 3 then atom 2 throws, source-hash filter sees atom 1 exists and skips on next discovery — atoms 2+3 stay missing until content changes. Documented in TODOS.md as a v0.42+ per-atom idempotency follow-up. Rare in practice. **(3)** A new `embedding_env_override` doctor check runs every doctor pass: surfaces when `GBRAIN_EMBEDDING_MODEL` / `GBRAIN_EMBEDDING_DIMENSIONS` disagree with DB config so users see the drift before the embed sweep corrupts vectors. Wired into both local doctor and the HTTP MCP doctor surface.
+
+What we caught and fixed before merging. Codex outside-voice review caught 10 real correctness gaps in the plan:
+- `extract-atoms` was calling `engine.putPage(slug, page)` without sourceId — on non-default brain sources, atoms always wrote to `default` and the NOT EXISTS idempotency check became ineffective. Fixed: sourceId threaded through every putPage call.
+- The original `ze-switch` env-gate placement (post-apply warning) would have shipped the same 716K-chunk damage class. Fixed: gate fires BEFORE the snapshot write at line ~294, not just before runSchemaTransition at ~304. Test asserts ZERO setConfig calls fire on a refused apply.
+- `resumeRetrievalUpgrade` would have been a bypass path. Fixed: same gate on resume.
+- Discovery SQL would have crashed on pages with NULL content_hash. Fixed: `AND p.content_hash IS NOT NULL` filter added.
+- Discovery would have chewed its own dream-generated output. Fixed: `AND COALESCE(p.frontmatter->>'dream_generated', '') <> 'true'` filter.
+- cycle.ts was passing `affectedSlugs = syncPagesAffected` only, missing pages just-written by the synthesize phase in the same cycle. Fixed: union of sync + synthesize affected slugs.
+- `ApplyResult` and `Check.issues` tagged unions/types needed extending to handle the new `refused` variant and `details.mismatches[]` shape. Fixed: typed properly.
+- The plan's "env wins for dream.*" claim was false — there are no GBRAIN_DREAM_* env vars. Fixed: dropped the false claim; precedence is `file > DB > defaults`.
+
+### Itemized changes
+
+**Phase 1: systemic dream.\* DB-config merge (`src/core/config.ts`)**
+
+- `loadConfigWithEngine()` sparse-merge block extended with 7 `dream.*` keys: `dream.synthesize.{session_corpus_dir, meeting_transcripts_dir, verdict_model, max_prompt_tokens, max_chunks_per_transcript}` + `dream.patterns.{lookback_days, min_evidence}`.
+- Precedence: file > DB > defaults per key. Parent objects (`cfg.dream`, `cfg.dream.synthesize`, `cfg.dream.patterns`) allocated defensively before assigning leaf keys.
+- Invalid DB int values fall back to "DB miss" (no throw).
+- `GBrainConfig` interface gains `dream?:` typed shape so consumers get TypeScript-level safety.
+
+**Phase 2: batch withRetry (`src/commands/extract.ts`, `src/core/retry-matcher.ts`)**
+
+- New exported pure primitive `withRetry<T>(fn, {onRetry?, delayMs?})` — single retry, 500ms default delay. Test seam via `delayMs: 0`.
+- New `logBatchRetry(label, snapshotLen, err, jsonMode)` helper shared across 6 flush sites.
+- All 6 `flush()` sites in `extract.ts` (lines ~519, 531, 614, 672, 840, 994) converted to `snapshot.slice()` BEFORE `batch.length = 0`. Error messages read `snapshot.length`, not the post-clear batch length.
+- Classifier is the existing `isRetryableConnError` from `src/core/retry-matcher.ts`. Extended in this wave with `GBrainError{problem: 'No database connection'}` typed shape recognition + the literal "No database connection" message pattern (closes the specific shape from PR #1416's reported incident).
+
+**Phase 3: extract_atoms idempotency + page discovery (`src/core/cycle/extract-atoms.ts`, `src/core/cycle.ts`)**
+
+- Source-hash existence check before LLM call replaces date-stamped slug as idempotency mechanism. Survives `gbrain sync --force` re-imports.
+- New `discoverExtractablePages(engine, sourceId, affectedSlugs?)` runs ONE raw SQL query with NOT EXISTS subquery: discovers extractable pages (6 types: meeting, source, article, video, book, original) AND filters already-extracted in one round-trip. Replaces the 6-listPages + per-candidate atom-check pattern that would have made ~56 queries per cycle.
+- SQL filters: `source_id`, `type = ANY($::text[])`, `deleted_at IS NULL`, `content_hash IS NOT NULL`, `imported_from <> 'markdown-greenfield'`, `dream_generated <> 'true'`, `length(compiled_truth) >= MIN`, optional `slug = ANY($::text[])` for affectedSlugs, NOT EXISTS atom with matching source_hash.
+- Transcript-side idempotency: `atomsExistForHash(engine, sourceId, contentHash16)` — closes the pre-existing v0.41.2.0 date-stamp duplicate bug for transcripts.
+- `sourceId` threaded through every `engine.putPage(slug, page, {sourceId})` call so atoms land in the correct source on federated brains.
+- New `_pages` test seam mirrors `_transcripts` shape. `_pages: undefined` triggers discovery; `_pages: []` deliberately suppresses.
+- `PhaseResult.details` extended with additive fields: `pages_processed`, `pages_total`, `pages_skipped_budget`, `duplicates_skipped`. All existing fields preserved (regression-tested).
+- `cycle.ts` passes union of `syncPagesAffected + synthesizeWrittenSlugs` as `affectedSlugs` to `runPhaseExtractAtoms`.
+
+**Phase 4: ze-switch pre-apply + pre-resume env-override gate (`src/core/retrieval-upgrade-planner.ts`, `src/commands/ze-switch.ts`, `src/core/retrieval-upgrade-prompt.ts`)**
+
+- New pure exports `detectEnvOverride(targetModel, targetDim, env?)` and `formatEnvOverrideWarning(warning)`. ASCII box (no Unicode per repo D10), line width ≤78 cols, includes paste-ready `unset` command.
+- `ApplyResult` tagged union extended with `{status: 'refused', reason: 'env_override', warning}` variant. `ApplyOpts` interface adds `ignoreEnvOverride?: boolean`.
+- Gate fires FIRST in `applyRetrievalUpgrade` — BEFORE `setConfig(KEY_PREVIOUS_SNAPSHOT)`, BEFORE `runSchemaTransition`. Zero side effects on refusal. Pinned by test that asserts ZERO setConfig calls fire on refused apply.
+- Same gate fires FIRST in `resumeRetrievalUpgrade`. No bypass path.
+- CLI flag `--ignore-env-override` mirrors the existing `--ignore-missing-key` precedent. Loud stderr line when set.
+- Planner stays data-pure — returns the warning struct; CLI handles rendering. Interactive prompt path (`runRetrievalUpgradePrompt`) also handles the new variant gracefully.
+
+**Phase 5: doctor `embedding_env_override` check (`src/commands/doctor.ts`)**
+
+- New `checkEmbeddingEnvOverride(engine)` reads `process.env.GBRAIN_EMBEDDING_MODEL` and `GBRAIN_EMBEDDING_DIMENSIONS`, compares against DB config. Uses `Check.details.mismatches[]` (NOT `Check.issues` which has a different schema).
+- Wired into BOTH `buildChecks()` (local doctor) AND `doctorReportRemote()` (HTTP MCP doctor) per the cross-surface parity convention. Source-grep regression assertion pins both wirings.
+- Message includes paste-ready `unset GBRAIN_EMBEDDING_MODEL GBRAIN_EMBEDDING_DIMENSIONS` fix.
+
+**Test coverage:**
+
+- New `test/extract-batch-retry.test.ts` (16 cases) — withRetry primitive, GBrainError shape recognition, logBatchRetry, snapshot-mutation regression contract.
+- New `test/extract-atoms-page-discovery.test.ts` (17 cases, PGLite) — discovery SQL filters, NOT EXISTS idempotency, dual-source merge, transcript-side idempotency, sourceId threading.
+- New `test/ze-switch-env-override.test.ts` (17 cases, PGLite + withEnv) — pure helpers, applyRetrievalUpgrade integration with engine-setConfig-spy ZERO-mutation assertion, resumeRetrievalUpgrade parity.
+- New `test/doctor-embedding-env-override.test.ts` (7 cases, PGLite + withEnv) — all status branches + cross-surface parity source-grep.
+- New `test/e2e/extract-atoms-discovery-sql.test.ts` (4 cases, real Postgres) — D10 reversal: validates ANY($::text[]) + JSONB ->> + NOT EXISTS + substring through `postgres.unsafe` against real PG.
+- Extended `test/cycle/extract-atoms-synthesize-concepts.test.ts` — `_pages: []` added to all existing cases + 1 critical regression case (legacy PhaseResult.details fields byte-identical to v0.41.2.0 transcript-only path).
+- Extended `test/loadConfig-merge.test.ts` — 8 new dream.* parallel cases (DB merge, file-wins, parent allocation, invalid-int fallback, throw resilience).
+
+**Credit:** rebuilt from work originally proposed by @garrytan-agents in PRs #1414, #1416, #1421. The PR descriptions were the design source — the rebuild's structural improvements came from /plan-eng-review and codex outside-voice. Closes both bug classes (the reported PgBouncer batch loss and the documented 716K-chunk damage incident).
+
+## To take advantage of v0.41.10.1
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the wave's three fixes:**
+   ```bash
+   # dream.* config merge
+   gbrain config set dream.synthesize.session_corpus_dir /tmp/test
+   gbrain config get dream.synthesize.session_corpus_dir
+   # should print /tmp/test, not the file-plane default
+
+   # ze-switch env-override gate
+   GBRAIN_EMBEDDING_MODEL=openai:text-embedding-3-large gbrain ze-switch --non-interactive --force
+   # should refuse with the ASCII warning box, NOT mutate schema
+
+   # doctor surfaces env disagreement
+   GBRAIN_EMBEDDING_MODEL=openai:text-embedding-3-large gbrain doctor --fast | grep embedding_env_override
+   # should show: embedding_env_override: warn
+   ```
+3. **If anything fails or looks wrong,** file an issue at
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
 ## [0.41.10.0] - 2026-05-25
 
 **Your brain stops being mostly orphan pages.** A new `gbrain extract links --by-mention` pass scans every page's body text for mentions of people and companies you already have pages for, then creates links automatically. The same release also fixes a silent corruption bug in the dream-cycle chunker that could split UTF-16 surrogate pairs (emoji, non-BMP CJK, mathematical alphanumerics) at chunk boundaries, breaking the per-chunk idempotency key on retries.

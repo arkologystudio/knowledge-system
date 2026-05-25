@@ -29,6 +29,7 @@ import {
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { pathToSlug, pruneDir, isSyncable } from '../core/sync.ts';
+import { isRetryableConnError } from '../core/retry-matcher.ts';
 import { buildGazetteer, findMentionedEntities } from '../core/by-mention.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
@@ -37,6 +38,47 @@ import { buildGazetteer, findMentionedEntities } from '../core/by-mention.ts';
 // count but safe at any future schema width and keeps per-batch error blast radius
 // small (a malformed row aborts at most 100, not thousands).
 const BATCH_SIZE = 100;
+
+// v0.41.2.1 — batch-flush retry primitive (closes PR #1416's ~30% batch-loss
+// bug). PgBouncer transaction-mode poolers recycle backend connections between
+// queries; the next query through a stale handle throws a retryable connection
+// error. Single 500ms-delay retry catches the recycle without amplifying real
+// outages (second failure propagates). Non-retryable errors (constraint
+// violations, etc.) propagate immediately so log-and-continue semantics are
+// preserved.
+//
+// Pure primitive: callers compose `onRetry` for stderr UI; retry classification
+// uses the canonical `isRetryableConnError` from src/core/retry-matcher.ts so
+// PgBouncer/auth-race/tcp-reset shapes don't drift across the codebase.
+
+export interface WithRetryOpts {
+  onRetry?: (attempt: number, err: unknown) => void;
+  delayMs?: number; // default 500
+}
+
+export async function withRetry<T>(fn: () => Promise<T>, opts: WithRetryOpts = {}): Promise<T> {
+  try {
+    return await fn();
+  } catch (firstErr) {
+    if (!isRetryableConnError(firstErr)) throw firstErr;
+    opts.onRetry?.(1, firstErr);
+    await new Promise((r) => setTimeout(r, opts.delayMs ?? 500));
+    return await fn(); // single retry — second failure propagates
+  }
+}
+
+export function logBatchRetry(
+  label: string,
+  snapshotLen: number,
+  err: unknown,
+  jsonMode: boolean,
+): void {
+  if (jsonMode) return;
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(
+    `[${label}] connection blip, retrying ${snapshotLen} rows in 500ms (${msg})`,
+  );
+}
 
 // --- Types ---
 
@@ -559,25 +601,34 @@ async function extractForSlugs(
 
   async function flushLinks() {
     if (linkBatch.length === 0) return;
+    // Snapshot BEFORE clear so a producer pushing during the 500ms retry
+    // delay can't lose items on the second attempt. Error messages read
+    // snapshot.length (batch.length is 0 by the time the catch fires).
+    const snapshot = linkBatch.slice();
+    linkBatch.length = 0;
     try {
-      linksCreated += await engine.addLinksBatch(linkBatch); // gbrain-allow-direct-insert: gbrain extract command — canonical link reconciliation from markdown body
+      linksCreated += await withRetry(
+        () => engine.addLinksBatch(snapshot), // gbrain-allow-direct-insert: gbrain extract command — canonical link reconciliation from markdown body
+        { onRetry: (_a, err) => logBatchRetry('extract.links_inc', snapshot.length, err, jsonMode) },
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (!jsonMode) console.error(`  link batch error (${linkBatch.length} rows lost): ${msg}`);
-    } finally {
-      linkBatch.length = 0;
+      if (!jsonMode) console.error(`  link batch error (${snapshot.length} rows lost): ${msg}`);
     }
   }
 
   async function flushTimeline() {
     if (timelineBatch.length === 0) return;
+    const snapshot = timelineBatch.slice();
+    timelineBatch.length = 0;
     try {
-      timelineCreated += await engine.addTimelineEntriesBatch(timelineBatch);
+      timelineCreated += await withRetry(
+        () => engine.addTimelineEntriesBatch(snapshot),
+        { onRetry: (_a, err) => logBatchRetry('extract.timeline_inc', snapshot.length, err, jsonMode) },
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (!jsonMode) console.error(`  timeline batch error (${timelineBatch.length} rows lost): ${msg}`);
-    } finally {
-      timelineBatch.length = 0;
+      if (!jsonMode) console.error(`  timeline batch error (${snapshot.length} rows lost): ${msg}`);
     }
   }
 
@@ -654,17 +705,20 @@ async function extractLinksFromDir(
   const batch: LinkBatchInput[] = [];
   async function flush() {
     if (batch.length === 0) return;
+    const snapshot = batch.slice();
+    batch.length = 0;
     try {
-      created += await engine.addLinksBatch(batch); // gbrain-allow-direct-insert: gbrain extract command — canonical link reconciliation from markdown body
+      created += await withRetry(
+        () => engine.addLinksBatch(snapshot), // gbrain-allow-direct-insert: gbrain extract command — canonical link reconciliation from markdown body
+        { onRetry: (_a, err) => logBatchRetry('extract.links_fs', snapshot.length, err, jsonMode) },
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (jsonMode) {
-        process.stderr.write(JSON.stringify({ event: 'batch_error', size: batch.length, error: msg }) + '\n');
+        process.stderr.write(JSON.stringify({ event: 'batch_error', size: snapshot.length, error: msg }) + '\n');
       } else {
-        console.error(`  batch error (${batch.length} link rows lost): ${msg}`);
+        console.error(`  batch error (${snapshot.length} link rows lost): ${msg}`);
       }
-    } finally {
-      batch.length = 0;
     }
   }
 
@@ -712,17 +766,20 @@ async function extractTimelineFromDir(
   const batch: TimelineBatchInput[] = [];
   async function flush() {
     if (batch.length === 0) return;
+    const snapshot = batch.slice();
+    batch.length = 0;
     try {
-      created += await engine.addTimelineEntriesBatch(batch);
+      created += await withRetry(
+        () => engine.addTimelineEntriesBatch(snapshot),
+        { onRetry: (_a, err) => logBatchRetry('extract.timeline_fs', snapshot.length, err, jsonMode) },
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (jsonMode) {
-        process.stderr.write(JSON.stringify({ event: 'batch_error', size: batch.length, error: msg }) + '\n');
+        process.stderr.write(JSON.stringify({ event: 'batch_error', size: snapshot.length, error: msg }) + '\n');
       } else {
-        console.error(`  batch error (${batch.length} timeline rows lost): ${msg}`);
+        console.error(`  batch error (${snapshot.length} timeline rows lost): ${msg}`);
       }
-    } finally {
-      batch.length = 0;
     }
   }
 
@@ -880,17 +937,20 @@ async function extractLinksFromDB(
   const batch: LinkBatchInput[] = [];
   async function flush() {
     if (batch.length === 0) return;
+    const snapshot = batch.slice();
+    batch.length = 0;
     try {
-      created += await engine.addLinksBatch(batch); // gbrain-allow-direct-insert: gbrain extract command — canonical link reconciliation from markdown body
+      created += await withRetry(
+        () => engine.addLinksBatch(snapshot), // gbrain-allow-direct-insert: gbrain extract command — canonical link reconciliation from markdown body
+        { onRetry: (_a, err) => logBatchRetry('extract.links_db', snapshot.length, err, jsonMode) },
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (jsonMode) {
-        process.stderr.write(JSON.stringify({ event: 'batch_error', size: batch.length, error: msg }) + '\n');
+        process.stderr.write(JSON.stringify({ event: 'batch_error', size: snapshot.length, error: msg }) + '\n');
       } else {
-        console.error(`  batch error (${batch.length} link rows lost): ${msg}`);
+        console.error(`  batch error (${snapshot.length} link rows lost): ${msg}`);
       }
-    } finally {
-      batch.length = 0;
     }
   }
 
@@ -1034,17 +1094,20 @@ async function extractTimelineFromDB(
   const batch: TimelineBatchInput[] = [];
   async function flush() {
     if (batch.length === 0) return;
+    const snapshot = batch.slice();
+    batch.length = 0;
     try {
-      created += await engine.addTimelineEntriesBatch(batch);
+      created += await withRetry(
+        () => engine.addTimelineEntriesBatch(snapshot),
+        { onRetry: (_a, err) => logBatchRetry('extract.timeline_db', snapshot.length, err, jsonMode) },
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (jsonMode) {
-        process.stderr.write(JSON.stringify({ event: 'batch_error', size: batch.length, error: msg }) + '\n');
+        process.stderr.write(JSON.stringify({ event: 'batch_error', size: snapshot.length, error: msg }) + '\n');
       } else {
-        console.error(`  batch error (${batch.length} timeline rows lost): ${msg}`);
+        console.error(`  batch error (${snapshot.length} timeline rows lost): ${msg}`);
       }
-    } finally {
-      batch.length = 0;
     }
   }
 
