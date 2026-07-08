@@ -352,6 +352,17 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
   if (typeof row.source_id === 'string') {
     result.source_id = row.source_id;
   }
+  // Knowledge System T4 — content-class tag + artefact citation handle.
+  // Projected by the unified retrieval SQL (searchKeyword / searchKeywordChunks
+  // / searchVector). Left untouched when the column isn't in the projection so
+  // legacy / narrow SELECTs see undefined (renderers default to 'note').
+  if (row.content_class === 'note' || row.content_class === 'artifact') {
+    result.content_class = row.content_class;
+  }
+  if ('artifact_id' in row) {
+    const raw = row.artifact_id;
+    result.artifact_id = raw == null ? null : Number(raw);
+  }
   // v0.34: effective_date / effective_date_source carried through from the
   // pages join. Same three-state read as readOptionalDate elsewhere: the
   // field is left UNTOUCHED when the column isn't in the projection (so

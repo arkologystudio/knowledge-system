@@ -708,6 +708,23 @@ export interface SearchResult {
    */
   source_id?: string;
   /**
+   * Knowledge System T4 — content-class discriminator so one query returns
+   * curated NOTES (`pages`) and raw ARTEFACTS (`artifacts`, migration v123)
+   * in a single ranked space, each tagged. 'note' for page-backed chunks,
+   * 'artifact' for artefact-scoped chunks (`content_chunks.artifact_id` set,
+   * `page_id NULL`). Optional for back-compat with engines / code paths that
+   * don't project the column (renderers default to 'note' when absent).
+   */
+  content_class?: 'note' | 'artifact';
+  /**
+   * Knowledge System T4 — set on ARTEFACT results (`content_class === 'artifact'`)
+   * to the `artifacts.id` the chunk belongs to; the caller's citation handle for
+   * the artefact (the note side uses `slug`). Null/absent for note results.
+   * Artefacts also carry a synthetic `slug` (`artifact:<object_id>`) so the
+   * (source_id, slug) pooling/dedup/RRF keys treat each artefact distinctly.
+   */
+  artifact_id?: number | null;
+  /**
    * v0.34 — page-level effective_date (and its source) carried through from
    * the pages join. Format: YYYY-MM-DD (ISO date-only). Consumers (currently
    * the contradiction probe's date-aware judge prompt + date pre-filter)

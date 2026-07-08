@@ -54,7 +54,7 @@ import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
-import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte } from './search/sql-ranking.ts';
+import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, UNIFIED_SLUG_EXPR, UNIFIED_SOURCE_ID_EXPR, UNIFIED_TITLE_EXPR, UNIFIED_TYPE_EXPR, UNIFIED_EFFECTIVE_DATE_EXPR, CONTENT_CLASS_EXPR, UNIFIED_CONTENT_FROM_JOIN, UNIFIED_CONTENT_VALID_CLAUSE } from './search/sql-ranking.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -1541,12 +1541,18 @@ export class PGLiteEngine implements BrainEngine {
     const innerLimit = Math.min(limit * 3, MAX_SEARCH_LIMIT * 3);
 
     // Source-aware ranking (v0.22): see postgres-engine.ts for rationale.
+    // T4: built on the UNIFIED slug (COALESCE page/artefact) so artefact rows
+    // (NULL p.slug) get the neutral factor and — critically — are NOT dropped
+    // by the hard-exclude clause (a bare `p.slug LIKE ...` on NULL evaluates to
+    // NULL, and `AND NOT NULL` would silently exclude every artefact).
     const boostMap = resolveBoostMap();
-    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const sourceFactorCase = buildSourceFactorCase(UNIFIED_SLUG_EXPR, boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
-    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+    const hardExcludeClause = buildHardExcludeClause(UNIFIED_SLUG_EXPR, hardExcludePrefixes);
 
-    // v0.26.5: visibility filter (soft-deleted + archived-source).
+    // v0.26.5: visibility filter (soft-deleted + archived-source). Artefact
+    // rows null-join `p`, so `p.deleted_at IS NULL` / quarantine pass; the
+    // archived-source guard still applies via the COALESCE(source) join to `s`.
     const visibilityClause = buildVisibilityClause('p', 's');
 
     // v0.32.7: CJK query branch. PGLite uses websearch_to_tsquery('english')
@@ -1583,39 +1589,40 @@ export class PGLiteEngine implements BrainEngine {
     // got reimported). Same param shape as Postgres engine.
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) > $${params.length}::timestamptz`;
     }
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation. Array wins over scalar.
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
-      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+      extraFilter += ` AND ${UNIFIED_SOURCE_ID_EXPR} = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
-      extraFilter += ` AND p.source_id = $${params.length}`;
+      extraFilter += ` AND ${UNIFIED_SOURCE_ID_EXPR} = $${params.length}`;
     }
 
     const { rows } = await this.db.query(
       `WITH ranked AS (
          SELECT
-           p.slug, p.id as page_id, p.title, p.type, p.source_id,
-           p.effective_date, p.effective_date_source,
+           ${UNIFIED_SLUG_EXPR} AS slug, p.id as page_id, ${UNIFIED_TITLE_EXPR} AS title, ${UNIFIED_TYPE_EXPR} AS type, ${UNIFIED_SOURCE_ID_EXPR} AS source_id,
+           ${UNIFIED_EFFECTIVE_DATE_EXPR} AS effective_date, p.effective_date_source,
+           cc.artifact_id, ${CONTENT_CLASS_EXPR} AS content_class,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
            CASE WHEN p.updated_at < (
              SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
            ) THEN true ELSE false END AS stale
-         FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id
-         JOIN sources s ON s.id = p.source_id
+         ${UNIFIED_CONTENT_FROM_JOIN}
          WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
            -- v0.27.1: hide image rows from default text-keyword search so
            -- OCR text doesn't drown text-page hits. Image-similarity queries
            -- run a separate vector path on embedding_image.
            AND cc.modality = 'text'
+           -- T4: keep the old INNER-JOIN semantics (drop orphan chunks).
+           ${UNIFIED_CONTENT_VALID_CLAUSE}
          ORDER BY score DESC
          LIMIT $2
        ),
@@ -1686,19 +1693,19 @@ export class PGLiteEngine implements BrainEngine {
     }
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) > $${params.length}::timestamptz`;
     }
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation on the CJK fallback path.
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
-      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+      extraFilter += ` AND ${UNIFIED_SOURCE_ID_EXPR} = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
-      extraFilter += ` AND p.source_id = $${params.length}`;
+      extraFilter += ` AND ${UNIFIED_SOURCE_ID_EXPR} = $${params.length}`;
     }
 
     // Bigram-frequency count: count occurrences of $qRaw in chunk_text via
@@ -1715,18 +1722,18 @@ export class PGLiteEngine implements BrainEngine {
       const { rows } = await this.db.query(
         `WITH ranked AS (
            SELECT
-             p.slug, p.id as page_id, p.title, p.type, p.source_id,
-             p.effective_date, p.effective_date_source,
+             ${UNIFIED_SLUG_EXPR} AS slug, p.id as page_id, ${UNIFIED_TITLE_EXPR} AS title, ${UNIFIED_TYPE_EXPR} AS type, ${UNIFIED_SOURCE_ID_EXPR} AS source_id,
+             ${UNIFIED_EFFECTIVE_DATE_EXPR} AS effective_date, p.effective_date_source,
+             cc.artifact_id, ${CONTENT_CLASS_EXPR} AS content_class,
              cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
              ${scoreExpr} AS score,
              CASE WHEN p.updated_at < (
                SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
              ) THEN true ELSE false END AS stale
-           FROM content_chunks cc
-           JOIN pages p ON p.id = cc.page_id
-           JOIN sources s ON s.id = p.source_id
+           ${UNIFIED_CONTENT_FROM_JOIN}
            WHERE cc.chunk_text ILIKE '%' || $1 || '%' ESCAPE '\\' ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
              AND cc.modality = 'text'
+             ${UNIFIED_CONTENT_VALID_CLAUSE}
            ORDER BY score DESC
            LIMIT $3
          ),
@@ -1740,17 +1747,17 @@ export class PGLiteEngine implements BrainEngine {
     } else {
       const { rows } = await this.db.query(
         `SELECT
-           p.slug, p.id as page_id, p.title, p.type, p.source_id,
-           p.effective_date, p.effective_date_source,
+           ${UNIFIED_SLUG_EXPR} AS slug, p.id as page_id, ${UNIFIED_TITLE_EXPR} AS title, ${UNIFIED_TYPE_EXPR} AS type, ${UNIFIED_SOURCE_ID_EXPR} AS source_id,
+           ${UNIFIED_EFFECTIVE_DATE_EXPR} AS effective_date, p.effective_date_source,
+           cc.artifact_id, ${CONTENT_CLASS_EXPR} AS content_class,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            ${scoreExpr} AS score,
            CASE WHEN p.updated_at < (
              SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
            ) THEN true ELSE false END AS stale
-         FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id
-         JOIN sources s ON s.id = p.source_id
+         ${UNIFIED_CONTENT_FROM_JOIN}
          WHERE cc.chunk_text ILIKE '%' || $1 || '%' ESCAPE '\\' ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+           ${UNIFIED_CONTENT_VALID_CLAUSE}
          ORDER BY score DESC
          LIMIT $3 OFFSET $4`,
         params,
@@ -1782,10 +1789,11 @@ export class PGLiteEngine implements BrainEngine {
 
     // Source-aware ranking applied here too — searchKeywordChunks is the
     // chunk-grain anchor primitive that two-pass retrieval (Layer 7) uses.
+    // T4: unified slug (NULL-safe hard-exclude; see searchKeyword).
     const boostMap = resolveBoostMap();
-    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const sourceFactorCase = buildSourceFactorCase(UNIFIED_SLUG_EXPR, boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
-    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+    const hardExcludeClause = buildHardExcludeClause(UNIFIED_SLUG_EXPR, hardExcludePrefixes);
     const visibilityClause = buildVisibilityClause('p', 's');
 
     // v0.32.7: CJK branch (same as searchKeyword but without page-dedup).
@@ -1812,38 +1820,38 @@ export class PGLiteEngine implements BrainEngine {
     // v0.29.1 since/until parity (codex pass-1 #10).
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) > $${params.length}::timestamptz`;
     }
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation for the chunk-grain
     // anchor primitive. Layer 7 two-pass walks from these anchors so a
     // foreign-source anchor would let the walk leak into foreign neighbors.
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
-      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+      extraFilter += ` AND ${UNIFIED_SOURCE_ID_EXPR} = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
-      extraFilter += ` AND p.source_id = $${params.length}`;
+      extraFilter += ` AND ${UNIFIED_SOURCE_ID_EXPR} = $${params.length}`;
     }
 
     // visibilityClause already declared above (v0.32.7: hoisted so CJK branch can reuse).
 
     const { rows } = await this.db.query(
       `SELECT
-         p.slug, p.id as page_id, p.title, p.type, p.source_id,
-         p.effective_date, p.effective_date_source,
+         ${UNIFIED_SLUG_EXPR} AS slug, p.id as page_id, ${UNIFIED_TITLE_EXPR} AS title, ${UNIFIED_TYPE_EXPR} AS type, ${UNIFIED_SOURCE_ID_EXPR} AS source_id,
+         ${UNIFIED_EFFECTIVE_DATE_EXPR} AS effective_date, p.effective_date_source,
+         cc.artifact_id, ${CONTENT_CLASS_EXPR} AS content_class,
          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
          ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
          CASE WHEN p.updated_at < (
            SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
          ) THEN true ELSE false END AS stale
-       FROM content_chunks cc
-       JOIN pages p ON p.id = cc.page_id
-       JOIN sources s ON s.id = p.source_id
+       ${UNIFIED_CONTENT_FROM_JOIN}
        WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+         ${UNIFIED_CONTENT_VALID_CLAUSE}
        ORDER BY score DESC
        LIMIT $2 OFFSET $3`,
       params
@@ -1878,7 +1886,9 @@ export class PGLiteEngine implements BrainEngine {
     // `slug` resolves cleanly (T1 per-page pool restructure).
     const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
-    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+    // T4: hard-exclude runs INSIDE the inner CTE (p.slug not yet aliased), on the
+    // unified slug so NULL-slug artefact rows aren't dropped by `AND NOT (NULL …)`.
+    const hardExcludeClause = buildHardExcludeClause(UNIFIED_SLUG_EXPR, hardExcludePrefixes);
     const innerLimit = offset + Math.max(limit * 5, 100);
 
     const params: unknown[] = [vecStr, innerLimit, limit, offset];
@@ -1903,21 +1913,21 @@ export class PGLiteEngine implements BrainEngine {
     // pages — preserves pagination contract.
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) > $${params.length}::timestamptz`;
     }
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
     // so HNSW candidate pool narrows before re-rank. Mirrors postgres-engine
     // placement decision (codex flagged this during plan review).
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
-      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+      extraFilter += ` AND ${UNIFIED_SOURCE_ID_EXPR} = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
-      extraFilter += ` AND p.source_id = $${params.length}`;
+      extraFilter += ` AND ${UNIFIED_SOURCE_ID_EXPR} = $${params.length}`;
     }
 
     // v0.26.5: visibility filter applied in the inner CTE so HNSW sees the
@@ -1945,14 +1955,14 @@ export class PGLiteEngine implements BrainEngine {
     const { rows } = await this.db.query(
       `WITH hnsw_candidates AS (
          SELECT
-           p.slug, p.id as page_id, p.title, p.type, p.source_id, p.updated_at,
-           p.effective_date, p.effective_date_source,
+           ${UNIFIED_SLUG_EXPR} AS slug, p.id as page_id, ${UNIFIED_TITLE_EXPR} AS title, ${UNIFIED_TYPE_EXPR} AS type, ${UNIFIED_SOURCE_ID_EXPR} AS source_id, p.updated_at,
+           ${UNIFIED_EFFECTIVE_DATE_EXPR} AS effective_date, p.effective_date_source,
+           cc.artifact_id, ${CONTENT_CLASS_EXPR} AS content_class,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            1 - (cc.${col} <=> ${castSql}) AS raw_score
-         FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id
-         JOIN sources s ON s.id = p.source_id
+         ${UNIFIED_CONTENT_FROM_JOIN}
          WHERE cc.${col} IS NOT NULL ${modalityFilter} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+           ${UNIFIED_CONTENT_VALID_CLAUSE}
          ORDER BY cc.${col} <=> ${castSql}
          LIMIT $2
        ),
@@ -1969,6 +1979,7 @@ export class PGLiteEngine implements BrainEngine {
        SELECT
          bpp.slug, bpp.page_id, bpp.title, bpp.type, bpp.source_id,
          bpp.effective_date, bpp.effective_date_source,
+         bpp.artifact_id, bpp.content_class,
          bpp.chunk_id, bpp.chunk_index, bpp.chunk_text, bpp.chunk_source,
          bpp.score,
          CASE WHEN bpp.updated_at < (
@@ -2193,7 +2204,19 @@ export class PGLiteEngine implements BrainEngine {
     );
   }
 
-  async getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]> {
+  async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]> {
+    // Knowledge System T4: federated grant (sourceIds[]) wins over scalar
+    // sourceId; neither set falls back to 'default' (unchanged legacy path).
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      const { rows } = await this.db.query(
+        `SELECT cc.* FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+         WHERE p.slug = $1 AND p.source_id = ANY($2::text[])
+         ORDER BY cc.chunk_index`,
+        [slug, opts.sourceIds]
+      );
+      return (rows as Record<string, unknown>[]).map(r => rowToChunk(r));
+    }
     const sourceId = opts?.sourceId ?? 'default';
     const { rows } = await this.db.query(
       `SELECT cc.* FROM content_chunks cc

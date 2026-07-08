@@ -1450,7 +1450,7 @@ const search: Operation = {
       // agent-warning channel (hybridSearch stamps it; this branch bypasses
       // hybridSearch, so stamp explicitly). Fail-open inside the helper.
       await stampContentFlags(ctx.engine, results);
-      bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
+      bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
       return results;
     }
@@ -1467,7 +1467,7 @@ const search: Operation = {
       onMeta: (m) => { capturedMeta = m; },
     });
     const latency_ms = Date.now() - startedAt;
-    bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
+    bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
     return results;
   },
@@ -1676,7 +1676,7 @@ const query: Operation = {
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
     // search handler — fire-and-forget, internal callers bypass this path.
-    bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
+    bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)));
 
     // Op-layer capture (v0.25.0). Fire-and-forget. meta tells gbrain-evals
     // what hybridSearch *actually* did so replay can distinguish "with API
@@ -2613,7 +2613,12 @@ const get_chunks: Operation = {
   },
   handler: async (ctx, p) => {
     // v0.31.8 (D20): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    // Knowledge System T4: thread the full scope opts (sourceScopeOpts) rather
+    // than only scalar ctx.sourceId, so a federated-grant caller (allowedSources,
+    // no scalar sourceId) has its grant honored instead of falling closed to
+    // 'default'. Precedence is federated array > scalar > nothing — the same
+    // fail-closed ladder every other content-read op routes through.
+    const sourceOpts = sourceScopeOpts(ctx);
     return ctx.engine.getChunks(p.slug as string, sourceOpts);
   },
   scope: 'read',

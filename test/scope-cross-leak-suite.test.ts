@@ -25,28 +25,25 @@
  * cross-class regression harness the F4 "app-layer is sufficient for Phase 1"
  * decision rests on.
  *
- * ── ARTEFACT-CLASS FINDING (read before extending) ────────────────────────
- * The artefact class inherits scope enforcement STRUCTURALLY, not by an
- * artefact-specific filter: every chunk-content read path
- * (search/query → searchKeyword/hybridSearch) is `... FROM content_chunks cc
- * JOIN pages p ON p.id = cc.page_id ...` and scopes via `p.source_id`. Artefact
- * chunks have `page_id = NULL`, so the INNER JOIN drops them BEFORE any source
- * filter runs. And no read op addresses an artefact directly — get_page /
- * get_chunks / get_links / get_backlinks / traverse_graph / list_pages are all
- * page-/slug-/graph-keyed, and artefacts have no slug and are absent from
- * `pages` and `links`.
+ * ── ARTEFACT-CLASS SCOPE ENFORCEMENT (T4 — read before extending) ──────────
+ * T4 wired artefact chunks INTO the hybrid retrieval path. Every chunk-content
+ * read path (search/query → searchKeyword / searchKeywordChunks / searchVector,
+ * both engines) now scans `FROM content_chunks cc LEFT JOIN pages p ... LEFT
+ * JOIN artifacts a ...` and scopes on the UNIFIED source
+ * `COALESCE(p.source_id, a.source_id)`. So the artefact class inherits scope
+ * enforcement STRUCTURALLY — via `artifacts.source_id`, routed through the same
+ * fail-closed resolvers (sourceScopeOpts / resolveRequestedScope) as pages.
+ * Artefact chunks (`page_id = NULL`, `artifact_id` set) surface with a synthetic
+ * slug (`artifact:<object_id>`) + `content_class = 'artifact'` tag, ranked in
+ * ONE space alongside notes.
  *
- * Net: artefacts CANNOT leak across scope today — because artefact content is
- * not reachable through ANY current read op at all. Isolation therefore holds,
- * but VACUOUSLY: the "inherits the same enforcement via source_id" property is
- * not yet exercised for artefacts. That property goes live only when a future
- * task wires artefact chunks into retrieval (surfacing `page_id IS NULL` chunks
- * scoped via `artifacts.source_id` — a LEFT JOIN / UNION on the artefact side).
- * THAT wiring is the real future leak surface. The `retrieval-wiring TRIPWIRE`
- * block below fails loudly the day artefact chunks start surfacing, forcing the
- * next author to add positive + cross-scope isolation coverage on the artefact
- * source path. This is the precise gap reported to the conductor for separate
- * scoping — NOT a leak in shipped code.
+ * This suite therefore now exercises REAL, non-vacuous isolation: §4 proves B's
+ * artefact IS retrievable in its own scope, and §3 proves a scope-a caller still
+ * cannot reach it. get_chunks stays page-/slug-keyed (artefacts have no page
+ * slug), and its federated grant is now honored (T4 threads sourceScopeOpts).
+ * The pre-T4 "retrieval-wiring TRIPWIRE" (which asserted artefacts were
+ * unreachable) has been converted — NOT deleted — into §4's positive +
+ * cross-scope coverage.
  * ──────────────────────────────────────────────────────────────────────────
  */
 
@@ -250,9 +247,10 @@ describe('NOTE class — cross-scope isolation, all read paths (federated grant 
   });
 });
 
-// ── get_chunks is a scalar-source op (handler uses ctx.sourceId only). Cover
-//    both the scalar transport (enforced) and the federated grant (fails
-//    closed to 'default' — a functionality gap, documented, NOT a leak). ──
+// ── get_chunks is a source-scoped content-read op. T4 threads the full
+//    sourceScopeOpts (federated array > scalar > nothing) so BOTH the scalar
+//    transport AND the federated grant are honored — and both fail closed
+//    against foreign scopes. ──
 describe('NOTE class — get_chunks scope behaviour', () => {
   test('scalar scope-a: reads own chunks, denied B\'s chunks', async () => {
     const own = (await get_chunks.handler(scalar('scope-a'), { slug: 'a/secret-note' })) as any[];
@@ -261,15 +259,22 @@ describe('NOTE class — get_chunks scope behaviour', () => {
     expect(cross.length).toBe(0);
   });
 
-  test('federated grant [scope-a]: fails closed (defaults to \'default\'), never returns scope-b chunks', async () => {
-    // The handler threads only scalar ctx.sourceId; a federated caller has none,
-    // so the engine defaults to 'default'. This does NOT honor the grant for the
-    // caller's own pages (a functionality gap flagged for the conductor), but it
-    // fails CLOSED — no scope-b content leaks.
+  test('federated grant [scope-a]: honors the grant — reads own chunks, denied B\'s chunks', async () => {
+    // T4 fix: the handler now threads sourceScopeOpts(ctx), so a federated
+    // caller's allowedSources grant is honored (was: fell closed to 'default',
+    // returning nothing even for the caller's own pages). Still fails CLOSED
+    // against out-of-grant scopes — no scope-b content leaks.
     const cross = (await get_chunks.handler(fed(['scope-a']), { slug: 'b/secret-note' })) as any[];
     expect(cross.length).toBe(0);
     const ownViaFed = (await get_chunks.handler(fed(['scope-a']), { slug: 'a/secret-note' })) as any[];
-    expect(ownViaFed.length).toBe(0); // grant not honored here → own chunks not returned either (fail-closed)
+    expect(ownViaFed.length).toBeGreaterThan(0); // grant honored → own chunks returned
+  });
+
+  test('two-source grant [scope-a,scope-b]: reads either scope\'s chunks', async () => {
+    const a = (await get_chunks.handler(fed(['scope-a', 'scope-b']), { slug: 'a/secret-note' })) as any[];
+    const b = (await get_chunks.handler(fed(['scope-a', 'scope-b']), { slug: 'b/secret-note' })) as any[];
+    expect(a.length).toBeGreaterThan(0);
+    expect(b.length).toBeGreaterThan(0);
   });
 });
 
@@ -331,16 +336,20 @@ describe('scope widening — out-of-grant source_id is permission_denied', () =>
 // ══════════════════════════════════════════════════════════════════════════
 // 3. ARTEFACT class (T1 / v123) — cross-scope isolation on every read path.
 //    Confirms the artefact class does NOT bleed across scope through any op.
-//    (See the header FINDING: isolation currently holds because artefact
-//    content is unreachable by any read op, not because a per-op artefact
-//    filter runs.)
+//    T4 wired artefact chunks INTO the hybrid retrieval path (scoped via
+//    artifacts.source_id), so these are now REAL, exercised isolation tests:
+//    B's artefact IS retrievable-ready and reachable in-scope (§4), yet a
+//    scope-a caller must never see it here. (Pre-T4 this held vacuously because
+//    artefact content was unreachable by any read op at all.)
 // ══════════════════════════════════════════════════════════════════════════
 describe('ARTEFACT class — no cross-scope bleed through any read path', () => {
   test('search / query: A never surfaces B\'s artefact content', async () => {
     for (const caller of [fed(['scope-a']), scalar('scope-a')]) {
       const s = (await search.handler(caller, { query: B_ART })) as any[];
+      expect(s.every(r => r.source_id === 'scope-a')).toBe(true);
       expect(textBlob(s)).not.toContain(B_ART);
       const q = (await query.handler(caller, { query: B_ART, expand: false })) as any[];
+      expect(q.every(r => r.source_id === 'scope-a')).toBe(true);
       expect(textBlob(q)).not.toContain(B_ART);
     }
   });
@@ -363,31 +372,61 @@ describe('ARTEFACT class — no cross-scope bleed through any read path', () => 
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// 4. ARTEFACT retrieval-wiring TRIPWIRE (current-state confirm).
-//    Documents WHY §3's isolation currently holds: artefact chunks are not
-//    surfaced by ANY retrieval path (search/query INNER JOIN `pages`, and
-//    artefact chunks carry page_id = NULL). These assertions PASS today and
-//    MUST FAIL the day artefact retrieval is wired — at which point the author
-//    of that change replaces this block with positive + cross-scope isolation
-//    coverage over the artefact source path (scoped via artifacts.source_id).
+// 4. ARTEFACT retrieval (T4) — in-scope retrievable + content-class-tagged,
+//    cross-scope isolated. This block REPLACES the pre-T4 "retrieval-wiring
+//    TRIPWIRE": artefact chunks are now surfaced by search/query through the
+//    unified hybrid path (LEFT JOIN artifacts, scoped via artifacts.source_id),
+//    so the "inherits the same enforcement via source_id" property is now
+//    genuinely EXERCISED — positive in-scope retrieval below, cross-scope
+//    isolation in §3. Turning the tripwire GREEN by isolating, not deleting.
 // ══════════════════════════════════════════════════════════════════════════
-describe('ARTEFACT retrieval-wiring TRIPWIRE — artefact chunks not yet surfaced by retrieval', () => {
-  test('the artefact chunk IS fully FTS-indexed (so exclusion is the page-join, not a missing tsvector)', async () => {
+describe('ARTEFACT retrieval (T4) — surfaced in-scope, tagged, isolated', () => {
+  test('the artefact chunk IS fully FTS-indexed (retrieval-ready at the SQL layer)', async () => {
     const [row] = await engine.executeRaw<{ n: number }>(
       `SELECT count(*)::int AS n FROM content_chunks
         WHERE artifact_id IS NOT NULL
           AND search_vector @@ websearch_to_tsquery('english', $1)`,
       [A_ART],
     );
-    expect(row!.n).toBeGreaterThan(0); // artefact chunk is retrievable-ready at the SQL layer
+    expect(row!.n).toBeGreaterThan(0);
   });
 
-  test('yet the OWNER\'s own search/query returns NOTHING for its artefact term (retrieval not wired)', async () => {
-    // If EITHER of these starts returning results, artefact retrieval has landed:
-    //   → convert this block into scoped-artefact isolation tests (see header FINDING).
-    const ownerSearch = (await search.handler(scalar('scope-a'), { query: A_ART })) as any[];
-    expect(ownerSearch.length).toBe(0);
-    const ownerQuery = (await query.handler(scalar('scope-a'), { query: A_ART, expand: false })) as any[];
-    expect(ownerQuery.length).toBe(0);
+  test('OWNER\'s search/query NOW surfaces its own artefact, tagged content_class=artifact', async () => {
+    for (const caller of [scalar('scope-a'), fed(['scope-a'])]) {
+      const s = (await search.handler(caller, { query: A_ART })) as any[];
+      expect(s.length).toBeGreaterThan(0);
+      expect(textBlob(s)).toContain(A_ART);
+      const artHits = s.filter(r => r.content_class === 'artifact');
+      expect(artHits.length).toBeGreaterThan(0);
+      // Every artefact hit is scope-a's, carries its artifact_id + synthetic slug.
+      expect(artHits.every(r => r.source_id === 'scope-a')).toBe(true);
+      expect(artHits.every(r => typeof r.artifact_id === 'number')).toBe(true);
+      expect(artHits.every(r => typeof r.slug === 'string' && r.slug.startsWith('artifact:'))).toBe(true);
+
+      const q = (await query.handler(caller, { query: A_ART, expand: false })) as any[];
+      expect(q.length).toBeGreaterThan(0);
+      expect(q.some(r => r.content_class === 'artifact')).toBe(true);
+    }
+  });
+
+  test('cross-scope: A\'s search for B\'s artefact term returns nothing (real, exercised isolation)', async () => {
+    for (const caller of [scalar('scope-a'), fed(['scope-a'])]) {
+      const s = (await search.handler(caller, { query: B_ART })) as any[];
+      expect(s.some(r => r.content_class === 'artifact' && r.source_id !== 'scope-a')).toBe(false);
+      expect(textBlob(s)).not.toContain(B_ART);
+    }
+  });
+
+  test('unified space: a query matching BOTH classes returns notes AND artefacts, each tagged', async () => {
+    // SHARED appears in scope-a's note body AND its artefact body. One ranked
+    // query returns both classes, scoped to the caller, each tagged.
+    const rows = (await search.handler(fed(['scope-a']), { query: SHARED })) as any[];
+    expect(rows.every(r => r.source_id === 'scope-a')).toBe(true);
+    const classes = new Set(rows.map(r => r.content_class));
+    expect(classes.has('note')).toBe(true);
+    expect(classes.has('artifact')).toBe(true);
+    // No scope-b content in the unified list.
+    expect(textBlob(rows)).not.toContain(B_ART);
+    expect(textBlob(rows)).not.toContain(B_NOTE);
   });
 });
