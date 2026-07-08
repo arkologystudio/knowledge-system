@@ -963,8 +963,13 @@ export interface BrainEngine {
    * lookup; without it, multi-source brains return chunks from every
    * same-slug source (importCodeFile uses this for incremental embedding
    * reuse, which would then attach the wrong source's embeddings).
+   *
+   * Knowledge System T4: also accepts `opts.sourceIds` (federated grant,
+   * array-wins-over-scalar) so a remote OAuth caller carrying `allowedSources`
+   * has its grant honored instead of falling closed to 'default' — the op
+   * layer threads `sourceScopeOpts(ctx)` which may emit either shape.
    */
-  getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]>;
+  getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]>;
   /**
    * Count chunks across the brain where embedding IS NULL.
    * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain

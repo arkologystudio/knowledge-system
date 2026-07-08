@@ -62,7 +62,7 @@ import { ConnectionManager } from './connection-manager.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
-import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte } from './search/sql-ranking.ts';
+import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, UNIFIED_SLUG_EXPR, UNIFIED_SOURCE_ID_EXPR, UNIFIED_TITLE_EXPR, UNIFIED_TYPE_EXPR, UNIFIED_EFFECTIVE_DATE_EXPR, CONTENT_CLASS_EXPR, UNIFIED_CONTENT_FROM_JOIN, UNIFIED_CONTENT_VALID_CLAUSE } from './search/sql-ranking.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 
@@ -1569,9 +1569,9 @@ export class PostgresEngine implements BrainEngine {
     // so they never enter the candidate set. (archive/ is demoted, not
     // excluded — issue #1777.)
     const boostMap = resolveBoostMap();
-    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const sourceFactorCase = buildSourceFactorCase(UNIFIED_SLUG_EXPR, boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
-    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+    const hardExcludeClause = buildHardExcludeClause(UNIFIED_SLUG_EXPR, hardExcludePrefixes);
 
     const params: unknown[] = [query];
     let typeClause = '';
@@ -1589,7 +1589,7 @@ export class PostgresEngine implements BrainEngine {
     let excludeSlugsClause = '';
     if (excludeSlugs?.length) {
       params.push(excludeSlugs);
-      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+      excludeSlugsClause = `AND ${UNIFIED_SLUG_EXPR} != ALL($${params.length}::text[])`;
     }
     let languageClause = '';
     if (language) {
@@ -1605,12 +1605,12 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      afterDateClause = `AND COALESCE(p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) > $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation filter. When the
     // caller's auth scope is set, narrow the inner CTE candidate set so
@@ -1623,10 +1623,10 @@ export class PostgresEngine implements BrainEngine {
     let sourceClause = '';
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
-      sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
+      sourceClause = `AND ${UNIFIED_SOURCE_ID_EXPR} = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
-      sourceClause = `AND p.source_id = $${params.length}`;
+      sourceClause = `AND ${UNIFIED_SOURCE_ID_EXPR} = $${params.length}`;
     }
     params.push(innerLimit);
     const innerLimitParam = `$${params.length}`;
@@ -1644,13 +1644,12 @@ export class PostgresEngine implements BrainEngine {
     const rawQuery = `
       WITH ranked_chunks AS (
         SELECT
-          p.slug, p.id as page_id, p.title, p.type, p.source_id,
-          p.effective_date, p.effective_date_source,
+          ${UNIFIED_SLUG_EXPR} AS slug, p.id as page_id, ${UNIFIED_TITLE_EXPR} AS title, ${UNIFIED_TYPE_EXPR} AS type, ${UNIFIED_SOURCE_ID_EXPR} AS source_id,
+          ${UNIFIED_EFFECTIVE_DATE_EXPR} AS effective_date, p.effective_date_source,
+          cc.artifact_id, ${CONTENT_CLASS_EXPR} AS content_class,
           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
           ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score
-        FROM content_chunks cc
-        JOIN pages p ON p.id = cc.page_id
-        JOIN sources s ON s.id = p.source_id
+        ${UNIFIED_CONTENT_FROM_JOIN}
         WHERE cc.search_vector @@ websearch_to_tsquery('english', $1)
           ${typeClause}
           ${typesClause}
@@ -1667,12 +1666,15 @@ export class PostgresEngine implements BrainEngine {
           -- doesn't drown text-page hits. Image search runs a separate
           -- vector path on embedding_image.
           AND cc.modality = 'text'
+          -- T4: keep the old INNER-JOIN semantics (drop orphan chunks).
+          ${UNIFIED_CONTENT_VALID_CLAUSE}
         ORDER BY score DESC
         LIMIT ${innerLimitParam}
       ),
       ${buildBestPerPagePoolCte('ranked_chunks')}
       SELECT slug, page_id, title, type, source_id,
         effective_date, effective_date_source,
+        artifact_id, content_class,
         chunk_id, chunk_index, chunk_text, chunk_source, score,
         false AS stale
       FROM best_per_page
@@ -1718,9 +1720,9 @@ export class PostgresEngine implements BrainEngine {
     // so curated-vs-bulk dampening should affect the anchor pool. Same
     // detail-gate, same hard-exclude behavior as searchKeyword.
     const boostMap = resolveBoostMap();
-    const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
+    const sourceFactorCase = buildSourceFactorCase(UNIFIED_SLUG_EXPR, boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
-    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+    const hardExcludeClause = buildHardExcludeClause(UNIFIED_SLUG_EXPR, hardExcludePrefixes);
 
     const params: unknown[] = [query];
     let typeClause = '';
@@ -1738,7 +1740,7 @@ export class PostgresEngine implements BrainEngine {
     let excludeSlugsClause = '';
     if (excludeSlugs?.length) {
       params.push(excludeSlugs);
-      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+      excludeSlugsClause = `AND ${UNIFIED_SLUG_EXPR} != ALL($${params.length}::text[])`;
     }
     let languageClause = '';
     if (language) {
@@ -1754,12 +1756,12 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      afterDateClause = `AND COALESCE(p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) > $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation. Anchor primitive
     // for two-pass retrieval, so cross-source anchors would let the walk
@@ -1767,10 +1769,10 @@ export class PostgresEngine implements BrainEngine {
     let sourceClause = '';
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
-      sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
+      sourceClause = `AND ${UNIFIED_SOURCE_ID_EXPR} = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
-      sourceClause = `AND p.source_id = $${params.length}`;
+      sourceClause = `AND ${UNIFIED_SOURCE_ID_EXPR} = $${params.length}`;
     }
     params.push(limit);
     const limitParam = `$${params.length}`;
@@ -1782,15 +1784,15 @@ export class PostgresEngine implements BrainEngine {
 
     const rawQuery = `
       SELECT
-        p.slug, p.id as page_id, p.title, p.type, p.source_id,
-        p.effective_date, p.effective_date_source,
+        ${UNIFIED_SLUG_EXPR} AS slug, p.id as page_id, ${UNIFIED_TITLE_EXPR} AS title, ${UNIFIED_TYPE_EXPR} AS type, ${UNIFIED_SOURCE_ID_EXPR} AS source_id,
+        ${UNIFIED_EFFECTIVE_DATE_EXPR} AS effective_date, p.effective_date_source,
+        cc.artifact_id, ${CONTENT_CLASS_EXPR} AS content_class,
         cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
         ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
         false AS stale
-      FROM content_chunks cc
-      JOIN pages p ON p.id = cc.page_id
-      JOIN sources s ON s.id = p.source_id
+      ${UNIFIED_CONTENT_FROM_JOIN}
       WHERE cc.search_vector @@ websearch_to_tsquery('english', $1)
+        ${UNIFIED_CONTENT_VALID_CLAUSE}
         ${typeClause}
         ${typesClause}
         ${excludeSlugsClause}
@@ -1841,7 +1843,7 @@ export class PostgresEngine implements BrainEngine {
     const boostMap = resolveBoostMap();
     const sourceFactorCaseOnSlug = buildSourceFactorCase('slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
-    const hardExcludeClause = buildHardExcludeClause('p.slug', hardExcludePrefixes);
+    const hardExcludeClause = buildHardExcludeClause(UNIFIED_SLUG_EXPR, hardExcludePrefixes);
     const innerLimit = offset + Math.max(limit * 5, 100);
 
     const params: unknown[] = [vecStr];
@@ -1860,7 +1862,7 @@ export class PostgresEngine implements BrainEngine {
     let excludeSlugsClause = '';
     if (excludeSlugs?.length) {
       params.push(excludeSlugs);
-      excludeSlugsClause = `AND p.slug != ALL($${params.length}::text[])`;
+      excludeSlugsClause = `AND ${UNIFIED_SLUG_EXPR} != ALL($${params.length}::text[])`;
     }
     let languageClause = '';
     if (language) {
@@ -1876,12 +1878,12 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      afterDateClause = `AND COALESCE(p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) > $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at, a.valid_from, a.updated_at, a.created_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
     // specifically. Pushing the filter inside narrows the HNSW candidate set
@@ -1891,10 +1893,10 @@ export class PostgresEngine implements BrainEngine {
     let sourceClause = '';
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
-      sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
+      sourceClause = `AND ${UNIFIED_SOURCE_ID_EXPR} = ANY($${params.length}::text[])`;
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
-      sourceClause = `AND p.source_id = $${params.length}`;
+      sourceClause = `AND ${UNIFIED_SOURCE_ID_EXPR} = $${params.length}`;
     }
     params.push(innerLimit);
     const innerLimitParam = `$${params.length}`;
@@ -1932,13 +1934,12 @@ export class PostgresEngine implements BrainEngine {
     const rawQuery = `
       WITH hnsw_candidates AS (
         SELECT
-          p.slug, p.id as page_id, p.title, p.type, p.source_id,
-          p.effective_date, p.effective_date_source,
+          ${UNIFIED_SLUG_EXPR} AS slug, p.id as page_id, ${UNIFIED_TITLE_EXPR} AS title, ${UNIFIED_TYPE_EXPR} AS type, ${UNIFIED_SOURCE_ID_EXPR} AS source_id,
+          ${UNIFIED_EFFECTIVE_DATE_EXPR} AS effective_date, p.effective_date_source,
+          cc.artifact_id, ${CONTENT_CLASS_EXPR} AS content_class,
           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
           1 - (cc.${col} <=> ${castSql}) AS raw_score
-        FROM content_chunks cc
-        JOIN pages p ON p.id = cc.page_id
-        JOIN sources s ON s.id = p.source_id
+        ${UNIFIED_CONTENT_FROM_JOIN}
         WHERE cc.${col} IS NOT NULL ${modalityFilter}
           ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
           ${typeClause}
@@ -1951,6 +1952,8 @@ export class PostgresEngine implements BrainEngine {
           ${sourceClause}
           ${hardExcludeClause}
           ${visibilityClause}
+          -- T4: keep the old INNER-JOIN semantics (drop orphan chunks).
+          ${UNIFIED_CONTENT_VALID_CLAUSE}
         ORDER BY cc.${col} <=> ${castSql}
         LIMIT ${innerLimitParam}
       ),
@@ -1968,6 +1971,7 @@ export class PostgresEngine implements BrainEngine {
       SELECT
         slug, page_id, title, type, source_id,
         effective_date, effective_date_source,
+        artifact_id, content_class,
         chunk_id, chunk_index, chunk_text, chunk_source,
         score,
         false AS stale
@@ -2224,8 +2228,19 @@ export class PostgresEngine implements BrainEngine {
     );
   }
 
-  async getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]> {
+  async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Chunk[]> {
     const sql = this.sql;
+    // Knowledge System T4: federated grant (sourceIds[]) wins over scalar
+    // sourceId; neither set falls back to 'default' (unchanged legacy path).
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      const rows = await sql`
+        SELECT cc.* FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = ${slug} AND p.source_id = ANY(${opts.sourceIds})
+        ORDER BY cc.chunk_index
+      `;
+      return rows.map((r) => rowToChunk(r as Record<string, unknown>));
+    }
     const sourceId = opts?.sourceId ?? 'default';
     const rows = await sql`
       SELECT cc.* FROM content_chunks cc
