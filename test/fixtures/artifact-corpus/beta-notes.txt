@@ -1,0 +1,6 @@
+Beta Notes
+
+Plain text fixture with no markdown heading. The extractor should fall back to
+the first non-empty line as the title. This document exercises the text/plain
+branch of the plaintext extractor and lands as a separate raw artefact scoped
+to its source.

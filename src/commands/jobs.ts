@@ -1841,6 +1841,16 @@ export async function registerBuiltinHandlers(
   worker.register('ingest_capture', makeIngestCaptureHandler(engine));
 
   // ============================================================
+  // Knowledge System T2 — ingest_bulk handler. Deterministic bulk-artefact
+  // ingestion: walks a corpus, extracts (pluggable extractor), chunks + embeds
+  // @1536, and lands raw artefacts (T1 `artifacts` + artefact-scoped
+  // `content_chunks`, page_id NULL) with NO agent in the loop. Enqueued by the
+  // `submit_ingest` op.
+  // ============================================================
+  const { makeIngestBulkHandler } = await import('../core/minions/handlers/ingest-bulk.ts');
+  worker.register('ingest_bulk', makeIngestBulkHandler(engine));
+
+  // ============================================================
   // v0.36+ brain-health-100 wave: 11 new handlers for autonomous
   // remediation via `gbrain doctor --remediate` and autopilot.
   //
