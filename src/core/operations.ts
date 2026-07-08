@@ -2877,6 +2877,61 @@ const submit_job: Operation = {
   },
 };
 
+// Knowledge System T2 — deterministic bulk-artefact ingestion. Enqueues one
+// `ingest_bulk` job that walks a corpus directory, extracts (pluggable
+// extractor; `unstructured` off-box per fork F5), chunks + embeds @1536, and
+// lands raw artefacts (T1 `artifacts` + artefact-scoped `content_chunks`,
+// page_id NULL) with NO agent in the loop. Returns the job id; artefacts are
+// materialised on job completion.
+const submit_ingest: Operation = {
+  name: 'submit_ingest',
+  description:
+    'Bulk-ingest a directory of raw documents as deterministic artefacts (no agent per document). ' +
+    'Extract → chunk → embed @1536 → land raw-class chunks. Returns the queued job id.',
+  params: {
+    dir: { type: 'string', required: true, description: 'Corpus directory to walk (absolute path).' },
+    scope: { type: 'string', description: 'Source scope (source_id) the artefacts land under. Default: "default".' },
+    extractor: { type: 'string', description: 'Preferred extractor name (e.g. "unstructured" for off-box PDF/office extraction). Default: per-extension with a lean plaintext fallback.' },
+    kind: { type: 'string', description: 'Artefact kind discriminator stamped on every document (default: "document").' },
+    extensions: { type: 'array', items: { type: 'string' }, description: 'File extensions to include (incl. dot). Default: text formats the lean baseline reads without off-box tooling.' },
+    limit: { type: 'number', description: 'Cap the number of documents processed (staged testing).' },
+    dry_run: { type: 'boolean', description: 'Walk + extract but land nothing (count only).' },
+    no_embed: { type: 'boolean', description: 'Skip embedding; chunks land NULL-embedded for a later `embed --stale` pass.' },
+    queue: { type: 'string', description: 'Queue name (default: "default").' },
+    priority: { type: 'number', description: 'Priority (0 = highest, default: 0).' },
+  },
+  mutating: true,
+  scope: 'admin',
+  handler: async (ctx, p) => {
+    const dir = typeof p.dir === 'string' ? p.dir.trim() : '';
+    if (!dir) throw new OperationError('invalid_params', 'submit_ingest: `dir` (corpus directory) is required');
+
+    const scope = typeof p.scope === 'string' && p.scope.trim() ? p.scope.trim() : 'default';
+    if (ctx.dryRun) return { dry_run: true, action: 'submit_ingest', dir, scope };
+
+    const jobData: Record<string, unknown> = {
+      dir,
+      scope,
+      source_id: scope,
+      ...(typeof p.extractor === 'string' ? { extractor: p.extractor } : {}),
+      ...(typeof p.kind === 'string' ? { kind: p.kind } : {}),
+      ...(Array.isArray(p.extensions) ? { extensions: p.extensions } : {}),
+      ...(typeof p.limit === 'number' ? { limit: p.limit } : {}),
+      ...(p.dry_run === true ? { dry_run: true } : {}),
+      ...(p.no_embed === true ? { no_embed: true } : {}),
+    };
+
+    const { MinionQueue } = await import('./minions/queue.ts');
+    const queue = new MinionQueue(ctx.engine);
+    const job = await queue.add('ingest_bulk', jobData, {
+      queue: (p.queue as string) || 'default',
+      priority: (p.priority as number) || 0,
+      max_attempts: 3,
+    });
+    return job;
+  },
+};
+
 // v0.38 Slice 3 — D13 — remote-callable submit_agent with registration-time
 // binding enforcement. Distinct from `submit_job` because:
 //   1. It's the FIRST op that lets remote MCP callers spawn paid LLM work
@@ -5349,6 +5404,8 @@ export const operations: Operation[] = [
   // Jobs (Minions)
   submit_job, get_job, list_jobs, cancel_job, retry_job, get_job_progress,
   pause_job, resume_job, replay_job, send_job_message,
+  // Knowledge System T2: deterministic bulk-artefact ingestion
+  submit_ingest,
   // v0.38 Slice 3: remote-callable agent dispatch with OAuth-bound trust boundary
   submit_agent,
   // Orphans
