@@ -5505,6 +5505,168 @@ export const MIGRATIONS: Migration[] = [
         WHERE dimension IS NOT NULL;
     `,
   },
+  {
+    version: 123,
+    name: 'raw_artifact_class_chunk_decoupling',
+    // F6 (KEYSTONE — Knowledge System T1): decouple content_chunks from pages so
+    // raw artefacts can be embedded + retrieved WITHOUT an authored page — the
+    // enabler for tiered ingestion. Introduces the `artifacts` table (a raw
+    // document/content object scoped by source_id, analogous to habitat-KB's
+    // `Document`) and relaxes content_chunks so a chunk references a page XOR an
+    // artefact via a CHECK constraint. The existing `chunk_source` discriminator
+    // (schema-embedded.ts:305) is reused — no new discriminator invented.
+    //
+    // Absorbs T9 on the artefact object: `object_id` UUID (stable external id;
+    // pgcrypto/gen_random_uuid already enabled in schema.sql), `provenance`
+    // JSONB, and a `visibility` marker — mirroring the columns already on the
+    // Life Chronicle `facts` table (visibility + valid_from/valid_until, v40 /
+    // migrate.ts:2288). `sources.config` already carries the federation slot.
+    //
+    // Like `facts`, `artifacts` is migration-created (deliberately absent from
+    // the static src/schema.sql / schema-embedded.ts bootstrap), so THIS
+    // migration is the single source of the table for both fresh and migrated
+    // brains — same pattern as v40 and v122.
+    //
+    // N2 guard: `artifacts` is a separate table with NO `deleted_at` column, so
+    // the autopilot 72h soft-delete purge (engine.purgeDeletedPages → DELETE
+    // FROM pages …, cascading only to that page's chunks) structurally cannot
+    // reach it. Artefact-scoped chunks carry page_id = NULL and are never
+    // cascade-deleted by a page purge. Regression-guarded in
+    // test/migration-v123-artifacts.test.ts.
+    idempotent: true,
+    sql: `
+      -- ── artifacts: raw-artefact / document content class ──────────────
+      CREATE TABLE IF NOT EXISTS artifacts (
+        id            BIGSERIAL   PRIMARY KEY,
+        -- T9: stable external identity (pgcrypto gen_random_uuid, enabled in schema.sql)
+        object_id     UUID        NOT NULL DEFAULT gen_random_uuid(),
+        source_id     TEXT        NOT NULL DEFAULT 'default',
+        -- artefact class discriminator (document, transcript, pdf, webpage, …)
+        kind          TEXT        NOT NULL DEFAULT 'document',
+        title         TEXT,
+        -- external location / source reference (habitat-KB Document.fileId analog)
+        uri           TEXT,
+        -- revision key for the same uri (habitat-KB Document.revisionId analog)
+        revision_id   TEXT,
+        -- raw extracted text (habitat-KB Document.text analog)
+        content       TEXT,
+        content_hash  TEXT,
+        -- T9: where it came from + extractor metadata
+        provenance    JSONB       NOT NULL DEFAULT '{}'::jsonb,
+        -- facts mirror: remote-redaction marker
+        visibility    TEXT        NOT NULL DEFAULT 'private'
+                      CHECK (visibility IN ('private','world')),
+        -- facts mirror: bi-temporal validity window
+        valid_from    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        valid_until   TIMESTAMPTZ,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      -- FK to sources added via a guarded DO block (facts_source_id_fkey pattern:
+      -- an inline REFERENCES got silently dropped by postgres.js unsafe()'s
+      -- multi-statement path in the v0.31 e2e run; splitting it out is explicit
+      -- + idempotent).
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'artifacts_source_id_fkey'
+             AND conrelid = 'artifacts'::regclass
+        ) THEN
+          ALTER TABLE artifacts
+            ADD CONSTRAINT artifacts_source_id_fkey
+            FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE;
+        END IF;
+      END $$;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_object_id ON artifacts(object_id);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_source ON artifacts(source_id);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_source_hash
+        ON artifacts(source_id, content_hash) WHERE content_hash IS NOT NULL;
+
+      -- ── content_chunks: page XOR artefact ─────────────────────────────
+      -- Relax the page FK (was NOT NULL) and add a nullable artefact FK. Every
+      -- existing row has page_id set + artifact_id NULL, so the XOR CHECK below
+      -- is already satisfied for legacy data — no backfill required.
+      ALTER TABLE content_chunks ALTER COLUMN page_id DROP NOT NULL;
+      ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS artifact_id BIGINT;
+
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'content_chunks_artifact_id_fkey'
+             AND conrelid = 'content_chunks'::regclass
+        ) THEN
+          ALTER TABLE content_chunks
+            ADD CONSTRAINT content_chunks_artifact_id_fkey
+            FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE;
+        END IF;
+      END $$;
+
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'content_chunks_page_xor_artifact'
+             AND conrelid = 'content_chunks'::regclass
+        ) THEN
+          ALTER TABLE content_chunks
+            ADD CONSTRAINT content_chunks_page_xor_artifact
+            CHECK (
+              (page_id IS NOT NULL AND artifact_id IS NULL)
+              OR (page_id IS NULL AND artifact_id IS NOT NULL)
+            );
+        END IF;
+      END $$;
+
+      -- Artefact-scoped chunk lookups + per-artefact chunk-index uniqueness
+      -- (mirror of idx_chunks_page / idx_chunks_page_index for the page side).
+      CREATE INDEX IF NOT EXISTS idx_chunks_artifact
+        ON content_chunks(artifact_id) WHERE artifact_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_artifact_index
+        ON content_chunks(artifact_id, chunk_index) WHERE artifact_id IS NOT NULL;
+    `,
+    handler: async (engine) => {
+      // RLS on the new artifacts table when the role has BYPASSRLS — mirrors the
+      // src/schema.sql RLS block + the facts v40 pattern. Enabling RLS with no
+      // policies means the anon key can't read artefacts (secure by default);
+      // the app connects as a BYPASSRLS role which bypasses it. Postgres-only;
+      // PGLite has no RLS engine.
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(123, `
+          DO $$
+          DECLARE has_bypass BOOLEAN;
+          BEGIN
+            SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass;
+            IF has_bypass THEN
+              ALTER TABLE artifacts ENABLE ROW LEVEL SECURITY;
+            END IF;
+          END $$;
+        `);
+      }
+    },
+    verify: async (engine) => {
+      // Post-condition probe (D6): table, decoupling column, and XOR constraint
+      // must all exist after the migration claims to have applied. Portable
+      // across Postgres + PGLite (information_schema + pg_constraint).
+      const t = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM information_schema.tables
+          WHERE table_schema = 'public' AND table_name = 'artifacts'`,
+      );
+      if ((t[0]?.n ?? 0) === 0) return false;
+      const c = await engine.executeRaw<{ is_nullable: string }>(
+        `SELECT is_nullable FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'content_chunks'
+            AND column_name = 'page_id'`,
+      );
+      if (c[0]?.is_nullable !== 'YES') return false;
+      const x = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_constraint
+          WHERE conname = 'content_chunks_page_xor_artifact'
+            AND conrelid = 'content_chunks'::regclass`,
+      );
+      return (x[0]?.n ?? 0) > 0;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

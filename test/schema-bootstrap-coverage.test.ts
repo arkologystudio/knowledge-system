@@ -741,6 +741,17 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'facts.value',
   'facts.value_hash',
   'facts.dim_status',
+  // v0.42 (migration v123, F6 / Knowledge System T1) — content_chunks.artifact_id
+  // decouples chunks from pages (chunk references a page XOR an artefact). Same
+  // precedent as content_chunks.edges_backfilled_at: `content_chunks` is in the
+  // schema blob, but artifact_id has NO forward-reference index in
+  // PGLITE_SCHEMA_SQL — its partial indexes (idx_chunks_artifact,
+  // idx_chunks_artifact_index) and the content_chunks_page_xor_artifact CHECK all
+  // live INSIDE the v123 migration. Fresh installs replay the schema blob then
+  // v123 adds the column+constraint; old brains get both via the same migration.
+  // No downstream filter reads artifact_id yet (ingestion wiring is T2/T4), so
+  // NULL on old brains is invisible. Column-only, no bootstrap probe needed.
+  'content_chunks.artifact_id',
   // v0.39.1.0 (migration v88) — schema-pack provenance per-source captured as
   // inline canonical closure snapshot on every eval_candidates row. NULL by
   // default; no index in PGLITE_SCHEMA_SQL references it. Migration handles

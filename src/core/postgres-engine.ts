@@ -1096,6 +1096,11 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     // Clamp to non-negative integer; runaway purge protection. The DELETE
     // cascades through content_chunks, page_links, chunk_relations via FKs.
+    // N2 guard (v123): this DELETE targets `pages` only and cascades solely to a
+    // page's own chunks (page_id set). Raw artefacts live in the separate
+    // `artifacts` table (no deleted_at) and their chunks carry page_id = NULL, so
+    // the autopilot 72h purge structurally cannot reach them. Never widen this to
+    // sweep artifact-scoped chunks. Guarded by test/migration-v123-artifacts.test.ts.
     const hours = Math.max(0, Math.floor(olderThanHours));
     const rows = await sql`
       DELETE FROM pages
