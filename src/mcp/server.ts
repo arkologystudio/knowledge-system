@@ -5,7 +5,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
-import { dispatchToolCall, validateParams, buildOperationContext } from './dispatch.ts';
+import { dispatchToolCall, validateParams, buildOperationContext, buildStdioAuth } from './dispatch.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import {
@@ -33,6 +33,9 @@ export async function startMcpServer(engine: BrainEngine) {
   // The MCP SDK's response type widened in 1.29 to allow a managed-task wrapper;
   // gbrain ops are synchronous, so we return the legacy `{ content, isError? }`
   // shape and cast through `any` (the SDK accepts it via the ServerResult union).
+  // The single source this stdio pipe is scoped to. Same value the dispatch
+  // context already used for `sourceId`; now ALSO the pipe's read grant.
+  const stdioSourceId = process.env.GBRAIN_SOURCE || 'default';
   server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => {
     const { name, arguments: params } = request.params;
     // v0.28: stdio MCP has no per-token auth (local pipe). Default the
@@ -46,7 +49,16 @@ export async function startMcpServer(engine: BrainEngine) {
       // v0.31: source defaults to 'default' for stdio (no per-token scope).
       // Operators who want a different source on stdio MCP should set
       // GBRAIN_SOURCE in the env or use --source via `gbrain call`.
-      sourceId: process.env.GBRAIN_SOURCE || 'default',
+      sourceId: stdioSourceId,
+      // Thread an explicit synthetic principal for the stdio pipe. Fixes the
+      // ctx.auth transport bug: without this, `whoami` threw unknown_transport
+      // AND `resolveRequestedScope`'s out-of-grant guard was inert (a stdio
+      // caller could read any source_id it named). buildStdioAuth scopes the
+      // pipe to `stdioSourceId` via allowedSources (fail-closed) and gives
+      // whoami an honest `transport: 'stdio'` identity. `remote` stays true —
+      // the SSH gate authenticates the transport, but filesystem/escalation
+      // op-guards must still treat the agent behind the pipe as untrusted.
+      auth: buildStdioAuth(stdioSourceId),
       // v0.31 (eD3): _meta.brain_hot_memory injection so Claude Desktop /
       // Code see the brain's relevant hot memory automatically alongside
       // every tool-call response. Best-effort; absorbs errors.

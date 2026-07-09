@@ -228,6 +228,24 @@ export interface Logger {
   error(msg: string): void;
 }
 
+/**
+ * Sentinel `AuthInfo.clientId` for the local stdio MCP pipe (`gbrain serve`
+ * over an SSH-gated stdio transport — the production `knowledge-system-serve`
+ * shape). The stdio transport carries no per-principal OAuth/bearer credential
+ * (the SSH key is the transport-layer gate, outside this process), so it
+ * synthesises an AuthInfo with this clientId to (a) satisfy the fail-closed
+ * "every remote call site must populate ctx.auth" contract that `whoami`
+ * enforces, and (b) carry an explicit `allowedSources` grant so the read-scope
+ * resolver (`resolveRequestedScope`) is fail-closed on an out-of-grant
+ * `source_id` param instead of falling through to the scalar-floor model.
+ *
+ * Keyed as a distinct value (not `gbrain_cl_*`, not a legacy token name) so
+ * `whoami` reports an honest `transport: 'stdio'` shape rather than
+ * masquerading as an OAuth client or an `access_tokens` legacy token.
+ * Greppable single source of truth — see `buildStdioAuth` in src/mcp/dispatch.ts.
+ */
+export const STDIO_LOCAL_CLIENT_ID = 'stdio-local';
+
 export interface AuthInfo {
   token: string;
   clientId: string;
@@ -3724,9 +3742,10 @@ const get_recent_transcripts: Operation = {
 const whoami: Operation = {
   name: 'whoami',
   description:
-    'Introspect the calling identity. Returns one of three transport shapes: ' +
+    'Introspect the calling identity. Returns one of four transport shapes: ' +
     '{transport: "oauth", client_id, client_name, scopes, expires_at}, ' +
-    '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
+    '{transport: "legacy", token_name, scopes, expires_at: null}, ' +
+    '{transport: "stdio", source_id, scopes} (SSH-gated local stdio pipe), or ' +
     '{transport: "local", scopes: []}. Throws unknown_transport when the ' +
     'context is ambiguous (remote=true without auth) — fail-closed posture ' +
     'mirroring the v0.26.9 trust-boundary contract.',
@@ -3740,6 +3759,20 @@ const whoami: Operation = {
     // special-case `transport: 'local'` explicitly.
     if (ctx.remote === false) {
       return { transport: 'local', scopes: [] };
+    }
+    // Local stdio MCP pipe (`gbrain serve` over SSH stdio). Remote/untrusted
+    // for op-execution purposes (`remote: true` — filesystem/escalation guards
+    // stay on), but it threads an explicit synthetic principal whose
+    // `allowedSources` grant makes read-scoping fail-closed. Report an honest
+    // `stdio` shape keyed on the sentinel clientId — NOT `legacy` (that means
+    // an access_tokens bearer row) and NOT `oauth`. `source_id` surfaces the
+    // single source this pipe is scoped to (its grant's first/only element).
+    if (ctx.auth && ctx.auth.clientId === STDIO_LOCAL_CLIENT_ID) {
+      return {
+        transport: 'stdio',
+        source_id: ctx.auth.allowedSources?.[0] ?? ctx.auth.sourceId ?? null,
+        scopes: ctx.auth.scopes,
+      };
     }
     if (!ctx.auth) {
       throw new OperationError(
