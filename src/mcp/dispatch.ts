@@ -7,9 +7,48 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { operations, OperationError } from '../core/operations.ts';
+import { operations, OperationError, STDIO_LOCAL_CLIENT_ID } from '../core/operations.ts';
 import type { Operation, OperationContext, AuthInfo } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
+
+/**
+ * Synthesise the `AuthInfo` for the local stdio MCP transport (`gbrain serve`
+ * over SSH stdio). The stdio pipe carries no OAuth/bearer credential — the SSH
+ * key is the transport-layer gate, outside this process — so this builds an
+ * explicit principal scoped to the single source the operator configured
+ * (`GBRAIN_SOURCE` / `--source`, default `'default'`).
+ *
+ * Why this exists (the ctx.auth transport bug): before this, the stdio
+ * transport dispatched with `remote: true` and NO `ctx.auth`. Two failures:
+ *   1. `whoami` hit the fail-closed `unknown_transport` throw.
+ *   2. `resolveRequestedScope`'s out-of-grant guard was a no-op
+ *      (`ctx.auth?.allowedSources` undefined → "scalar-floor model"), so a
+ *      stdio caller could pass `source_id: '<other-tenant>'` and read a source
+ *      it was never granted the moment a second scope exists.
+ *
+ * The grant is `allowedSources: [sourceId]` — the pipe reads exactly its
+ * configured source and nothing else (fail-closed). `scopes` is honest about
+ * capability (the stdio path runs no `hasScope` gate, so it is inert for
+ * authorization and consumed only by `whoami` introspection). This is
+ * deliberately model-agnostic w.r.t. multi-tenant auth: SSH-key-as-boundary
+ * (one node/key per tenant → its own `GBRAIN_SOURCE`) and per-principal auth
+ * (replace this synthetic principal with a real threaded one) both build on
+ * the now-populated `ctx.auth` seam.
+ */
+export function buildStdioAuth(sourceId: string): AuthInfo {
+  return {
+    token: '',
+    clientId: STDIO_LOCAL_CLIENT_ID,
+    clientName: 'local stdio pipe',
+    // Honest capability of the local pipe (read + write). Inert for stdio
+    // authorization (no scope gate on this transport); reported by whoami.
+    scopes: ['read', 'write'],
+    // The fail-closed lever: an explicit single-source federated grant so
+    // resolveRequestedScope rejects an out-of-grant source_id param.
+    sourceId,
+    allowedSources: [sourceId],
+  };
+}
 
 export interface ToolResult {
   content: { type: 'text'; text: string }[];

@@ -8,8 +8,9 @@
  */
 
 import { test, expect, describe } from 'bun:test';
-import { operations, OperationError } from '../src/core/operations.ts';
+import { operations, OperationError, STDIO_LOCAL_CLIENT_ID } from '../src/core/operations.ts';
 import type { OperationContext, AuthInfo } from '../src/core/operations.ts';
+import { buildStdioAuth } from '../src/mcp/dispatch.ts';
 
 const whoami = operations.find(o => o.name === 'whoami')!;
 
@@ -92,6 +93,39 @@ describe('whoami op contract', () => {
     expect(result.token_name).toBe('my-personal-token');
     expect(result.scopes).toEqual(['read', 'write', 'admin']);
     expect(result.expires_at).toBeNull();
+  });
+
+  // stdio transport — the SSH-gated local pipe (`gbrain serve`). remote=true
+  // (untrusted for op-execution) but auth is threaded with the pipe's source
+  // grant, so whoami reports an honest `stdio` shape instead of throwing
+  // unknown_transport (the pre-fix behavior) or masquerading as `legacy`.
+  test('stdio transport returns source_id + scopes (does NOT throw)', async () => {
+    const result = (await whoami.handler(
+      ctxWith({ remote: true, auth: buildStdioAuth('default') }),
+      {},
+    )) as any;
+    expect(result.transport).toBe('stdio');
+    expect(result.source_id).toBe('default');
+    expect(result.scopes).toEqual(['read', 'write']);
+  });
+
+  test('stdio transport reflects a non-default configured source', async () => {
+    const result = (await whoami.handler(
+      ctxWith({ remote: true, auth: buildStdioAuth('zoa-confidential') }),
+      {},
+    )) as any;
+    expect(result.transport).toBe('stdio');
+    expect(result.source_id).toBe('zoa-confidential');
+  });
+
+  test('stdio branch is keyed on the sentinel clientId (not the legacy fallthrough)', async () => {
+    // A synthetic auth carrying the stdio sentinel must NOT be reported as a
+    // legacy access_tokens bearer — that would muddy the trust semantics.
+    const auth = buildStdioAuth('default');
+    expect(auth.clientId).toBe(STDIO_LOCAL_CLIENT_ID);
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    expect(result.transport).not.toBe('legacy');
+    expect(result.transport).toBe('stdio');
   });
 
   // Q3: ambiguous transport — fail-closed. The footgun this guards against
