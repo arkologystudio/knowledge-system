@@ -5830,6 +5830,183 @@ export const MIGRATIONS: Migration[] = [
       return (cols[0]?.n ?? 0) === 3;
     },
   },
+  {
+    version: 125,
+    name: 'source_rls_policies',
+    // Knowledge System KS-C: in-DB row-level security as defense-in-depth
+    // BENEATH the app-layer `allowedSources` ladder (sourceScopeOpts
+    // operations.ts:435 / resolveRequestedScope :491, unchanged). Today
+    // isolation is app-layer only AND the app connects as a BYPASSRLS role, so a
+    // single un-threaded read op is a cross-space leak with no DB backstop —
+    // acceptable for SSH-gated single-owner agents, NOT for a public multi-user
+    // portal (gates KS-B/KS-E).
+    //
+    // This migration provisions a dedicated NOBYPASSRLS request identity
+    // (`gbrain_request`) and per-space SELECT policies on the confidential
+    // read-path tables. At request time the MCP dispatcher wraps remote reads in
+    // `engine.withRlsScope(allowedSources, …)`, which `SET LOCAL ROLE
+    // gbrain_request` + sets the `app.allowed_sources` GUC inside a transaction;
+    // the policies below then refuse any row outside that set. Fail-closed: an
+    // unset/empty GUC → NULL/empty array → 0 rows, never the scalar 'default'.
+    //
+    // Coverage (decision D, Ross 2026-07-10): 11 tables.
+    //   - Direct `source_id` column: pages, artifacts, facts, files, ingest_log.
+    //   - Transitive (EXISTS via parent): content_chunks (page_id XOR artifact_id
+    //     per v123), links (from_page_id), tags, raw_data, timeline_entries,
+    //     page_versions — all → pages.source_id.
+    // Deferred (tracked, not portal-reachable in v1): takes/calibration/eval/
+    // code-edges/oauth/minion/identity tables.
+    //
+    // Role provisioning (decision E): attempted behind the v124 `has_bypass`
+    // capability gate; if the role can't be created (postgres role may lack
+    // CREATEROLE), the block RAISEs a WARNING and RETURNs — it NEVER locks the
+    // app out (v24/v29/v31 precedent; the app's BYPASSRLS role keeps working and
+    // app-layer isolation remains). KS-C is "done" only once the role exists AND
+    // the cross-space-denial test passes (test/rls-cross-space-isolation.test.ts)
+    // — a provisioning skip = deploy-incomplete, surfaced by that test, not here.
+    //
+    // Postgres-only: PGLite has no roles/policies/SET LOCAL, so the whole handler
+    // no-ops there (`engine.kind !== 'postgres'` guard) and those deployments keep
+    // app-layer enforcement exclusively. Regression-guarded by
+    // test/migration-v125-rls.test.ts.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind !== 'postgres') return; // PGLite: no RLS engine — app-layer only.
+      await engine.runMigration(125, `
+        DO $$
+        DECLARE has_bypass BOOLEAN;
+        BEGIN
+          SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+          IF NOT has_bypass THEN
+            RAISE WARNING 'v125 (KS-C): current role lacks BYPASSRLS/superuser; skipping RLS provisioning. App-layer source isolation remains in force. Run the documented KS-C bootstrap SQL as a superuser to complete it.';
+            RETURN;
+          END IF;
+
+          -- Provision the NOBYPASSRLS request identity. Guarded: the postgres
+          -- role may lack CREATEROLE (Supabase normally has it, but never assume)
+          -- — on any failure, WARN + RETURN so the app is never locked out.
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'gbrain_request') THEN
+              CREATE ROLE gbrain_request NOLOGIN NOBYPASSRLS;
+            END IF;
+            -- Let the app role (postgres) SET ROLE gbrain_request at request time.
+            EXECUTE 'GRANT gbrain_request TO ' || quote_ident(current_user);
+          EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'v125 (KS-C): could not provision role gbrain_request (%). Skipping RLS provisioning; app-layer isolation remains. Run the documented bootstrap SQL as a superuser.', SQLERRM;
+            RETURN;
+          END;
+
+          -- Read grants. Covered tables are policy-isolated below. The support
+          -- tables (sources/config) and the query_cache hot-path row store carry
+          -- no cross-space secret beyond their own app-layer-filtered source_id;
+          -- the confidential read ops (query/search) need them to function under
+          -- the request role. CREATE POLICY itself needs no grant (postgres owns
+          -- the tables).
+          GRANT SELECT ON pages, content_chunks, artifacts, links, timeline_entries, tags, raw_data, page_versions, facts, files, ingest_log TO gbrain_request;
+          GRANT SELECT ON sources, config TO gbrain_request;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON query_cache TO gbrain_request;
+
+          -- Enable RLS on every covered table. Idempotent (re-enable is a no-op).
+          -- The app's BYPASSRLS role is unaffected; only gbrain_request is filtered.
+          -- No FORCE: gbrain_request is a non-owner, so ordinary RLS applies to it.
+          ALTER TABLE pages             ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE content_chunks    ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE artifacts         ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE links             ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE timeline_entries  ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE tags              ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE raw_data          ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE page_versions     ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE facts             ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE files             ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE ingest_log        ENABLE ROW LEVEL SECURITY;
+
+          -- Policies (DROP+CREATE = idempotent; Postgres has no CREATE POLICY IF
+          -- NOT EXISTS). Predicate is fail-closed: NULLIF(...,'') turns both an
+          -- unset GUC (NULL) and an empty GUC ('') into NULL → source_id = ANY(NULL)
+          -- → 0 rows; a zero-grant '{}' → empty array → 0 rows. Never 'default'.
+
+          -- ── direct source_id column ───────────────────────────────────────
+          DROP POLICY IF EXISTS ks_source_isolation ON pages;
+          CREATE POLICY ks_source_isolation ON pages FOR SELECT TO gbrain_request
+            USING (source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON artifacts;
+          CREATE POLICY ks_source_isolation ON artifacts FOR SELECT TO gbrain_request
+            USING (source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON facts;
+          CREATE POLICY ks_source_isolation ON facts FOR SELECT TO gbrain_request
+            USING (source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON files;
+          CREATE POLICY ks_source_isolation ON files FOR SELECT TO gbrain_request
+            USING (source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON ingest_log;
+          CREATE POLICY ks_source_isolation ON ingest_log FOR SELECT TO gbrain_request
+            USING (source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+          -- ── transitive via parent page/artifact (EXISTS) ─────────────────
+          -- content_chunks: page_id XOR artifact_id (v123). Cover BOTH parents,
+          -- else artefact-backed chunks would leak or vanish.
+          DROP POLICY IF EXISTS ks_source_isolation ON content_chunks;
+          CREATE POLICY ks_source_isolation ON content_chunks FOR SELECT TO gbrain_request
+            USING (
+              EXISTS (SELECT 1 FROM pages p WHERE p.id = content_chunks.page_id
+                        AND p.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]))
+              OR EXISTS (SELECT 1 FROM artifacts a WHERE a.id = content_chunks.artifact_id
+                        AND a.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]))
+            );
+
+          DROP POLICY IF EXISTS ks_source_isolation ON links;
+          CREATE POLICY ks_source_isolation ON links FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM pages p WHERE p.id = links.from_page_id
+                        AND p.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON tags;
+          CREATE POLICY ks_source_isolation ON tags FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM pages p WHERE p.id = tags.page_id
+                        AND p.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON raw_data;
+          CREATE POLICY ks_source_isolation ON raw_data FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM pages p WHERE p.id = raw_data.page_id
+                        AND p.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON timeline_entries;
+          CREATE POLICY ks_source_isolation ON timeline_entries FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM pages p WHERE p.id = timeline_entries.page_id
+                        AND p.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON page_versions;
+          CREATE POLICY ks_source_isolation ON page_versions FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM pages p WHERE p.id = page_versions.page_id
+                        AND p.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+        END $$;
+      `);
+    },
+    verify: async (engine) => {
+      if (engine.kind !== 'postgres') return true; // PGLite no-op — nothing to verify.
+      // If provisioning was skipped (no CREATEROLE / no BYPASSRLS), the role is
+      // absent by design (never lock the app out). Treat that as verified so the
+      // migration completes; the cross-space-denial test — not this hook —
+      // enforces that KS-C is genuinely "done" on a node that CAN provision.
+      const role = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'gbrain_request'`,
+      );
+      if ((role[0]?.n ?? 0) === 0) return true;
+      // Role exists → all 11 covered-table policies must be present.
+      const pol = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_policies
+          WHERE schemaname = 'public' AND policyname = 'ks_source_isolation'
+            AND tablename IN ('pages','content_chunks','artifacts','links','timeline_entries',
+                              'tags','raw_data','page_versions','facts','files','ingest_log')`,
+      );
+      return (pol[0]?.n ?? 0) === 11;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

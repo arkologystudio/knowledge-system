@@ -145,6 +145,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'queue_health',
   'reranker_health',
   'rls',
+  'rls_enforcement',
   'rls_event_trigger',
   'search_mode',
   'pool_reap_health',

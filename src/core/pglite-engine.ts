@@ -918,6 +918,14 @@ export class PGLiteEngine implements BrainEngine {
     });
   }
 
+  async withRlsScope<T>(_allowedSources: string[], fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    // KS-C: documented pass-through no-op. PGLite has no roles / RLS policies /
+    // `SET LOCAL`, so these deployments keep app-layer source isolation
+    // (`sourceScopeOpts`) exclusively — an inherent limitation, not a gap. `fn`
+    // runs on `this` unchanged.
+    return fn(this);
+  }
+
   // Pages CRUD
   async getPage(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Page | null> {
     // v0.26.5: hide soft-deleted by default; opt-in via opts.includeDeleted.
