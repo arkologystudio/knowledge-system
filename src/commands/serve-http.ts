@@ -27,7 +27,7 @@ import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
-import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput, parseScopeString } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
@@ -713,6 +713,119 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   });
 
   // ---------------------------------------------------------------------------
+  // KS-A: POST /auth/mint — confidential-client-vouched principal-token mint.
+  //
+  // The ONE genuinely new trust-bearing surface. A confidential client (the
+  // portal, KS-B) authenticates with its client_secret (post body OR Basic
+  // header, mirroring the /token confidential path) AND must hold the
+  // `users_admin` scope; it then vouches for an end user by `subject` and gets
+  // back a short-TTL token whose `allowedSources = grants(subject) ∩ requested`.
+  //
+  // Fail-closed everywhere: unknown/ambiguous principal, zero grants, or an
+  // empty requested-intersection all return a deny — mintPrincipalToken NEVER
+  // issues an unscoped token (an empty allowedSources would fall through
+  // sourceScopeOpts to the scalar `default` source, the ctx.auth leak class).
+  //
+  // Browser trust (Q3): audience is the portal's confidential client only — the
+  // browser never holds a KB token in v1; Next.js proxies. The optional
+  // `visibility` field is accepted and IGNORED (the reserved v1-additive slot).
+  //
+  // Every mint (grant or deny) is audit-logged to mcp_request_log.
+  // ---------------------------------------------------------------------------
+  app.post('/auth/mint', ccRateLimiter, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
+    // Detect confidential auth: client_secret in body OR Authorization: Basic.
+    let clientId: string | undefined = req.body?.client_id;
+    let presentedSecret: string | undefined = req.body?.client_secret;
+    const authHeader = (req.headers.authorization ?? '').toString();
+    if (!presentedSecret && authHeader.startsWith('Basic ')) {
+      try {
+        const decoded = Buffer.from(authHeader.slice('Basic '.length), 'base64').toString('utf8');
+        const idx = decoded.indexOf(':');
+        if (idx > -1) {
+          clientId ||= decodeURIComponent(decoded.slice(0, idx));
+          presentedSecret = decodeURIComponent(decoded.slice(idx + 1));
+        }
+      } catch { /* malformed Basic → rejected below */ }
+    }
+    if (!clientId || !presentedSecret) {
+      res.status(401).json({ error: 'invalid_client', error_description: 'confidential client authentication required' });
+      return;
+    }
+
+    const auditMint = async (status: string, subject: unknown, errorMessage?: string) => {
+      try {
+        await executeRawJsonb(
+          engine,
+          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+          [clientId ?? null, 'auth_mint', 'auth_mint', Date.now() - startTime, status, errorMessage ?? null],
+          [{ subject: typeof subject === 'string' ? subject : null }],
+        );
+      } catch { /* audit is best-effort — never block the mint on a log failure */ }
+    };
+
+    let client;
+    try {
+      client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      await auditMint('denied', req.body?.subject, msg);
+      res.status(401).json({ error: 'invalid_client', error_description: msg });
+      return;
+    }
+
+    // Least privilege: only a users_admin confidential client may mint principal
+    // tokens. A read/write/sources_admin client cannot vouch for end users.
+    if (!hasScope(parseScopeString(client.scope), 'users_admin')) {
+      await auditMint('denied', req.body?.subject, 'client lacks users_admin scope');
+      res.status(403).json({ error: 'insufficient_scope', error_description: 'minting principal tokens requires the users_admin scope' });
+      return;
+    }
+
+    const subject = req.body?.subject;
+    if (!subject || typeof subject !== 'string') {
+      await auditMint('error', subject, 'subject required');
+      res.status(400).json({ error: 'invalid_request', error_description: 'subject is required' });
+      return;
+    }
+    const kind = typeof req.body?.kind === 'string' ? req.body.kind : undefined;
+    const rawRequested = req.body?.requested_sources;
+    let requestedSources: string[] | undefined;
+    if (Array.isArray(rawRequested)) {
+      requestedSources = rawRequested.filter((s: unknown): s is string => typeof s === 'string' && s.length > 0);
+    } else if (typeof rawRequested === 'string' && rawRequested.length > 0) {
+      requestedSources = rawRequested.split(',').map((s) => s.trim()).filter(Boolean);
+    }
+
+    try {
+      const minted = await oauthProvider.mintPrincipalToken({
+        subject,
+        kind: kind as never,
+        requestedSources,
+      });
+      await auditMint('success', subject);
+      res.json({
+        access_token: minted.access_token,
+        token_type: 'bearer',
+        expires_at: minted.expires_at,
+        expires_in: Math.max(0, minted.expires_at - Math.floor(Date.now() / 1000)),
+        allowed_sources: minted.allowed_sources,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      await auditMint('denied', subject, msg);
+      // Unknown/zero-grant/empty-intersection → 403 (fail-closed deny);
+      // ambiguous subject → 400 (caller must disambiguate by kind).
+      if (/ambiguous/i.test(msg)) {
+        res.status(400).json({ error: 'invalid_request', error_description: msg });
+      } else {
+        res.status(403).json({ error: 'access_denied', error_description: msg });
+      }
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // MCP SDK Auth Router (OAuth endpoints)
   // ---------------------------------------------------------------------------
   // The issuer URL goes into discovery metadata + token iss claims. It MUST
@@ -1299,6 +1412,25 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const { name, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
       const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      // KS-A (H1): stop hardcoding source_id='default' / federated_read=undefined.
+      // A multi-source brain must be able to register a client scoped to a
+      // specific space (write source) with an explicit federated-read set,
+      // otherwise the admin SPA can only ever mint default-source clients — the
+      // exact gap that blocked per-space provisioning. Accept both from the body,
+      // fall back to the historical defaults when omitted.
+      const bodySourceId = typeof (req.body as Record<string, unknown>).source_id === 'string'
+        && ((req.body as Record<string, unknown>).source_id as string).length > 0
+        ? (req.body as Record<string, unknown>).source_id as string
+        : 'default';
+      const rawFederated = (req.body as Record<string, unknown>).federated_read;
+      let federatedRead: string[] | undefined;
+      if (Array.isArray(rawFederated)) {
+        federatedRead = rawFederated.filter((s): s is string => typeof s === 'string' && s.length > 0);
+      } else if (typeof rawFederated === 'string' && rawFederated.length > 0) {
+        federatedRead = rawFederated.split(',').map((s) => s.trim()).filter(Boolean);
+      } else {
+        federatedRead = undefined;
+      }
       let scopeString: string;
       try {
         scopeString = normalizeScopesInput(rawScopes);
@@ -1329,7 +1461,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return;
       }
       const result = await oauthProvider.registerClientManual(
-        name, grants, scopeString, uris, 'default', undefined, validatedAuthMethod,
+        name, grants, scopeString, uris, bodySourceId, federatedRead, validatedAuthMethod,
       );
       // Set per-client TTL if specified
       if (tokenTtl && Number(tokenTtl) > 0) {

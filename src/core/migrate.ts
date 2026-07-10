@@ -5667,6 +5667,169 @@ export const MIGRATIONS: Migration[] = [
       return (x[0]?.n ?? 0) > 0;
     },
   },
+  {
+    version: 124,
+    name: 'principals_and_source_grants',
+    // Knowledge System KS-A: the identity + intra-org (per-space) authorization
+    // layer ABOVE the existing `allowedSources` enforcement ladder
+    // (sourceScopeOpts / resolveRequestedScope, operations.ts:417/473). The
+    // ladder already ENFORCES per-source scope but nothing populated it for end
+    // users — this migration adds the tables that do.
+    //
+    // Re-derives habitat-KB's retired CLIENT_LAYER.md (`Principal` +
+    // `ProjectPermission`) against `source` (not `project`), reusing gbrain's
+    // `federated_read` primitive rather than inventing a parallel RBAC axis.
+    //
+    // Two new tables + three additive columns on `access_tokens`:
+    //   - principals(id, kind, subject, display_name, …) — humans/agents/service.
+    //   - principal_source_grants(principal_id, source_id, role, visibility_ceiling)
+    //     — the net-new (principal, source, role) grant. `visibility_ceiling` is
+    //     the RESERVED v1-additive slot (NULL = "the source IS the access
+    //     boundary"; the D-Commons within-source membrane lands additively here
+    //     later, never a breaking change) — unused by enforcement now.
+    //   - access_tokens.{principal_id, allowed_sources, expires_at} — a scoped
+    //     PAT (long-lived, revocable, expires_at NULL) or a minted short-TTL
+    //     token (expires_at set) is an access_tokens row carrying a principal +
+    //     an explicit allowed_sources subset of that principal's grants. Read
+    //     back through verifyAccessToken's legacy-fallback path.
+    //
+    // Like `facts` (v40) and `artifacts` (v123), principals + grants are
+    // migration-created (deliberately absent from the static src/schema.sql /
+    // schema-embedded.ts bootstrap), so THIS migration is the single source of
+    // both tables for fresh AND migrated brains. FKs go through guarded DO
+    // blocks (the facts_source_id_fkey pattern — an inline REFERENCES got
+    // silently dropped by postgres.js unsafe()'s multi-statement path).
+    //
+    // Additive only: new tables + nullable columns, no data mutation → safe on
+    // the live brain. Regression-guarded in test/migration-v124-principals.test.ts.
+    idempotent: true,
+    sql: `
+      -- ── principals: humans / agents / service accounts ────────────────
+      CREATE TABLE IF NOT EXISTS principals (
+        id           BIGSERIAL   PRIMARY KEY,
+        kind         TEXT        NOT NULL DEFAULT 'human'
+                     CHECK (kind IN ('human','agent','service')),
+        -- external identity key: email (human), owner+label (agent), name (service)
+        subject      TEXT        NOT NULL,
+        display_name TEXT,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (kind, subject)
+      );
+
+      -- ── principal_source_grants: (principal, source, role) ────────────
+      CREATE TABLE IF NOT EXISTS principal_source_grants (
+        id                 BIGSERIAL   PRIMARY KEY,
+        principal_id       BIGINT      NOT NULL,
+        source_id          TEXT        NOT NULL,
+        role               TEXT        NOT NULL DEFAULT 'read'
+                           CHECK (role IN ('read','write','admin')),
+        -- RESERVED v1-additive slot (KS decision, Ross 2026-07-09 option (b)):
+        -- NULL = "the source IS the access boundary; no within-source
+        -- visibility filtering". The D-Commons membrane lands here additively
+        -- later. Unused by enforcement now.
+        visibility_ceiling TEXT,
+        created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (principal_id, source_id)
+      );
+
+      -- FK principal_source_grants.principal_id → principals(id) (guarded DO
+      -- block; ON DELETE CASCADE so revoking a principal drops its grants).
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'principal_source_grants_principal_id_fkey'
+             AND conrelid = 'principal_source_grants'::regclass
+        ) THEN
+          ALTER TABLE principal_source_grants
+            ADD CONSTRAINT principal_source_grants_principal_id_fkey
+            FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE;
+        END IF;
+      END $$;
+
+      -- FK principal_source_grants.source_id → sources(id) (guarded; ON DELETE
+      -- CASCADE so removing a source drops grants that referenced it — no
+      -- dangling grant can widen a token to a since-deleted source).
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'principal_source_grants_source_id_fkey'
+             AND conrelid = 'principal_source_grants'::regclass
+        ) THEN
+          ALTER TABLE principal_source_grants
+            ADD CONSTRAINT principal_source_grants_source_id_fkey
+            FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE;
+        END IF;
+      END $$;
+
+      CREATE INDEX IF NOT EXISTS idx_grants_principal
+        ON principal_source_grants(principal_id);
+      CREATE INDEX IF NOT EXISTS idx_grants_source
+        ON principal_source_grants(source_id);
+
+      -- ── access_tokens: principal-scoped PAT + minted-token support ─────
+      -- principal_id: the owning principal (NULL for legacy grandfather tokens).
+      -- allowed_sources: explicit per-token source scope = subset of the
+      --   principal's grants; read back into AuthInfo.allowedSources.
+      -- expires_at: epoch SECONDS (mirrors oauth_tokens.expires_at semantics so
+      --   coerceTimestamp/verify treat both the same). NULL = never-expire
+      --   (a revocable PAT); set = short-TTL minted token.
+      ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS principal_id    BIGINT;
+      ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS allowed_sources TEXT[];
+      ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS expires_at      BIGINT;
+
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'access_tokens_principal_id_fkey'
+             AND conrelid = 'access_tokens'::regclass
+        ) THEN
+          ALTER TABLE access_tokens
+            ADD CONSTRAINT access_tokens_principal_id_fkey
+            FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE;
+        END IF;
+      END $$;
+
+      CREATE INDEX IF NOT EXISTS idx_access_tokens_principal
+        ON access_tokens(principal_id) WHERE principal_id IS NOT NULL;
+    `,
+    handler: async (engine) => {
+      // RLS on the two new identity tables when the role has BYPASSRLS — mirrors
+      // the artifacts v123 pattern + the schema.sql RLS block. Enabling RLS with
+      // no policies means the anon key can't read principals/grants (secure by
+      // default); the app connects as a BYPASSRLS role which bypasses it.
+      // Postgres-only; PGLite has no RLS engine. access_tokens already had RLS
+      // enabled in an earlier migration, so it is not re-enabled here.
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(124, `
+          DO $$
+          DECLARE has_bypass BOOLEAN;
+          BEGIN
+            SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass;
+            IF has_bypass THEN
+              ALTER TABLE principals ENABLE ROW LEVEL SECURITY;
+              ALTER TABLE principal_source_grants ENABLE ROW LEVEL SECURITY;
+            END IF;
+          END $$;
+        `);
+      }
+    },
+    verify: async (engine) => {
+      // Post-condition probe: both tables + the three access_tokens columns +
+      // the grant CHECK must exist. Portable across Postgres + PGLite.
+      const tbls = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN ('principals','principal_source_grants')`,
+      );
+      if ((tbls[0]?.n ?? 0) < 2) return false;
+      const cols = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'access_tokens'
+            AND column_name IN ('principal_id','allowed_sources','expires_at')`,
+      );
+      return (cols[0]?.n ?? 0) === 3;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

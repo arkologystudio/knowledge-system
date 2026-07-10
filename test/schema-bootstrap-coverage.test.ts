@@ -692,6 +692,16 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'minion_jobs.stagger_key',
   'sources.chunker_version',
   'access_tokens.permissions',
+  // KS-A (migration v124) — principal-scoped token columns. Same exemption
+  // rationale as access_tokens.permissions above: added by an ALTER in v124,
+  // NOT in PGLITE_SCHEMA_SQL. The only index that references principal_id
+  // (idx_access_tokens_principal) is co-defined inside v124 itself, so no
+  // schema-blob forward reference exists for the bootstrap to trip on. The
+  // verifyAccessToken read path uses `SELECT *`, so it degrades cleanly on a
+  // pre-v124 brain (the columns are simply absent from the row).
+  'access_tokens.principal_id',
+  'access_tokens.allowed_sources',
+  'access_tokens.expires_at',
   'takes.resolved_quality',
   'pages.emotional_weight_recomputed_at',
   'facts.notability',

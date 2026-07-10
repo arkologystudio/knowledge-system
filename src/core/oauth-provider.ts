@@ -27,6 +27,13 @@ import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope } from './legacy-token-scope.ts';
+import {
+  resolvePrincipalGrants,
+  resolvePrincipalBySubject,
+  intersectSources,
+  scopesForGrants,
+  type PrincipalKind,
+} from './principal-grants.ts';
 import type { SqlQuery, SqlValue } from './sql-query.ts';
 export type { SqlQuery, SqlValue };
 
@@ -46,7 +53,7 @@ export type { SqlQuery, SqlValue };
  * `redirect_uri` containing `,`) would be parsed by Postgres as MULTIPLE
  * array elements, smuggling values past validation. See CSO finding #5.
  */
-function pgArray(arr: string[]): string {
+export function pgArray(arr: string[]): string {
   if (!arr || arr.length === 0) return '{}';
   const escaped = arr.map(s => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
   return `{${escaped.join(',')}}`;
@@ -670,36 +677,79 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       } as CoreAuthInfo as SdkAuthInfo;
     }
 
-    // Fallback: legacy access_tokens table (backward compat). Modern legacy
-    // rows may carry permissions.source_id from the pre-OAuth bearer-token
-    // path; OAuth transport must preserve that same source grant instead of
-    // pinning every legacy token to `default`.
-    let legacyRows: Record<string, unknown>[];
-    try {
-      legacyRows = await this.sql`
-        SELECT name, permissions FROM access_tokens
-        WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
-      `;
-    } catch (err) {
-      if (isUndefinedColumnError(err, 'permissions')) {
-        legacyRows = await this.sql`
-          SELECT name FROM access_tokens
-          WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
-        `;
-      } else {
-        throw err;
-      }
-    }
+    // Fallback: legacy access_tokens table (backward compat + KS-A principal
+    // tokens). Modern legacy rows may carry permissions.source_id from the
+    // pre-OAuth bearer-token path; OAuth transport must preserve that same
+    // source grant instead of pinning every legacy token to `default`.
+    //
+    // KS-A: this same table now also backs principal-scoped tokens — a scoped
+    // PAT or a minted short-TTL token is an access_tokens row carrying
+    // principal_id + allowed_sources (+ expires_at). `SELECT *` (rather than the
+    // named-column projection with per-column fallback) keeps this path
+    // forward/backward compatible across a rolling deploy: pre-v124 brains
+    // simply don't return the new keys (→ undefined → the legacy branch below),
+    // post-v124 brains do — no isUndefinedColumnError ladder required.
+    const legacyRows = await this.sql`
+      SELECT * FROM access_tokens
+      WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
+    `;
 
     if (legacyRows.length > 0) {
-      // Legacy tokens get full admin access (grandfather in).
-      // For legacy tokens, name = clientId = clientName (single identifier).
-      // Update last_used_at
+      const row = legacyRows[0];
+      const name = row.name as string;
+
+      // KS-A: enforce a real expiry when the row carries one (minted short-TTL
+      // token). Legacy grandfather rows (expires_at NULL/absent) skip this and
+      // keep their historical never-expire semantics below. Fail-closed on a
+      // present-but-past expiry.
+      const rowExpiry = coerceTimestamp(row.expires_at);
+      if (rowExpiry !== undefined && rowExpiry < now) {
+        throw new InvalidTokenError('Token expired');
+      }
+
+      // Update last_used_at (single-identifier: name = clientId = clientName).
       await this.sql`
         UPDATE access_tokens SET last_used_at = now() WHERE token_hash = ${tokenHash}
       `;
-      const name = legacyRows[0].name as string;
-      const permissionsRaw = legacyRows[0].permissions;
+
+      // KS-A principal-scoped token branch. A row bound to a principal (or
+      // carrying an explicit allowed_sources) is NOT a full-admin grandfather
+      // token — it is scoped to its stored sources + scopes. FAIL-CLOSED: a
+      // principal row that resolves to ZERO allowed sources is DENIED, never
+      // defaulted (an empty allowedSources would fall through sourceScopeOpts to
+      // the scalar `default` source — the exact leak class the ctx.auth fix
+      // sealed). Mint/pat-issue never persist an empty allowed_sources, so this
+      // is defense-in-depth.
+      const rawAllowed = row.allowed_sources;
+      if (row.principal_id != null || Array.isArray(rawAllowed)) {
+        const allowedSources = Array.isArray(rawAllowed)
+          ? (rawAllowed as unknown[]).filter((s): s is string => typeof s === 'string' && s.length > 0)
+          : [];
+        if (allowedSources.length === 0) {
+          throw new InvalidTokenError('Invalid token');
+        }
+        const storedScopes = Array.isArray(row.scopes)
+          ? (row.scopes as unknown[]).filter((s): s is string => typeof s === 'string' && s.length > 0)
+          : [];
+        const scopes = storedScopes.length > 0 ? storedScopes : ['read'];
+        return {
+          token,
+          clientId: name,
+          clientName: name,
+          scopes,
+          // A minted token carries its real short expiry; a PAT (expires_at
+          // NULL) is revocable-immortal, surfaced as a 1yr-forward marker to
+          // satisfy the SDK's `typeof expiresAt === 'number'` requirement.
+          expiresAt: rowExpiry ?? (Math.floor(Date.now() / 1000) + 365 * 24 * 3600),
+          // Scalar write floor = the first allowed source; the federated array
+          // is what the enforcement ladder actually reads.
+          sourceId: allowedSources[0],
+          allowedSources,
+        } as CoreAuthInfo as SdkAuthInfo;
+      }
+
+      // Legacy tokens get full admin access (grandfather in).
+      const permissionsRaw = row.permissions;
       let permissions: unknown = permissionsRaw;
       if (typeof permissionsRaw === 'string') {
         try {
@@ -1013,5 +1063,137 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     }
 
     return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // KS-A: principal-scoped token issuance (mint + PAT)
+  // -------------------------------------------------------------------------
+  //
+  // Both a minted short-TTL token and a long-lived scoped PAT are rows in
+  // `access_tokens` carrying `principal_id` + an explicit `allowed_sources`
+  // subset of the principal's grants, read back through the legacy-fallback
+  // path in verifyAccessToken. They differ ONLY in expiry: mint sets a short
+  // `expires_at`; a PAT leaves it NULL (revocable-immortal). This keeps the one
+  // new trust-bearing surface (`/auth/mint`) minimal — no second token store,
+  // no change to the oauth_tokens/issueTokens path, no new read path.
+
+  /**
+   * Persist a principal-scoped access_tokens row and return the raw token.
+   * Shared by mint + PAT. `expiresEpoch` NULL = never-expire (PAT).
+   *
+   * FAIL-CLOSED: refuses to write a row with an empty `allowedSources` — a
+   * zero-source token would fall through sourceScopeOpts to the scalar
+   * `default` source (the ctx.auth leak class). Callers resolve the grant
+   * intersection and MUST reject empties BEFORE calling; this is the last gate.
+   */
+  private async persistPrincipalToken(args: {
+    name: string;
+    principalId: number | string | bigint;
+    allowedSources: string[];
+    scopes: string[];
+    expiresEpoch: number | null;
+  }): Promise<string> {
+    const allowed = args.allowedSources.filter((s) => typeof s === 'string' && s.length > 0);
+    if (allowed.length === 0) {
+      throw new Error('refusing to issue a principal token with no allowed sources (zero-grant deny)');
+    }
+    const token = generateToken('gbrain_at_');
+    const tokenHash = hashToken(token);
+    await this.sql`
+      INSERT INTO access_tokens (name, token_hash, scopes, principal_id, allowed_sources, expires_at)
+      VALUES (${args.name}, ${tokenHash}, ${pgArray(args.scopes)},
+              ${args.principalId}, ${pgArray(allowed)},
+              ${args.expiresEpoch})
+    `;
+    return token;
+  }
+
+  /**
+   * Mint a short-TTL token for a principal (resolved by subject, optionally by
+   * kind). `allowedSources = grants(principal) ∩ requestedSources` (all grants
+   * when requestedSources omitted). The token's flat scope = the highest role
+   * among the included grants (least privilege over the intersected set).
+   *
+   * Throws (caller maps to 403) when: the principal is unknown, the subject is
+   * ambiguous across kinds, the principal has zero grants, or the requested
+   * intersection is empty. NEVER mints an unscoped token.
+   *
+   * This is the engine primitive behind the confidential-client-vouched
+   * `POST /auth/mint` endpoint. `subject` + `kind` identify the end user; the
+   * CALLING confidential client (the portal) is authenticated separately at the
+   * HTTP boundary.
+   */
+  async mintPrincipalToken(args: {
+    subject: string;
+    kind?: PrincipalKind;
+    requestedSources?: string[];
+    ttlSeconds?: number;
+  }): Promise<{ access_token: string; expires_at: number; allowed_sources: string[] }> {
+    const principal = await resolvePrincipalBySubject(this.sql, args.subject, args.kind);
+    if (principal === null) {
+      throw new Error('unknown principal');
+    }
+    if (principal === 'ambiguous') {
+      throw new Error('ambiguous principal subject — specify kind (human|agent|service)');
+    }
+    const grants = await resolvePrincipalGrants(this.sql, principal.id);
+    if (grants.length === 0) {
+      throw new Error('principal has no source grants');
+    }
+    const grantedSources = grants.map((g) => g.source_id);
+    const allowed = intersectSources(grantedSources, args.requestedSources);
+    if (allowed.length === 0) {
+      throw new Error('no granted sources match the requested scope');
+    }
+    const includedGrants = grants.filter((g) => allowed.includes(g.source_id));
+    const scopes = scopesForGrants(includedGrants);
+    const ttl = args.ttlSeconds && args.ttlSeconds > 0 ? args.ttlSeconds : this.tokenTtl;
+    const expiresEpoch = Math.floor(Date.now() / 1000) + ttl;
+    const name = `mint:${principal.kind}:${principal.subject}:${expiresEpoch}`;
+    const token = await this.persistPrincipalToken({
+      name,
+      principalId: principal.id,
+      allowedSources: allowed,
+      scopes,
+      expiresEpoch,
+    });
+    return { access_token: token, expires_at: expiresEpoch, allowed_sources: allowed };
+  }
+
+  /**
+   * Issue a long-lived scoped Personal Access Token for a principal (resolved
+   * by id). The agent-onboarding unlock: paste once into an MCP config, never
+   * re-auth, revoke via `pat_revoke`. Scope = grants(principal) ∩
+   * requestedSources (all grants when omitted); least-privilege capability from
+   * the included grants. `label` is the human-facing token name (must be unique
+   * — the access_tokens.name UNIQUE-by-hash + explicit collision check).
+   *
+   * A PAT is `expires_at = NULL` (revocable-immortal). Agents act at ≤ their
+   * owner's access because the caller passes a requestedSources subset.
+   */
+  async issuePersonalAccessToken(args: {
+    principalId: number | string | bigint;
+    label: string;
+    requestedSources?: string[];
+  }): Promise<{ access_token: string; allowed_sources: string[]; scopes: string[] }> {
+    const grants = await resolvePrincipalGrants(this.sql, args.principalId);
+    if (grants.length === 0) {
+      throw new Error('principal has no source grants');
+    }
+    const grantedSources = grants.map((g) => g.source_id);
+    const allowed = intersectSources(grantedSources, args.requestedSources);
+    if (allowed.length === 0) {
+      throw new Error('no granted sources match the requested scope');
+    }
+    const includedGrants = grants.filter((g) => allowed.includes(g.source_id));
+    const scopes = scopesForGrants(includedGrants);
+    const token = await this.persistPrincipalToken({
+      name: args.label,
+      principalId: args.principalId,
+      allowedSources: allowed,
+      scopes,
+      expiresEpoch: null,
+    });
+    return { access_token: token, allowed_sources: allowed, scopes };
   }
 }

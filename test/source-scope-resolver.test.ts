@@ -9,9 +9,11 @@
  * loudly here.
  */
 import { describe, test, expect } from 'bun:test';
+import { intersectSources, scopesForGrants, type PrincipalGrant } from '../src/core/principal-grants.ts';
 import {
   resolveRequestedScope,
   resolveCodeIntelScope,
+  sourceScopeOpts,
   OperationError,
   type OperationContext,
 } from '../src/core/operations.ts';
@@ -119,5 +121,40 @@ describe('resolveCodeIntelScope — single-source code traversal', () => {
   test('remote with no source in scope is denied, never widened to all', () => {
     const ctx = ctxOf({ remote: true, sourceId: '' });
     expect(() => resolveCodeIntelScope(ctx, '__all__')).toThrow(OperationError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KS-A: a principal's (source, role) grants feed the SAME resolver. Building
+// the AuthInfo the way mintPrincipalToken does (allowedSources = the grant
+// intersection) must produce identical isolation to a native OAuth client — no
+// second enforcement path.
+// ---------------------------------------------------------------------------
+describe('resolveRequestedScope — principal grants feed the ladder unchanged', () => {
+  // A principal granted read on space A + write on space B.
+  const grants: PrincipalGrant[] = [
+    { source_id: 'space-a', role: 'read' },
+    { source_id: 'space-b', role: 'write' },
+  ];
+  const allowed = intersectSources(grants.map((g) => g.source_id));
+  const scopes = scopesForGrants(grants);
+  const principalAuth = { token: 't', clientId: 'principal:human:x', scopes, allowedSources: allowed } as any;
+
+  test('the grant intersection becomes the federated read scope', () => {
+    const ctx = ctxOf({ remote: true, auth: principalAuth });
+    expect(sourceScopeOpts(ctx)).toEqual({ sourceIds: ['space-a', 'space-b'] });
+  });
+
+  test('an in-grant explicit source resolves; an out-of-grant one is denied', () => {
+    const ctx = ctxOf({ remote: true, auth: principalAuth });
+    expect(resolveRequestedScope(ctx, 'space-a')).toEqual({ sourceId: 'space-a' });
+    expect(() => resolveRequestedScope(ctx, 'space-z')).toThrow(OperationError);
+  });
+
+  test('a single-source grant (agent ≤ owner) scopes to exactly that source', () => {
+    const narrowed = intersectSources(grants.map((g) => g.source_id), ['space-a']);
+    const ctx = ctxOf({ remote: true, auth: { token: 't', clientId: 'pat', scopes: scopesForGrants(grants.filter((g) => narrowed.includes(g.source_id))), allowedSources: narrowed } as any });
+    expect(resolveRequestedScope(ctx, undefined)).toEqual({ sourceIds: ['space-a'] });
+    expect(() => resolveRequestedScope(ctx, 'space-b')).toThrow(OperationError);
   });
 });

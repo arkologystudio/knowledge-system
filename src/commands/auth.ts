@@ -455,6 +455,139 @@ async function registerClient(name: string, args: string[]) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// KS-A: principal identity + per-space grants + scoped PATs (CLI).
+//
+// The operator-facing half of the identity layer. Mirrors kbctl's
+// member create / grant / issue-cred against `source` (not `project`).
+// ---------------------------------------------------------------------------
+
+function flagValue(args: string[], flag: string): string | undefined {
+  const i = args.indexOf(flag);
+  if (i < 0 || i + 1 >= args.length) return undefined;
+  const v = args[i + 1];
+  return v && !v.startsWith('--') ? v : undefined;
+}
+
+async function principalAdd(subject: string, args: string[]) {
+  const kind = flagValue(args, '--kind') || 'human';
+  const displayName = flagValue(args, '--name') || null;
+  if (!subject) { console.error('Usage: auth principal add <subject> [--kind human|agent|service] [--name "Display Name"]'); process.exit(1); }
+  const { isPrincipalKind } = await import('../core/principal-grants.ts');
+  if (!isPrincipalKind(kind)) { console.error(`Invalid --kind "${kind}" (expected human|agent|service).`); process.exit(1); }
+  await withConfiguredSql(async (_sql, engine) => {
+    const rows = await engine.executeRaw<{ id: number; kind: string; subject: string }>(
+      `INSERT INTO principals (kind, subject, display_name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (kind, subject)
+         DO UPDATE SET display_name = COALESCE(EXCLUDED.display_name, principals.display_name)
+       RETURNING id, kind, subject`,
+      [kind, subject, displayName],
+    );
+    const r = rows[0];
+    console.log(`Principal: id=${Number(r.id)} kind=${r.kind} subject=${r.subject}`);
+    console.log(`Grant a space: gbrain auth principal grant ${Number(r.id)} <source_id> <read|write|admin>`);
+  });
+}
+
+async function principalGrant(principalId: string, sourceId: string, role: string) {
+  if (!principalId || !sourceId || !role) { console.error('Usage: auth principal grant <principal_id> <source_id> <read|write|admin>'); process.exit(1); }
+  const { isGrantRole } = await import('../core/principal-grants.ts');
+  if (!isGrantRole(role)) { console.error(`Invalid role "${role}" (expected read|write|admin).`); process.exit(1); }
+  await withConfiguredSql(async (_sql, engine) => {
+    try {
+      const rows = await engine.executeRaw<{ id: number }>(
+        `INSERT INTO principal_source_grants (principal_id, source_id, role)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (principal_id, source_id) DO UPDATE SET role = EXCLUDED.role
+         RETURNING id`,
+        [Number(principalId), sourceId, role],
+      );
+      console.log(`Granted: principal ${principalId} → source "${sourceId}" (${role}) [grant ${Number(rows[0].id)}]`);
+    } catch (e: any) {
+      if (/foreign key|violates|constraint/i.test(e?.message || '')) {
+        console.error(`Grant references an unknown principal or source. Create the principal (auth principal add) and source (sources add) first.`);
+        process.exit(1);
+      }
+      throw e;
+    }
+  });
+}
+
+async function principalRevoke(principalId: string, sourceId: string) {
+  if (!principalId || !sourceId) { console.error('Usage: auth principal revoke <principal_id> <source_id>'); process.exit(1); }
+  await withConfiguredSql(async (_sql, engine) => {
+    const rows = await engine.executeRaw<{ id: number }>(
+      `DELETE FROM principal_source_grants WHERE principal_id = $1 AND source_id = $2 RETURNING id`,
+      [Number(principalId), sourceId],
+    );
+    console.log(rows.length > 0 ? `Revoked grant: principal ${principalId} → source "${sourceId}"` : `No grant found for principal ${principalId} on "${sourceId}".`);
+  });
+}
+
+async function patIssue(principalId: string, label: string, args: string[]) {
+  if (!principalId || !label) { console.error('Usage: auth pat issue <principal_id> <label> [--sources src-a,src-b]'); process.exit(1); }
+  const sourcesRaw = flagValue(args, '--sources');
+  const requestedSources = sourcesRaw ? sourcesRaw.split(',').map(s => s.trim()).filter(Boolean) : undefined;
+  await withConfiguredSql(async (sql) => {
+    const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
+    const provider = new GBrainOAuthProvider({ sql });
+    try {
+      const result = await provider.issuePersonalAccessToken({ principalId: Number(principalId), label, requestedSources });
+      console.log(`Personal Access Token issued for principal ${principalId} ("${label}"):\n`);
+      console.log(`  ${result.access_token}\n`);
+      console.log(`  Allowed sources: ${result.allowed_sources.join(', ')}`);
+      console.log(`  Scopes:          ${result.scopes.join(', ')}\n`);
+      console.log('Save this token — it will not be shown again.');
+      console.log(`Revoke with: gbrain auth pat revoke "${label}"`);
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      if (/unique|duplicate|23505/i.test(msg)) console.error(`A token labelled "${label}" already exists. Revoke it or choose a different label.`);
+      else if (/no source grants|no granted sources/i.test(msg)) console.error(`Cannot issue: ${msg}. Grant the principal a source first (auth principal grant).`);
+      else console.error('Error:', msg);
+      process.exit(1);
+    }
+  });
+}
+
+async function patRevoke(label: string) {
+  if (!label) { console.error('Usage: auth pat revoke <label>'); process.exit(1); }
+  await withConfiguredSql(async (sql) => {
+    const rows = await sql`
+      UPDATE access_tokens SET revoked_at = now()
+      WHERE name = ${label} AND principal_id IS NOT NULL AND revoked_at IS NULL
+      RETURNING id
+    `;
+    console.log(rows.length > 0 ? `PAT "${label}" revoked.` : `No active PAT found with label "${label}".`);
+  });
+}
+
+/**
+ * H2: the never-built `gbrain auth scope-client`. Scope an EXISTING OAuth
+ * client to a write source + federated-read set (the AuthInfo.sourceId /
+ * allowedSources a public-client registration may otherwise leave null).
+ */
+async function scopeClient(clientId: string, args: string[]) {
+  if (!clientId) { console.error('Usage: auth scope-client <client_id> --source <id> [--federated-read src-a,src-b]'); process.exit(1); }
+  const sourceId = flagValue(args, '--source');
+  if (!sourceId) { console.error('scope-client requires --source <id>.'); process.exit(1); }
+  const fedRaw = flagValue(args, '--federated-read');
+  const federated = fedRaw ? fedRaw.split(',').map(s => s.trim()).filter(Boolean) : [sourceId];
+  await withConfiguredSql(async (sql) => {
+    const { pgArray } = await import('../core/oauth-provider.ts');
+    const rows = await sql`
+      UPDATE oauth_clients
+         SET source_id = ${sourceId}, federated_read = ${pgArray(federated)}
+       WHERE client_id = ${clientId}
+       RETURNING client_id, client_name
+    `;
+    if (rows.length === 0) { console.error(`No client found with id "${clientId}".`); process.exit(1); }
+    console.log(`Client "${rows[0].client_name}" (${clientId}) scoped:`);
+    console.log(`  Write source:    ${sourceId}`);
+    console.log(`  Federated reads: ${federated.join(', ')}`);
+  });
+}
+
 /**
  * Entry point for the `gbrain auth` CLI subcommand. Also reused by the
  * direct-script path (see bottom of file) so `bun run src/commands/auth.ts`
@@ -497,6 +630,26 @@ export async function runAuth(args: string[]): Promise<void> {
     }
     case 'register-client': await registerClient(rest[0], rest.slice(1)); return;
     case 'revoke-client': await revokeClient(rest[0]); return;
+    case 'scope-client': await scopeClient(rest[0], rest.slice(1)); return;
+    case 'principal': {
+      // gbrain auth principal add|grant|revoke ...
+      const [sub, ...pRest] = rest;
+      if (sub === 'add') { await principalAdd(pRest[0] || '', pRest.slice(1)); return; }
+      if (sub === 'grant') { await principalGrant(pRest[0] || '', pRest[1] || '', pRest[2] || ''); return; }
+      if (sub === 'revoke') { await principalRevoke(pRest[0] || '', pRest[1] || ''); return; }
+      console.error('Usage: auth principal <add|grant|revoke> ...');
+      process.exit(1);
+      return;
+    }
+    case 'pat': {
+      // gbrain auth pat issue|revoke ...
+      const [sub, ...pRest] = rest;
+      if (sub === 'issue') { await patIssue(pRest[0] || '', pRest[1] || '', pRest.slice(2)); return; }
+      if (sub === 'revoke') { await patRevoke(pRest[0] || ''); return; }
+      console.error('Usage: auth pat <issue|revoke> ...');
+      process.exit(1);
+      return;
+    }
     case 'test': {
       const tokenIdx = rest.indexOf('--token');
       const url = rest.find(a => !a.startsWith('--') && a !== rest[tokenIdx + 1]);
@@ -528,6 +681,16 @@ Usage:
      --token-endpoint-auth-method <method>                 (v0.41.3+; client_secret_post | client_secret_basic | none;
                                                             'none' = public PKCE-only client, no secret minted)
   gbrain auth revoke-client <client_id>                   Hard-delete an OAuth 2.1 client (cascades to tokens + codes)
+  gbrain auth scope-client <client_id> --source <id> [--federated-read a,b]
+                                                          Scope an existing OAuth client to a write source + federated reads (H2)
+  gbrain auth principal add <subject> [--kind human|agent|service] [--name "…"]
+                                                          KS-A: register a principal (human/agent/service)
+  gbrain auth principal grant <principal_id> <source_id> <read|write|admin>
+                                                          KS-A: grant a principal a role on a source (space)
+  gbrain auth principal revoke <principal_id> <source_id> KS-A: revoke a grant
+  gbrain auth pat issue <principal_id> <label> [--sources a,b]
+                                                          KS-A: issue a scoped Personal Access Token (subset of grants; shown once)
+  gbrain auth pat revoke <label>                          KS-A: revoke a Personal Access Token by label
   gbrain auth test <url> --token <token>                  Smoke-test a remote MCP server
 `);
   }
