@@ -70,6 +70,17 @@ function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+/**
+ * KS-C: render a string[] as a Postgres text-array literal (`{"a","b"}`) for the
+ * `app.allowed_sources` GUC consumed by the v125 RLS policies. Each element is
+ * double-quoted with `"`/`\` escaped so source ids with punctuation can't break
+ * the literal. Empty input → `{}` (the zero-grant, fail-closed value → 0 rows).
+ */
+function toPgTextArrayLiteral(values: readonly string[]): string {
+  if (values.length === 0) return '{}';
+  return '{' + values.map((v) => '"' + v.replace(/(["\\])/g, '\\$1') + '"').join(',') + '}';
+}
+
 export function getPostgresSchema(
   dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
   model: string = DEFAULT_EMBEDDING_MODEL,
@@ -866,6 +877,29 @@ export class PostgresEngine implements BrainEngine {
     const conn = this.sql;
     return conn.begin(async (tx) => {
       // Create a scoped engine with tx as its connection, no shared state mutation
+      const txEngine = Object.create(this) as PostgresEngine;
+      Object.defineProperty(txEngine, 'sql', { get: () => tx });
+      Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
+      return fn(txEngine);
+    }) as Promise<T>;
+  }
+
+  async withRlsScope<T>(allowedSources: string[], fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    // KS-C: drop to the NOBYPASSRLS `gbrain_request` identity + set the per-txn
+    // `app.allowed_sources` scope GUC, then run `fn` on a transaction-scoped
+    // engine. The v125 policies enforce per-space isolation at the DB layer.
+    // Both statements are SET LOCAL (transaction-scoped) so they auto-reset on
+    // COMMIT and can never leak onto the next request reusing this pooled
+    // backend (the 6543 txn-mode-pooler-safe pattern already proven by
+    // `searchVector`'s `SET LOCAL statement_timeout`). An empty scope yields an
+    // empty array literal → 0 rows (fail-closed), never the scalar 'default'.
+    const conn = this.sql;
+    const literal = toPgTextArrayLiteral(allowedSources);
+    return conn.begin(async (tx) => {
+      await tx`SET LOCAL ROLE gbrain_request`;
+      await tx`SELECT set_config('app.allowed_sources', ${literal}, true)`;
+      // Scoped engine over the tx connection (mirrors `transaction()` above);
+      // no shared-state mutation, so concurrent requests stay isolated.
       const txEngine = Object.create(this) as PostgresEngine;
       Object.defineProperty(txEngine, 'sql', { get: () => tx });
       Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });

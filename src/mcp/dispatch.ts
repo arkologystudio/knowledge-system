@@ -7,9 +7,77 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { operations, OperationError, STDIO_LOCAL_CLIENT_ID } from '../core/operations.ts';
+import { operations, OperationError, STDIO_LOCAL_CLIENT_ID, sourceScopeOpts } from '../core/operations.ts';
 import type { Operation, OperationContext, AuthInfo } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
+
+/**
+ * KS-C: the confidential-corpus read ops whose ENTIRE read surface lies within
+ * the v125 RLS-covered tables (pages, content_chunks, artifacts, links,
+ * timeline_entries, tags, raw_data, page_versions, facts, files, ingest_log)
+ * plus the granted support tables (sources, config, query_cache). ONLY these
+ * are safe to run under the NOBYPASSRLS `gbrain_request` role.
+ *
+ * Every OTHER read op touches a DEFERRED table (decision D: takes / calibration
+ * / eval / code-edges / oauth / identity …) that `gbrain_request` has no SELECT
+ * grant on — running it under the role hard-fails `permission denied`. Those
+ * deferred ops (takes_list, takes_search, code_def, code_callers/callees,
+ * get_calibration_profile, find_experts, …) MUST run on the normal BYPASSRLS
+ * path exactly as before; the app-layer `sourceScopeOpts` ladder stays their
+ * isolation. This allowlist is the fix for review finding CRITICAL-2 (the wrap
+ * previously fired for every `op.scope === 'read'`).
+ *
+ * Verified per-op against handlers + engine methods (2026-07-10):
+ *   query / search     → hybridSearch/searchVector read content_chunks, pages,
+ *                        query_cache, config, sources; relationalFanout reads
+ *                        pages, links, content_chunks — all covered/granted.
+ *   get_page           → pages, tags.        get_chunks → content_chunks.
+ *   get_links / get_backlinks / list_link_sources → links, pages.
+ *   get_timeline       → timeline_entries, pages.
+ *   search_by_image    → content_chunks, pages.
+ * Code ops (code_def / code_callers / code_callees / code_blast / code_flow /
+ * code_refs) read code_symbols / code_edges (DEFERRED) → intentionally EXCLUDED.
+ * `retrieve` is not an operation (the T4 unified surface is query/search/get_page).
+ */
+const RLS_WRAPPED_READ_OPS: ReadonlySet<string> = new Set([
+  'query',
+  'search',
+  'get_page',
+  'get_chunks',
+  'get_links',
+  'get_backlinks',
+  'get_timeline',
+  'list_link_sources',
+  'search_by_image',
+]);
+
+/**
+ * KS-C (review finding CRITICAL-1): resolve the RLS GUC scope from the SAME
+ * precedence ladder the app-layer read filter uses (`sourceScopeOpts`), NOT
+ * raw `ctx.auth.allowedSources`. This guarantees the DB scope can never be
+ * NARROWER than the app-layer filter for a legitimate caller:
+ *
+ *   - federated grant (`ctx.auth.allowedSources` non-empty) → those sourceIds.
+ *   - scalar principal (allowedSources absent, `ctx.sourceId` set — e.g. the
+ *     stdio pipe, a legacy scalar token) → `[ctx.sourceId]`. Deriving from raw
+ *     `ctx.auth.allowedSources` here would yield `[]` → deny-all; routing
+ *     through `sourceScopeOpts` closes that stdio deny-all independent of the
+ *     ctx.auth transport fix (PR #5).
+ *   - neither (a deliberately empty scope) → `[]` → the v125 policies match 0
+ *     rows (fail-closed), NEVER the scalar `default`.
+ *
+ * A legitimately ALL-scoped caller needs no special-case: a trusted-local
+ * all-sources caller has `ctx.remote === false` and is never wrapped (keeps
+ * full BYPASSRLS visibility); a remote principal granted every source carries
+ * the explicit source list in `allowedSources`, so `sourceScopeOpts` returns
+ * that full array and the GUC spans exactly those sources.
+ */
+export function resolveRlsAllowedSources(ctx: OperationContext): string[] {
+  const scope = sourceScopeOpts(ctx);
+  if (scope.sourceIds && scope.sourceIds.length > 0) return scope.sourceIds;
+  if (scope.sourceId) return [scope.sourceId];
+  return [];
+}
 
 /**
  * Synthesise the `AuthInfo` for the local stdio MCP transport (`gbrain serve`
@@ -289,7 +357,34 @@ export async function dispatchToolCall(
   const ctx = buildOperationContext(engine, safeParams, opts);
 
   try {
-    const result = await op.handler(ctx, safeParams);
+    // KS-C: in-DB RLS backstop. For remote (untrusted, `ctx.remote === true`)
+    // CONFIDENTIAL-CORPUS read ops (the explicit `RLS_WRAPPED_READ_OPS`
+    // allowlist), run the handler under the NOBYPASSRLS `gbrain_request` role +
+    // a per-transaction `app.allowed_sources` GUC, so the database itself
+    // refuses any covered-table row outside the caller's granted spaces even if
+    // an app-layer filter is missed.
+    //
+    // CRITICAL-2 fix: the allowlist replaces the previous `op.scope === 'read'`
+    // gate. `gbrain_request` only holds SELECT on the covered + support tables,
+    // so a DEFERRED read op (takes_list, code_def, …) would `permission denied`
+    // under the role — those run unwrapped on the normal BYPASSRLS path.
+    //
+    // CRITICAL-1 fix: the scope is derived via `resolveRlsAllowedSources(ctx)`
+    // (mirrors the app-layer `sourceScopeOpts` ladder), never raw
+    // `ctx.auth.allowedSources` — so the DB scope is never narrower than the
+    // app filter, and a scalar/stdio principal doesn't deny-all. Fail-closed: an
+    // empty resolved scope yields 0 rows, never the scalar `default`.
+    //
+    // Write/admin ops and the trusted CLI path (`ctx.remote !== true`) keep
+    // today's pooled behavior; PGLite's `withRlsScope` is a pass-through no-op.
+    // The app-layer `sourceScopeOpts` ladder stays primary — this is
+    // defense-in-depth beneath it.
+    const result = (ctx.remote === true && RLS_WRAPPED_READ_OPS.has(op.name))
+      ? await engine.withRlsScope(
+          resolveRlsAllowedSources(ctx),
+          (scopedEngine) => op.handler({ ...ctx, engine: scopedEngine }, safeParams),
+        )
+      : await op.handler(ctx, safeParams);
     const out: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     // v0.31 (eD3 + eE4): best-effort _meta.brain_hot_memory injection.
     // The hook is wrapped in its own try/catch — any DB blip / cache miss /

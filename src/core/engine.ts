@@ -670,6 +670,30 @@ export interface BrainEngine {
    * usage constraints. Release is automatic.
    */
   withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T>;
+  /**
+   * KS-C (in-DB RLS): run `fn` with the database scoped to `allowedSources` so
+   * the DB itself refuses any covered-table row outside the caller's granted
+   * spaces — a backstop beneath the app-layer `sourceScopeOpts` ladder, closing
+   * the "un-threaded read → cross-space leak" class.
+   *
+   * Postgres: opens a transaction, `SET LOCAL ROLE gbrain_request` (the
+   * NOBYPASSRLS request identity provisioned by migration v125) +
+   * `set_config('app.allowed_sources', …, true)`, then hands `fn` a
+   * transaction-scoped engine. The v125 policies (`USING source_id = ANY(…)`,
+   * fail-closed on unset/empty → 0 rows, never the scalar `default`) enforce
+   * per-space isolation. Both the role-drop and the GUC are `SET LOCAL`
+   * (transaction-scoped): they auto-reset on COMMIT and can never leak onto the
+   * next request that reuses a pooled backend.
+   *
+   * PGLite: documented pass-through no-op — PGLite has no roles/policies/`SET
+   * LOCAL`, so those deployments keep app-layer enforcement exclusively; `fn`
+   * receives `this` unchanged.
+   *
+   * Wired by the MCP dispatcher for remote (`ctx.remote === true`) READ ops
+   * only; write/admin ops and the trusted CLI path keep today's behavior. An
+   * empty/absent scope is fail-closed (0 rows) by design.
+   */
+  withRlsScope<T>(allowedSources: string[], fn: (engine: BrainEngine) => Promise<T>): Promise<T>;
 
   // Pages CRUD
   /**

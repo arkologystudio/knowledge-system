@@ -464,6 +464,89 @@ export async function childTableOrphansCheck(engine: BrainEngine): Promise<Check
   };
 }
 
+/**
+ * KS-C (review finding MEDIUM): make an inert-RLS deployment observable instead
+ * of a silent green. The v125 migration provisions the NOBYPASSRLS
+ * `gbrain_request` role behind the `has_bypass` capability gate and WARN+skips
+ * if the connecting role lacks BYPASSRLS/superuser or CREATEROLE — never
+ * locking the app out. Its `verify()` deliberately returns true on a skip (so
+ * the migration completes), which means a node that CANNOT self-provision would
+ * otherwise report no signal that in-DB isolation is still OFF.
+ *
+ * This check surfaces that state directly from LIVE catalog truth (pg_roles +
+ * pg_policies) — more robust than a recorded flag, which would go stale the
+ * moment an operator runs the documented bootstrap SQL. "KS-C is not done until
+ * the role exists AND the covered policies are present."
+ *
+ *   - Postgres, role + all 11 policies present  → ok   ("RLS enforcement active")
+ *   - Postgres, role absent                      → warn ("RLS enforcement
+ *       inactive: gbrain_request not provisioned") — deploy-incomplete signal
+ *   - Postgres, role present but policies missing → warn (partial provisioning)
+ *   - PGLite                                     → ok   (RLS N/A by design;
+ *       app-layer isolation only — inherent limitation, not a gap)
+ *
+ * WARN (not FAIL): app-layer `sourceScopeOpts` isolation remains in force, so
+ * the brain is not broken — but the KS-C defense-in-depth backstop is not yet
+ * complete, and that must be visible before the portal (KS-B/KS-E) serves any
+ * client-confidential source.
+ */
+export async function checkRlsEnforcement(engine: BrainEngine): Promise<Check> {
+  const COVERED_TABLES = [
+    'pages', 'content_chunks', 'artifacts', 'links', 'timeline_entries',
+    'tags', 'raw_data', 'page_versions', 'facts', 'files', 'ingest_log',
+  ];
+  if (engine.kind !== 'postgres') {
+    return {
+      name: 'rls_enforcement',
+      status: 'ok',
+      message: 'PGLite — in-DB RLS N/A; app-layer source isolation only (by design).',
+    };
+  }
+  try {
+    const roleRows = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'gbrain_request'`,
+    );
+    if ((roleRows[0]?.n ?? 0) === 0) {
+      return {
+        name: 'rls_enforcement',
+        status: 'warn',
+        message:
+          'RLS enforcement inactive: gbrain_request not provisioned. ' +
+          'App-layer source isolation remains in force, but the KS-C in-DB backstop ' +
+          'is OFF (deploy-incomplete). Run the documented KS-C bootstrap SQL as a ' +
+          'superuser (CREATE ROLE gbrain_request + GRANT + re-run migration v125) to complete it.',
+      };
+    }
+    const polRows = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pg_policies
+        WHERE schemaname = 'public' AND policyname = 'ks_source_isolation'
+          AND tablename = ANY($1::text[])`,
+      [COVERED_TABLES],
+    );
+    const present = polRows[0]?.n ?? 0;
+    if (present < COVERED_TABLES.length) {
+      return {
+        name: 'rls_enforcement',
+        status: 'warn',
+        message:
+          `RLS partially provisioned: gbrain_request exists but only ${present}/${COVERED_TABLES.length} ` +
+          'covered-table policies are present. Re-run migration v125 (`gbrain apply-migrations --yes`) to heal.',
+      };
+    }
+    return {
+      name: 'rls_enforcement',
+      status: 'ok',
+      message: `RLS enforcement active: gbrain_request + ${present}/${COVERED_TABLES.length} covered-table policies present.`,
+    };
+  } catch (e) {
+    return {
+      name: 'rls_enforcement',
+      status: 'warn',
+      message: `Could not verify RLS enforcement state: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}
+
 export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorReport> {
   const checks: Check[] = [];
 
@@ -832,6 +915,11 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // 13. v0.42 self_upgrade_health: mode, whether behind, recent failures.
   // File-plane only (no engine) — works on thin clients too.
   checks.push(checkSelfUpgradeHealth());
+
+  // 14. KS-C rls_enforcement: surface an inert-RLS (gbrain_request not
+  // provisioned) deployment as a deploy-incomplete warn instead of a silent
+  // green. Cross-surface parity with buildChecks (local doctor).
+  checks.push(await checkRlsEnforcement(engine));
 
   return computeDoctorReport(checks);
 }
@@ -7312,6 +7400,12 @@ export async function buildChecks(
     const { runAllOnboardChecks } = await import('../core/onboard/checks.ts');
     const onboardResults = await runAllOnboardChecks(engine);
     for (const r of onboardResults) checks.push(r.check);
+
+    // KS-C rls_enforcement (review finding MEDIUM): surface an inert-RLS
+    // deployment (gbrain_request not provisioned → in-DB backstop OFF) as a
+    // deploy-incomplete warn. Cross-surface parity with doctorReportRemote.
+    progress.heartbeat('rls_enforcement');
+    checks.push(await checkRlsEnforcement(engine));
   }
 
   progress.finish();
