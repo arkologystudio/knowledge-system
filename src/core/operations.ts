@@ -5373,6 +5373,230 @@ const chronicle_backfill: Operation = {
   cliHints: { name: 'chronicle-backfill' },
 };
 
+// ---------------------------------------------------------------------------
+// Knowledge System KS-A — principal + per-space grant provisioning ops.
+//
+// The identity layer above the `allowedSources` enforcement ladder. These
+// provision the `principals` / `principal_source_grants` model that
+// mintPrincipalToken + issuePersonalAccessToken resolve into token scope.
+// `users_admin`-scoped (the reserved user-account-management axis) — an admin
+// confidential client (the portal, KS-B) or the local operator provisions
+// identity; a `sources_admin`/`read`/`write` token cannot. Local CLI callers
+// (ctx.remote === false) bypass scope enforcement, matching the sources ops.
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a principal's `(source, role)` grants. Re-exported here (the ops-layer
+ * home named by the KS-A technical design) over the shared resolver in
+ * principal-grants.ts so callers can depend on operations.ts without reaching
+ * into the helper module.
+ */
+export async function grantsForPrincipal(
+  engine: BrainEngine,
+  principalId: number | string | bigint,
+): Promise<Array<{ source_id: string; role: 'read' | 'write' | 'admin' }>> {
+  const { sqlQueryForEngine } = await import('./sql-query.ts');
+  const { resolvePrincipalGrants } = await import('./principal-grants.ts');
+  return resolvePrincipalGrants(sqlQueryForEngine(engine), principalId);
+}
+
+const principals_add: Operation = {
+  name: 'principals_add',
+  description:
+    'KS-A: register (idempotently) a principal — a human, agent, or service ' +
+    'account — that per-space grants and tokens hang off. subject is the ' +
+    'external identity key (email for humans; owner+label for agents; name for ' +
+    'service accounts). Idempotent on (kind, subject): re-adding updates ' +
+    'display_name and returns the existing id.',
+  params: {
+    kind: { type: 'string', required: true, description: 'human | agent | service' },
+    subject: { type: 'string', required: true, description: 'External identity key (unique per kind).' },
+    display_name: { type: 'string', description: 'Human-readable label (optional).' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { isPrincipalKind } = await import('./principal-grants.ts');
+    const kind = p.kind as string;
+    const subject = p.subject as string;
+    if (!isPrincipalKind(kind)) {
+      throw new OperationError('invalid_params', `kind must be one of human|agent|service (got '${kind}')`, 'Pass a valid principal kind.');
+    }
+    if (!subject || typeof subject !== 'string') {
+      throw new OperationError('invalid_params', 'subject is required', 'Pass a non-empty subject.');
+    }
+    const displayName = (p.display_name as string | undefined) ?? null;
+    if (ctx.dryRun) return { dry_run: true, action: 'principals_add', kind, subject };
+    const rows = await ctx.engine.executeRaw<{ id: number; kind: string; subject: string }>(
+      `INSERT INTO principals (kind, subject, display_name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (kind, subject)
+         DO UPDATE SET display_name = COALESCE(EXCLUDED.display_name, principals.display_name)
+       RETURNING id, kind, subject`,
+      [kind, subject, displayName],
+    );
+    const row = rows[0];
+    return { id: Number(row.id), kind: row.kind, subject: row.subject };
+  },
+  cliHints: { name: 'principals-add' },
+};
+
+const grant_add: Operation = {
+  name: 'grant_add',
+  description:
+    'KS-A: grant a principal a role (read|write|admin) on a source (a "space"/' +
+    'wiki). Idempotent on (principal_id, source_id): re-granting updates the ' +
+    'role. This is what populates the allowedSources the enforcement ladder ' +
+    'already reads.',
+  params: {
+    principal_id: { type: 'number', required: true, description: 'Principal id (from principals_add).' },
+    source_id: { type: 'string', required: true, description: 'Source id to grant on.' },
+    role: { type: 'string', required: true, description: 'read | write | admin' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const { isGrantRole } = await import('./principal-grants.ts');
+    const principalId = p.principal_id as number;
+    const sourceId = p.source_id as string;
+    const role = p.role as string;
+    if (!isGrantRole(role)) {
+      throw new OperationError('invalid_params', `role must be one of read|write|admin (got '${role}')`, 'Pass a valid role.');
+    }
+    if (!sourceId || typeof sourceId !== 'string') {
+      throw new OperationError('invalid_params', 'source_id is required', 'Pass a source id.');
+    }
+    if (ctx.dryRun) return { dry_run: true, action: 'grant_add', principal_id: principalId, source_id: sourceId, role };
+    try {
+      const rows = await ctx.engine.executeRaw<{ id: number }>(
+        `INSERT INTO principal_source_grants (principal_id, source_id, role)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (principal_id, source_id) DO UPDATE SET role = EXCLUDED.role
+         RETURNING id`,
+        [principalId, sourceId, role],
+      );
+      return { status: 'granted', grant_id: Number(rows[0].id), principal_id: principalId, source_id: sourceId, role };
+    } catch (e) {
+      // FK violation → unknown principal or unknown source. Surface as a clean
+      // invalid_params rather than a raw DB error.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/foreign key|violates|constraint/i.test(msg)) {
+        throw new OperationError('invalid_params', `grant references an unknown principal or source: ${msg}`, 'Create the principal (principals_add) and source (sources_add) first.');
+      }
+      throw e;
+    }
+  },
+  cliHints: { name: 'grant-add' },
+};
+
+const grant_revoke: Operation = {
+  name: 'grant_revoke',
+  description:
+    'KS-A: revoke a principal\'s grant on a source. Existing minted tokens are ' +
+    'bounded by their short TTL; PATs are checked at verify time so revocation ' +
+    'of the grant does not retroactively rescope a live PAT — revoke the PAT ' +
+    '(pat_revoke) to cut it immediately.',
+  params: {
+    principal_id: { type: 'number', required: true, description: 'Principal id.' },
+    source_id: { type: 'string', required: true, description: 'Source id to revoke.' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const principalId = p.principal_id as number;
+    const sourceId = p.source_id as string;
+    if (ctx.dryRun) return { dry_run: true, action: 'grant_revoke', principal_id: principalId, source_id: sourceId };
+    const rows = await ctx.engine.executeRaw<{ id: number }>(
+      `DELETE FROM principal_source_grants
+       WHERE principal_id = $1 AND source_id = $2
+       RETURNING id`,
+      [principalId, sourceId],
+    );
+    return { status: rows.length > 0 ? 'revoked' : 'not_found', principal_id: principalId, source_id: sourceId };
+  },
+  cliHints: { name: 'grant-revoke' },
+};
+
+const pat_issue: Operation = {
+  name: 'pat_issue',
+  description:
+    'KS-A: issue a long-lived scoped Personal Access Token for a principal — ' +
+    'the agent-onboarding unlock (paste once into an MCP config, never re-auth, ' +
+    'revocable). Scope = the principal\'s grants ∩ requested sources (all grants ' +
+    'when sources omitted); least-privilege. The token is shown ONCE. Fails if ' +
+    'the principal has no grants or the requested intersection is empty (never ' +
+    'issues an unscoped token).',
+  params: {
+    principal_id: { type: 'number', required: true, description: 'Principal id.' },
+    label: { type: 'string', required: true, description: 'Unique token label (used to revoke).' },
+    sources: { type: 'string', description: 'Comma-separated subset of the principal\'s granted sources. Omit = all grants.' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const principalId = p.principal_id as number;
+    const label = p.label as string;
+    if (!label || typeof label !== 'string') {
+      throw new OperationError('invalid_params', 'label is required', 'Pass a unique token label.');
+    }
+    const requestedSources = typeof p.sources === 'string' && p.sources.length > 0
+      ? p.sources.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+    if (ctx.dryRun) return { dry_run: true, action: 'pat_issue', principal_id: principalId, label, sources: requestedSources };
+    const { sqlQueryForEngine } = await import('./sql-query.ts');
+    const { GBrainOAuthProvider } = await import('./oauth-provider.ts');
+    const provider = new GBrainOAuthProvider({ sql: sqlQueryForEngine(ctx.engine) });
+    try {
+      const result = await provider.issuePersonalAccessToken({ principalId, label, requestedSources });
+      return {
+        status: 'issued',
+        label,
+        access_token: result.access_token,
+        allowed_sources: result.allowed_sources,
+        scopes: result.scopes,
+        note: 'Save this token — it will not be shown again. Revoke with pat_revoke.',
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/unique|duplicate|23505/i.test(msg)) {
+        throw new OperationError('invalid_params', `a token labelled '${label}' already exists`, 'Revoke it (pat_revoke) or choose a different label.');
+      }
+      if (/no source grants|no granted sources/i.test(msg)) {
+        throw new OperationError('permission_denied', msg, 'Grant the principal at least one source (grant_add) within the requested set.');
+      }
+      throw e;
+    }
+  },
+  cliHints: { name: 'pat-issue' },
+};
+
+const pat_revoke: Operation = {
+  name: 'pat_revoke',
+  description: 'KS-A: revoke a Personal Access Token by its label. Immediate (checked at verify time).',
+  params: {
+    label: { type: 'string', required: true, description: 'The token label passed to pat_issue.' },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const label = p.label as string;
+    if (!label || typeof label !== 'string') {
+      throw new OperationError('invalid_params', 'label is required', 'Pass the token label.');
+    }
+    if (ctx.dryRun) return { dry_run: true, action: 'pat_revoke', label };
+    // Only principal-scoped rows are revocable here — never touch a legacy
+    // grandfather token or an OAuth-minted row by label collision.
+    const rows = await ctx.engine.executeRaw<{ id: string }>(
+      `UPDATE access_tokens SET revoked_at = now()
+       WHERE name = $1 AND principal_id IS NOT NULL AND revoked_at IS NULL
+       RETURNING id`,
+      [label],
+    );
+    return { status: rows.length > 0 ? 'revoked' : 'not_found', label };
+  },
+  cliHints: { name: 'pat-revoke' },
+};
+
 export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, delete_page, list_pages,
@@ -5423,6 +5647,9 @@ export const operations: Operation[] = [
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
   whoami, sources_add, sources_list, sources_remove, sources_status,
+  // Knowledge System KS-A: principal identity + per-space grant provisioning
+  // (users_admin-scoped). Feeds mintPrincipalToken / issuePersonalAccessToken.
+  principals_add, grant_add, grant_revoke, pat_issue, pat_revoke,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.42.x (#2390): Life Chronicle timeline reads
