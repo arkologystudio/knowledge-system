@@ -200,6 +200,64 @@ interface GBrainOAuthProviderOptions {
    * (operator-trusted, registers grants directly).
    */
   allowClientCredentialsDcr?: boolean;
+
+  // --- GOV-2: governance token introspection (RFC 7662) -------------------
+  //
+  // When `governanceIntrospectUrl` is set, `verifyAccessToken` routes a token
+  // that carries a governance prefix (see `governanceTokenPrefixes`) to the
+  // governance service's introspection endpoint instead of the local DB. The
+  // introspection response's `allowed_sources` becomes `AuthInfo.allowedSources`
+  // — the seam that lets the co-located governance service own identity/grants
+  // while the KS remains the authority-free consumer. All fields are optional;
+  // when the URL is unset governance introspection is OFF and a governance-
+  // prefixed token DENIES (fail-closed on misconfiguration).
+  /** Governance introspection endpoint (RFC 7662), e.g. `https://governance.internal/v1/introspect`. */
+  governanceIntrospectUrl?: string;
+  /** Confidential-client id KS presents to governance (HTTP Basic). */
+  governanceClientId?: string;
+  /** Confidential-client secret KS presents to governance (HTTP Basic). Never logged. */
+  governanceClientSecret?: string;
+  /**
+   * Bounded introspection cache TTL in ms. Default 0 (disabled) → every read
+   * re-introspects → revocation is truly instant. Hard-capped at
+   * `GOVERNANCE_CACHE_TTL_HARD_CAP_MS` so worst-case revocation staleness stays
+   * small. `active:false` results are never cached.
+   */
+  governanceCacheTtlMs?: number;
+  /**
+   * Routable token prefixes that mark a token as governance-minted. Defaults to
+   * `['hab_at_', 'hab_pat_']` (short-TTL access + revocable-immortal PAT),
+   * mirroring the `generateToken` prefix convention. Governance owns the prefix
+   * (it is part of the contract).
+   */
+  governanceTokenPrefixes?: string[];
+}
+
+/** Default governance token prefixes (part of the GOV-2 introspection contract). */
+export const DEFAULT_GOVERNANCE_TOKEN_PREFIXES = ['hab_at_', 'hab_pat_'] as const;
+
+/**
+ * Hard cap on the governance introspection cache TTL (ms). Even when an operator
+ * opts into caching, worst-case revocation staleness is bounded to this. The
+ * co-located introspection call is a cheap loopback round-trip, so caching is a
+ * micro-opt, not a necessity — the cap keeps "instant revocation" nearly true.
+ */
+export const GOVERNANCE_CACHE_TTL_HARD_CAP_MS = 5000;
+
+/**
+ * Shape of the governance introspection response KS consumes (RFC 7662 §2.2).
+ * The canonical fixture (`test/fixtures/governance-introspection.contract.json`)
+ * is the byte-identical shared contract artifact both repos pin to.
+ */
+interface GovernanceIntrospectionResponse {
+  active: boolean;
+  principal?: string;
+  principal_kind?: string;
+  allowed_sources?: unknown;
+  scopes?: unknown;
+  expires_at?: number | null;
+  client_name?: string;
+  token_id?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,12 +441,46 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   private tokenTtl: number;
   private refreshTtl: number;
 
+  // --- GOV-2 governance introspection config (frozen at construction) ------
+  private readonly governanceIntrospectUrl?: string;
+  private readonly governanceClientId?: string;
+  private readonly governanceClientSecret?: string;
+  private readonly governanceCacheTtlMs: number;
+  private readonly governanceTokenPrefixes: string[];
+  /**
+   * Bounded introspection cache, keyed on `hashToken(token)` (never the raw
+   * token). Only `active:true` results are ever stored; `active:false` is never
+   * cached so a revoked token can't be re-served. Empty when TTL=0 (default).
+   */
+  private readonly governanceCache = new Map<string, { authInfo: SdkAuthInfo; expiresAtMs: number }>();
+
   constructor(options: GBrainOAuthProviderOptions) {
     this.sql = options.sql;
     this._clientsStore = new GBrainClientsStore(this.sql, options.allowClientCredentialsDcr === true);
     this.dcrDisabled = options.dcrDisabled === true;
     this.tokenTtl = options.tokenTtl || 3600;
     this.refreshTtl = options.refreshTtl || 30 * 24 * 3600;
+
+    // GOV-2: governance introspection is OFF unless an endpoint is configured.
+    // Trim so an empty/whitespace env var reads as unset (fail-closed).
+    const introUrl = options.governanceIntrospectUrl?.trim();
+    this.governanceIntrospectUrl = introUrl ? introUrl : undefined;
+    this.governanceClientId = options.governanceClientId;
+    this.governanceClientSecret = options.governanceClientSecret;
+    // Clamp the cache TTL into [0, hard cap]. NaN/negative → 0 (disabled).
+    const rawTtl = Number(options.governanceCacheTtlMs);
+    this.governanceCacheTtlMs = Number.isFinite(rawTtl) && rawTtl > 0
+      ? Math.min(rawTtl, GOVERNANCE_CACHE_TTL_HARD_CAP_MS)
+      : 0;
+    const prefixes = options.governanceTokenPrefixes?.filter(p => typeof p === 'string' && p.length > 0);
+    this.governanceTokenPrefixes = prefixes && prefixes.length > 0
+      ? prefixes
+      : [...DEFAULT_GOVERNANCE_TOKEN_PREFIXES];
+  }
+
+  /** True when the token carries a governance-minted prefix (contract-routable). */
+  private isGovernanceToken(token: string): boolean {
+    return this.governanceTokenPrefixes.some(p => token.startsWith(p));
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
@@ -588,6 +680,19 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const tokenHash = hashToken(token);
     const now = Math.floor(Date.now() / 1000);
 
+    // GOV-2: governance-introspection branch (runs BEFORE the local DB lookup).
+    // A token carrying a governance prefix is NEVER a local DB token — its
+    // authority is the governance service's introspection endpoint. This branch
+    // is fail-closed at every exit: prefix-but-not-configured, inactive,
+    // empty/missing allowed_sources, unreachable/timeout/non-200/malformed all
+    // THROW (deny). It NEVER falls through to the local path or the scalar
+    // `default` source — that is the exact cross-scope leak class the ctx.auth
+    // fix sealed. Non-governance tokens (the transitional bootstrap/legacy admin
+    // token) skip this entirely and take the local path below.
+    if (this.isGovernanceToken(token)) {
+      return this.introspectGovernanceToken(token, tokenHash, now);
+    }
+
     // Try OAuth tokens first. JOIN oauth_clients in the same query so
     // verifyAccessToken returns client_name AND source_id in AuthInfo —
     // eliminates the separate per-request lookup at serve-http.ts that
@@ -777,6 +882,139 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     }
 
     throw new InvalidTokenError('Invalid token');
+  }
+
+  // -------------------------------------------------------------------------
+  // GOV-2: Governance token introspection (RFC 7662 consumer half)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve a governance-minted opaque reference token by introspecting it
+   * against the co-located governance service (RFC 7662). Returns an `AuthInfo`
+   * whose `allowedSources` comes from the introspection response — the seam that
+   * moves grant authority out of the KS engine.
+   *
+   * FAIL-CLOSED at every branch — a governance-prefixed token that can't be
+   * positively affirmed as active + scoped is DENIED (`InvalidTokenError`). It
+   * never falls back to the local DB path or the scalar `default` source.
+   *
+   *   1. introspection not configured        → deny (misconfig fails closed)
+   *   2. active:false / unknown / revoked     → deny (zero access)
+   *   3. active:true, empty/missing scope     → deny (never unscoped/`default`)
+   *   4. active:true, expires_at < now        → deny (defensive clock-skew re-check)
+   *   5. unreachable/timeout/non-200/bad JSON → deny (never the local path)
+   *   6. active:true + non-empty scope        → AuthInfo{ allowedSources }
+   *
+   * The bounded cache (default TTL=0) is consulted first; only `active:true`
+   * results are ever cached, keyed on the token HASH (never the raw token).
+   */
+  private async introspectGovernanceToken(
+    token: string,
+    tokenHash: string,
+    now: number,
+  ): Promise<SdkAuthInfo> {
+    // (1) Prefix matched but introspection is not configured → fail closed.
+    // A governance token can only be honored by the authority; without it,
+    // deny rather than risk falling through to any local interpretation.
+    if (!this.governanceIntrospectUrl || !this.governanceClientId || !this.governanceClientSecret) {
+      throw new InvalidTokenError('Governance introspection not configured');
+    }
+
+    // Bounded cache lookup (only active results are ever stored here).
+    if (this.governanceCacheTtlMs > 0) {
+      const cached = this.governanceCache.get(tokenHash);
+      if (cached) {
+        if (cached.expiresAtMs > Date.now()) return cached.authInfo;
+        this.governanceCache.delete(tokenHash);
+      }
+    }
+
+    // Call the introspection endpoint. The URL is taken verbatim from config
+    // (an exact-value, operator-trusted allowlist) — no user/token-derived URL
+    // ever reaches fetch — so it is DELIBERATELY not run through
+    // fetchWithSSRFGuard, which rejects the private/co-located governance host.
+    let response: GovernanceIntrospectionResponse;
+    try {
+      const basic = Buffer.from(`${this.governanceClientId}:${this.governanceClientSecret}`).toString('base64');
+      const body = new URLSearchParams({ token, token_type_hint: 'access_token' }).toString();
+      const res = await fetch(this.governanceIntrospectUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${basic}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+        },
+        body,
+      });
+      // (5a) Non-200 → deny. Never leak the status into a fall-through.
+      if (!res.ok) {
+        throw new InvalidTokenError('Governance introspection failed');
+      }
+      response = (await res.json()) as GovernanceIntrospectionResponse;
+    } catch (err) {
+      // (5b) Unreachable / timeout / malformed JSON / any transport fault →
+      // fail closed. Re-throw an already-shaped InvalidTokenError as-is;
+      // wrap everything else so we NEVER leak a non-deny outcome.
+      if (err instanceof InvalidTokenError) throw err;
+      throw new InvalidTokenError('Governance introspection unreachable');
+    }
+
+    // (2) Inactive / unknown / revoked / expired → deny. active:false is the
+    // ONLY negative shape (RFC 7662 §2.2); it is never cached.
+    if (!response || response.active !== true) {
+      throw new InvalidTokenError('Token inactive');
+    }
+
+    // (3) Active but no scope → deny. An empty allowed_sources MUST NOT widen to
+    // "all sources" or fall to the scalar `default` — mirrors the
+    // sourceScopeOpts "[] is not all" rule. Defense-in-depth: the mint proves
+    // it never issues an empty scope, but we re-enforce here.
+    const allowedSources = Array.isArray(response.allowed_sources)
+      ? (response.allowed_sources as unknown[]).filter(
+          (s): s is string => typeof s === 'string' && s.length > 0,
+        )
+      : [];
+    if (allowedSources.length === 0) {
+      throw new InvalidTokenError('Token carries no allowed sources');
+    }
+
+    // (4) Defensive expiry re-check on top of trusting `active`. `expires_at` is
+    // epoch seconds; null (a PAT) → no wall-clock expiry, surfaced as a
+    // 1yr-forward marker to satisfy the SDK's `typeof expiresAt === 'number'`.
+    const rawExpiry = response.expires_at;
+    const expiresAt = coerceTimestamp(rawExpiry ?? undefined);
+    if (expiresAt !== undefined && expiresAt < now) {
+      throw new InvalidTokenError('Token expired');
+    }
+
+    const scopes = Array.isArray(response.scopes)
+      ? (response.scopes as unknown[]).filter((s): s is string => typeof s === 'string' && s.length > 0)
+      : [];
+
+    const authInfo = {
+      token,
+      // token_id is the opaque governance token id → AuthInfo.clientId (KS
+      // read-audit key). Fall back to the token hash if governance omits it.
+      clientId: (typeof response.token_id === 'string' && response.token_id) || tokenHash,
+      clientName: typeof response.client_name === 'string' ? response.client_name : undefined,
+      scopes: scopes.length > 0 ? scopes : ['read'],
+      // PAT (expires_at NULL) → revocable-immortal; SDK requires a number.
+      expiresAt: expiresAt ?? (now + 365 * 24 * 3600),
+      // allowedSources is the scope driver; leave sourceId undefined so
+      // sourceScopeOpts prefers the federated array (operations.ts:435-443).
+      allowedSources,
+    } as CoreAuthInfo as SdkAuthInfo;
+
+    // Cache ONLY active results, and only when caching is enabled. active:false
+    // is never stored (a revoked token must not be re-served from cache).
+    if (this.governanceCacheTtlMs > 0) {
+      this.governanceCache.set(tokenHash, {
+        authInfo,
+        expiresAtMs: Date.now() + this.governanceCacheTtlMs,
+      });
+    }
+
+    return authInfo;
   }
 
   // -------------------------------------------------------------------------
