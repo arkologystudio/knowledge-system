@@ -480,12 +480,40 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // constructor option instead of monkey-patching `_clientsStore` after
   // construction. Same outcome (no /register endpoint when --enable-dcr
   // is not passed); cleaner shape for tests and future maintainers.
+  // GOV-2: governance token introspection (RFC 7662). OFF unless
+  // GBRAIN_GOVERNANCE_INTROSPECT_URL is set, so this is safe to ship before the
+  // governance producer (GOV-1) exists. Client-credentials come from env/secret
+  // ONLY — never hardcoded, never logged. The cache TTL is hard-capped inside
+  // the provider; default 0 keeps revocation instant.
+  const governanceCacheTtlRaw = process.env.GBRAIN_GOVERNANCE_CACHE_TTL_MS;
   const oauthProvider = new GBrainOAuthProvider({
     sql,
     tokenTtl,
     dcrDisabled: !enableDcr,
     allowClientCredentialsDcr: enableDcrInsecure === true,
+    governanceIntrospectUrl: process.env.GBRAIN_GOVERNANCE_INTROSPECT_URL,
+    governanceClientId: process.env.GBRAIN_GOVERNANCE_CLIENT_ID,
+    governanceClientSecret: process.env.GBRAIN_GOVERNANCE_CLIENT_SECRET,
+    governanceCacheTtlMs: governanceCacheTtlRaw ? Number(governanceCacheTtlRaw) : undefined,
   });
+
+  // Surface the governance introspection posture (never the secret value).
+  if (process.env.GBRAIN_GOVERNANCE_INTROSPECT_URL) {
+    const hasCreds = !!(process.env.GBRAIN_GOVERNANCE_CLIENT_ID && process.env.GBRAIN_GOVERNANCE_CLIENT_SECRET);
+    if (hasCreds) {
+      console.error(
+        `[serve-http] Governance token introspection ENABLED → ${process.env.GBRAIN_GOVERNANCE_INTROSPECT_URL} ` +
+        `(hab_at_/hab_pat_ tokens verified via RFC 7662; cache TTL ${process.env.GBRAIN_GOVERNANCE_CACHE_TTL_MS || '0'}ms).`,
+      );
+    } else {
+      // Misconfiguration fails closed at verify time; warn loudly at startup.
+      console.error(
+        '[serve-http] WARNING: GBRAIN_GOVERNANCE_INTROSPECT_URL is set but ' +
+        'GBRAIN_GOVERNANCE_CLIENT_ID/GBRAIN_GOVERNANCE_CLIENT_SECRET are not — ' +
+        'governance-prefixed tokens will be DENIED until credentials are supplied.',
+      );
+    }
+  }
 
   // #1353: loud stderr security WARN when DCR is enabled. DCR is an
   // unauthenticated network registration endpoint; surface the posture change

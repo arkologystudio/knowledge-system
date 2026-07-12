@@ -1,0 +1,46 @@
+{
+  "$comment": "Canonical GOV-2 introspection contract (RFC 7662). SHARED, byte-identical, between habitat-governance (producer, /v1/introspect) and knowledge-system (consumer, verifyAccessToken). A breaking change takes /v2 with a coexistence window. Values here are the canonical example from the GOV-2 Technical Design; tests assert the FIELD SET and shape, not literal values.",
+  "version": "v1",
+  "endpoint": "POST /v1/introspect",
+  "request": {
+    "headers": {
+      "Authorization": "Basic base64(<GBRAIN_GOVERNANCE_CLIENT_ID>:<GBRAIN_GOVERNANCE_CLIENT_SECRET>)",
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    "body": "token=<opaque-reference-token>&token_type_hint=access_token"
+  },
+  "token_prefixes": {
+    "access": "hab_at_",
+    "pat": "hab_pat_"
+  },
+  "response_active": {
+    "active": true,
+    "principal": "human:alice@ext.example",
+    "principal_kind": "human",
+    "allowed_sources": ["zoa"],
+    "scopes": ["read"],
+    "expires_at": 1752300000,
+    "client_name": "alice (zoa guest)",
+    "token_id": "gtok_9f2c1e5b7a8d4f60b3c2a1e0d9f8c7b6"
+  },
+  "response_inactive": {
+    "active": false
+  },
+  "active_field_set": [
+    "active",
+    "principal",
+    "principal_kind",
+    "allowed_sources",
+    "scopes",
+    "expires_at",
+    "client_name",
+    "token_id"
+  ],
+  "principal_kinds": ["human", "agent", "service", "org"],
+  "notes": {
+    "expires_at": "epoch seconds; null for a PAT (expires_at NULL in the tokens table)",
+    "allowed_sources": "current source_id strings ⊆ (grants ∩ requested); MUST be non-empty for an active token (fail-closed)",
+    "token_id": "opaque governance token id (gtok_ prefix) → KS AuthInfo.clientId + read-audit key",
+    "inactive": "unknown/revoked/expired/empty-scope → { \"active\": false } ONLY (RFC 7662 §2.2 — leak no other claims)"
+  }
+}

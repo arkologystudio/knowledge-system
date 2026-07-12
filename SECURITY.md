@@ -260,6 +260,46 @@ psql "$DATABASE_URL" -c \
 `token_name = NULL`. Inserts are fire-and-forget so audit failures
 never block requests.
 
+### Governance token introspection (GOV-2, RFC 7662)
+
+When a co-located governance service owns identity + grants, `gbrain serve
+--http` can verify governance-minted tokens by **introspection** instead of the
+local DB. A token carrying a governance prefix (`hab_at_` short-TTL access,
+`hab_pat_` revocable-immortal PAT) is routed to the governance service's
+introspection endpoint; the response's `allowed_sources` becomes the token's
+source scope. Opaque reference tokens (not signed) mean **revocation is
+authoritative at governance and takes effect on the next introspection**.
+
+Off by default. Enable by pointing at the endpoint and supplying the
+confidential-client credentials KS presents as HTTP Basic:
+
+```bash
+GBRAIN_GOVERNANCE_INTROSPECT_URL=https://governance.internal/v1/introspect \
+GBRAIN_GOVERNANCE_CLIENT_ID=knowledge-system \
+GBRAIN_GOVERNANCE_CLIENT_SECRET=<secret> \
+gbrain serve --http --bind 0.0.0.0
+```
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `GBRAIN_GOVERNANCE_INTROSPECT_URL` | unset (introspection OFF) | RFC 7662 endpoint. Taken verbatim from config (exact-value allowlist); deliberately **not** SSRF-guarded because it is a trusted, private/co-located host. |
+| `GBRAIN_GOVERNANCE_CLIENT_ID` | unset | Confidential-client id KS presents (HTTP Basic). |
+| `GBRAIN_GOVERNANCE_CLIENT_SECRET` | unset | Confidential-client secret. **Env/secret store only — never committed or logged.** |
+| `GBRAIN_GOVERNANCE_CACHE_TTL_MS` | `0` (disabled) | Bounded introspection cache. `0` → every read re-introspects → instant revocation. Hard-capped at 5000ms; `active:false` is never cached. |
+
+**Fail-closed at every branch.** A governance-prefixed token is DENIED when
+introspection is not configured (URL or creds missing), returns `active:false`,
+returns `active:true` with empty/missing `allowed_sources`, is past
+`expires_at`, or the endpoint is unreachable / times out / returns non-200 /
+returns malformed JSON. It NEVER falls through to the local DB path or the
+scalar `default` source. Non-governance tokens (the transitional bootstrap admin
+token) are unaffected and keep the local path.
+
+The request/response shape is pinned by the byte-identical contract fixture
+`test/fixtures/governance-introspection.contract.json`, shared with the
+governance producer. A breaking change to the shape takes `/v2` with a
+coexistence window.
+
 **v0.26.9 redaction default.** The `params` column now stores
 `{redacted, kind, declared_keys, unknown_key_count, approx_bytes}` instead
 of raw JSON-RPC payloads. Declared keys (intersected against the operation's
