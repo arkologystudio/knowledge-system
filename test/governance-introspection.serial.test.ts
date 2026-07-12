@@ -25,6 +25,7 @@ import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { GBrainOAuthProvider } from '../src/core/oauth-provider.ts';
 import { sqlQueryForEngine } from '../src/core/sql-query.ts';
+import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 
 // The byte-identical shared contract artifact (copied from habitat-governance
 // origin/staging; GOV-1 tests against the same file). This checksum is the
@@ -48,6 +49,29 @@ function stubFetch(impl: (url: any, init: any) => Promise<any> | any): { calls: 
   globalThis.fetch = (async (url: any, init: any) => {
     counter.calls++;
     return impl(url, init);
+  }) as typeof globalThis.fetch;
+  return counter;
+}
+
+/**
+ * Install a fetch stub that simulates a HUNG endpoint: it never resolves, and
+ * only rejects when the caller's `AbortSignal` fires — with that signal's
+ * `reason` (a `TimeoutError` DOMException for `AbortSignal.timeout`), exactly as
+ * the real `fetch` does. Proves the introspection timeout actually aborts the
+ * call rather than blocking the auth path forever.
+ */
+function hungFetch(): { calls: number } {
+  const counter = { calls: 0 };
+  globalThis.fetch = (async (_url: any, init: any) => {
+    counter.calls++;
+    return await new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (signal) {
+        signal.addEventListener('abort', () =>
+          reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError')));
+      }
+      // No resolve path — the endpoint "hangs" until the timeout aborts it.
+    });
   }) as typeof globalThis.fetch;
   return counter;
 }
@@ -238,6 +262,34 @@ describe('GOV-2 fail-closed (every deny path)', () => {
   test('malformed JSON body → DENY', async () => {
     stubFetch(() => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token'); } }));
     await expect(providerWith().verifyAccessToken(GOV_TOKEN)).rejects.toThrow(/unreachable/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GOV-2-HARDEN — introspection fetch timeout + canonical error shape
+// ---------------------------------------------------------------------------
+
+describe('GOV-2-HARDEN fetch timeout + error shape', () => {
+  test('hung endpoint past the timeout → DENY (InvalidTokenError), never local path', async () => {
+    const counter = hungFetch();
+    // 20ms bound against a fetch that never resolves — AbortSignal.timeout fires,
+    // fetch rejects, and the provider fails CLOSED rather than blocking forever.
+    const provider = providerWith({ governanceIntrospectTimeoutMs: 20 });
+    const p = provider.verifyAccessToken(GOV_TOKEN);
+    await expect(p).rejects.toThrow(InvalidTokenError);
+    await expect(p).rejects.toThrow(/timed out/i);
+    expect(counter.calls).toBe(1); // the endpoint WAS called, then aborted
+  });
+
+  test('active:true but non-finite expires_at → DENY via canonical InvalidTokenError', async () => {
+    // An already-active response bearing a corrupt (non-numeric) expires_at.
+    // coerceTimestamp runs OUTSIDE the fetch try/catch; pre-hardening it threw a
+    // plain Error (→ a 500 from bearerAuth), now it throws the canonical
+    // InvalidTokenError (→ a 401 deny on the same path as every other branch).
+    stubFetch(() => activeResponse({ expires_at: 'not-a-number' }));
+    const p = providerWith().verifyAccessToken(GOV_TOKEN);
+    await expect(p).rejects.toThrow(InvalidTokenError);
+    await expect(p).rejects.toThrow(/non-finite/i);
   });
 });
 

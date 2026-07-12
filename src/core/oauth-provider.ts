@@ -157,9 +157,16 @@ function validateRedirectUri(uri: string): void {
  * rejects strings; (2) RFC 7591 §3.2.1 requires `client_id_issued_at` and
  * `client_secret_expires_at` to be JSON numbers in DCR responses, not strings.
  *
- * Throws on non-finite (NaN/Infinity) so corrupt rows fail loud at the boundary
- * instead of letting `expiresAt: NaN` flow through to the SDK as a fake-valid
- * token. Returns undefined for SQL NULL so callers decide NULL semantics
+ * Throws `InvalidTokenError` on non-finite (NaN/Infinity) so corrupt rows fail
+ * loud at the boundary instead of letting `expiresAt: NaN` flow through to the
+ * SDK as a fake-valid token. `InvalidTokenError` (not a plain `Error`) is the
+ * canonical deny shape: it is caught by the SDK's bearerAuth middleware as a
+ * 401 invalid_token rather than surfacing as a 500. This matters at the one
+ * call site that runs OUTSIDE a try/catch — the governance introspection
+ * expiry re-check (`introspectGovernanceToken` step 4) — where an already-
+ * `active:true` response bearing a non-finite `expires_at` must still DENY
+ * through the canonical path.
+ * Returns undefined for SQL NULL so callers decide NULL semantics
  * explicitly. For OAuth, the comparison sites treat NULL as "expired"
  * (fail-closed); the DCR response sites preserve undefined per RFC 7591
  * (the `client_secret_expires_at` field is optional, undefined means
@@ -169,7 +176,7 @@ export function coerceTimestamp(value: unknown): number | undefined {
   if (value === null || value === undefined) return undefined;
   const n = Number(value);
   if (!Number.isFinite(n)) {
-    throw new Error(`coerceTimestamp: non-finite timestamp value ${JSON.stringify(value)}`);
+    throw new InvalidTokenError(`coerceTimestamp: non-finite timestamp value ${JSON.stringify(value)}`);
   }
   return n;
 }
@@ -231,6 +238,15 @@ interface GBrainOAuthProviderOptions {
    * (it is part of the contract).
    */
   governanceTokenPrefixes?: string[];
+  /**
+   * Bounded timeout (ms) for the introspection `fetch`. Without it a hung
+   * governance endpoint would block the live-brain auth path indefinitely.
+   * Default `DEFAULT_GOVERNANCE_INTROSPECT_TIMEOUT_MS` (5000). NaN/≤0 → the
+   * default. On timeout the `fetch` aborts and the call fails CLOSED (deny,
+   * `InvalidTokenError`) exactly like any other transport fault — it never falls
+   * through to the local path or the scalar `default` source.
+   */
+  governanceIntrospectTimeoutMs?: number;
 }
 
 /** Default governance token prefixes (part of the GOV-2 introspection contract). */
@@ -243,6 +259,17 @@ export const DEFAULT_GOVERNANCE_TOKEN_PREFIXES = ['hab_at_', 'hab_pat_'] as cons
  * micro-opt, not a necessity — the cap keeps "instant revocation" nearly true.
  */
 export const GOVERNANCE_CACHE_TTL_HARD_CAP_MS = 5000;
+
+/**
+ * Default bound (ms) on the governance introspection `fetch`. The introspection
+ * call sits on the live-brain auth path; without a timeout a hung governance
+ * endpoint blocks every governance-token verification indefinitely (an
+ * availability/DoS gap — it never returns valid auth, but it never returns at
+ * all). 5s is generous for a co-located loopback round-trip yet still bounds the
+ * worst case. Override per-provider via `governanceIntrospectTimeoutMs`
+ * (env `GBRAIN_GOVERNANCE_INTROSPECT_TIMEOUT_MS`).
+ */
+export const DEFAULT_GOVERNANCE_INTROSPECT_TIMEOUT_MS = 5000;
 
 /**
  * Shape of the governance introspection response KS consumes (RFC 7662 §2.2).
@@ -447,6 +474,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   private readonly governanceClientSecret?: string;
   private readonly governanceCacheTtlMs: number;
   private readonly governanceTokenPrefixes: string[];
+  private readonly governanceIntrospectTimeoutMs: number;
   /**
    * Bounded introspection cache, keyed on `hashToken(token)` (never the raw
    * token). Only `active:true` results are ever stored; `active:false` is never
@@ -476,6 +504,12 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     this.governanceTokenPrefixes = prefixes && prefixes.length > 0
       ? prefixes
       : [...DEFAULT_GOVERNANCE_TOKEN_PREFIXES];
+    // Bound the introspection fetch. NaN/≤0 → the default (a hung endpoint must
+    // never block the auth path forever; there is no "unbounded" opt-out).
+    const rawTimeout = Number(options.governanceIntrospectTimeoutMs);
+    this.governanceIntrospectTimeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0
+      ? rawTimeout
+      : DEFAULT_GOVERNANCE_INTROSPECT_TIMEOUT_MS;
   }
 
   /** True when the token carries a governance-minted prefix (contract-routable). */
@@ -945,6 +979,10 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
           Accept: 'application/json',
         },
         body,
+        // Bound the call so a hung governance endpoint can't block the auth path
+        // forever. On expiry fetch rejects with a TimeoutError → the catch below
+        // fails closed (deny), never a fall-through.
+        signal: AbortSignal.timeout(this.governanceIntrospectTimeoutMs),
       });
       // (5a) Non-200 → deny. Never leak the status into a fall-through.
       if (!res.ok) {
@@ -956,6 +994,11 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // fail closed. Re-throw an already-shaped InvalidTokenError as-is;
       // wrap everything else so we NEVER leak a non-deny outcome.
       if (err instanceof InvalidTokenError) throw err;
+      // AbortSignal.timeout(...) fired → the endpoint hung past the bound. Same
+      // fail-closed outcome as any transport fault; distinct message for logs.
+      if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+        throw new InvalidTokenError('Governance introspection timed out');
+      }
       throw new InvalidTokenError('Governance introspection unreachable');
     }
 

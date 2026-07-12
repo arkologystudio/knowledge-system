@@ -3,7 +3,7 @@
 ## Reporting Vulnerabilities
 
 If you discover a security issue in GBrain, please report it privately by opening
-a [private security advisory](https://github.com/garrytan/gbrain/security/advisories/new)
+a [private security advisory](https://github.com/arkologystudio/knowledge-system/security/advisories/new)
 on GitHub.
 
 Do not open a public issue for security vulnerabilities.
@@ -286,6 +286,7 @@ gbrain serve --http --bind 0.0.0.0
 | `GBRAIN_GOVERNANCE_CLIENT_ID` | unset | Confidential-client id KS presents (HTTP Basic). |
 | `GBRAIN_GOVERNANCE_CLIENT_SECRET` | unset | Confidential-client secret. **Env/secret store only — never committed or logged.** |
 | `GBRAIN_GOVERNANCE_CACHE_TTL_MS` | `0` (disabled) | Bounded introspection cache. `0` → every read re-introspects → instant revocation. Hard-capped at 5000ms; `active:false` is never cached. |
+| `GBRAIN_GOVERNANCE_INTROSPECT_TIMEOUT_MS` | `5000` | Bound on the introspection `fetch` (`AbortSignal.timeout`). A hung governance endpoint would otherwise block the auth path indefinitely; on expiry the call fails closed (DENY). NaN/≤0 → the default. |
 
 **Fail-closed at every branch.** A governance-prefixed token is DENIED when
 introspection is not configured (URL or creds missing), returns `active:false`,
