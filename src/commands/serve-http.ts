@@ -486,6 +486,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ONLY — never hardcoded, never logged. The cache TTL is hard-capped inside
   // the provider; default 0 keeps revocation instant.
   const governanceCacheTtlRaw = process.env.GBRAIN_GOVERNANCE_CACHE_TTL_MS;
+  const governanceTimeoutRaw = process.env.GBRAIN_GOVERNANCE_INTROSPECT_TIMEOUT_MS;
   const oauthProvider = new GBrainOAuthProvider({
     sql,
     tokenTtl,
@@ -495,6 +496,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     governanceClientId: process.env.GBRAIN_GOVERNANCE_CLIENT_ID,
     governanceClientSecret: process.env.GBRAIN_GOVERNANCE_CLIENT_SECRET,
     governanceCacheTtlMs: governanceCacheTtlRaw ? Number(governanceCacheTtlRaw) : undefined,
+    governanceIntrospectTimeoutMs: governanceTimeoutRaw ? Number(governanceTimeoutRaw) : undefined,
   });
 
   // Surface the governance introspection posture (never the secret value).
