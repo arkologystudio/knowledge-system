@@ -1,0 +1,41 @@
+# Arkology Knowledge System — HTTP MCP retrieval endpoint (KS-E).
+#
+# The auth-bearing read path for external agents (e.g. Douglas's Claude Code):
+# `gbrain serve --http` exposes OAuth 2.1 MCP + verifies governance-minted
+# tokens (hab_at_/hab_pat_) via RFC 7662 introspection against habitat-governance.
+#
+# Mirrors the box's proven knowledge-system-sync.service pattern (same bun path,
+# same gbrain.env, Restart=always). Bound to 127.0.0.1 — public reach ONLY via
+# the Cloudflare tunnel. Install per docs/deploy/KS-E-governance-retrieval.md.
+#
+# Placeholders to fill before install:
+#   <KS_PUBLIC_URL>  the public issuer, e.g. https://kb.arkology.studio
+#                    (must match the CF tunnel hostname you point at :3131)
+
+[Unit]
+Description=Arkology Knowledge System - HTTP MCP retrieval endpoint (OAuth 2.1 + governance introspection)
+After=network-online.target docker.service
+Wants=network-online.target
+# Postgres (KS brain) runs as a docker container; don't start before it.
+Requires=docker.service
+
+[Service]
+Type=simple
+# Brain/DB/embedding config (shared with sync + dream units).
+EnvironmentFile=/etc/gbrain/gbrain.env
+# Governance introspection creds (KS-E). Separate file → least privilege; the
+# sync/dream units never load the governance client secret. See
+# ops/kb-vps/governance.env.example.
+EnvironmentFile=/etc/gbrain/governance.env
+Environment=PATH=/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# --bind 127.0.0.1 (serve-http default; explicit here): loopback only, fronted
+# by the Cloudflare tunnel. Never bind 0.0.0.0 on this shared box.
+# NB: `serve --http` serves the WHOLE brain with per-token source scoping — it
+# takes no --source (unlike the sync/dream units); access is decided per token.
+ExecStart=/root/.bun/bin/gbrain serve --http --port 3131 --bind 127.0.0.1 --public-url <KS_PUBLIC_URL>
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
