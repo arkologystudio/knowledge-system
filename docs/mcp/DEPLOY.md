@@ -129,7 +129,7 @@ gbrain auth register-client dept-x-agent \
   --federated-read dept-x,shared,parent-canon
 ```
 
-`--source` controls the write authority — `put_page` / `add_link` / etc only
+`--source` controls the write authority — `commit_page` / `put_page` / `add_link` / etc only
 land in `dept-x`. `--federated-read` controls the read axis independently;
 queries return rows from any of the listed sources. Omit both flags for the
 v0.33-compatible super-client shape. Pre-v0.34 clients are backfilled to
@@ -289,6 +289,8 @@ Remote servers must be added via Settings > Integrations, NOT
 | list_pages | < 200ms | DB query with filters |
 | search (keyword) | 100-300ms | Full-text search |
 | query (hybrid) | 1-3s | Embedding + vector + keyword + RRF |
+| commit_page preview | 100-1000ms | Pull + validate + bounded diff; no write |
+| commit_page apply | 1-5s | Commit + Git push, then immediate index update |
 | put_page | 100-500ms | Write + trigger search_vector update |
 | get_stats | < 100ms | Aggregate query |
 
