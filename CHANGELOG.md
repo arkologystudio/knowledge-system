@@ -2,6 +2,20 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.0] - 2026-07-15
+
+**Approved agents can now propose and commit canonical wiki pages through the same remote MCP surface they already use for retrieval, without needing a local checkout or shell access. Every write is previewed, concurrency-checked, committed to Git, pushed, and indexed before success is reported.**
+
+### Added
+- **Git-first `commit_page` MCP writes.** Write-scoped clients can preview a complete markdown change, inspect its diff, then apply the exact preview using the returned Git HEAD and content hash. The server validates frontmatter and paths, refuses dirty or conflicting checkouts, serializes concurrent writes, records the calling agent and source in commit trailers, pushes before acknowledging success, and refreshes the derived index immediately.
+- **Operator-controlled rollout.** The writer is disabled by default and supports protected slug patterns so constitutional pages such as `north-star` and `voice/*` remain human-authored. Connected-agent guidance now teaches the preview/apply flow for Claude, Codex, Perplexity, and generic MCP clients.
+
+### Fixed
+- **Git failures cannot leak embedded remote credentials.** Error messages returned through MCP redact URL user information before reaching remote callers.
+
+### To take advantage of v0.43.0.0
+Upgrade the server, then opt in with `gbrain config set writer.commit_page.enabled true`. Protect human-authored pages with `gbrain config set writer.commit_page.protected_slugs 'north-star,voice/*'`, and grant `write` only to clients that should be able to propose canonical changes.
+
 ## [0.42.57.0] - 2026-07-02
 
 **PGLite incident fix: a busy `gbrain dream` (or `embed`) could have its data-directory lock stolen and get its brain corrupted beyond in-place repair. The lock will no longer be taken from a process that is alive, and an already-corrupted store now tells you exactly how to recover.**

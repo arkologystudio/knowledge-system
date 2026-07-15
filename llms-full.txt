@@ -3698,7 +3698,7 @@ gbrain auth register-client dept-x-agent \
   --federated-read dept-x,shared,parent-canon
 ```
 
-`--source` controls the write authority — `put_page` / `add_link` / etc only
+`--source` controls the write authority — `commit_page` / `put_page` / `add_link` / etc only
 land in `dept-x`. `--federated-read` controls the read axis independently;
 queries return rows from any of the listed sources. Omit both flags for the
 v0.33-compatible super-client shape. Pre-v0.34 clients are backfilled to
@@ -3752,7 +3752,22 @@ filesystem surface area.
 | Scope | What it allows |
 |-------|---------------|
 | `read` | `search`, `query`, `get_page`, `list_pages`, graph traversal |
-| `write` | `put_page`, `delete_page`, `add_link`, `add_timeline_entry` |
+| `write` | `commit_page`, `put_page`, `delete_page`, `add_link`, `add_timeline_entry` |
+
+For durable remote knowledge writes, enable and use the Git-first surface:
+
+```bash
+gbrain config set writer.commit_page.enabled true
+gbrain config set writer.commit_page.protected_slugs 'north-star,voice/*'
+```
+
+Call `commit_page` once with `mode=preview`, show the returned diff to the
+operator, then call `mode=apply` with the returned `head_before` and
+`content_sha256`. Apply fails if either token has changed, if the checkout is
+dirty, if a pull conflicts, or if the slug matches the protected list. The Git
+push completes before the derived index is updated. Keep `put_page` for trusted
+local ingestion pipelines or compatibility clients that deliberately accept
+DB-first semantics.
 | `admin` | Client management, token revocation, sweep, local-only ops |
 
 ## Legacy Bearer Token Setup
@@ -3843,6 +3858,8 @@ Remote servers must be added via Settings > Integrations, NOT
 | list_pages | < 200ms | DB query with filters |
 | search (keyword) | 100-300ms | Full-text search |
 | query (hybrid) | 1-3s | Embedding + vector + keyword + RRF |
+| commit_page preview | 100-1000ms | Pull + validate + bounded diff; no write |
+| commit_page apply | 1-5s | Commit + Git push, then immediate index update |
 | put_page | 100-500ms | Write + trigger search_vector update |
 | get_stats | < 100ms | Aggregate query |
 

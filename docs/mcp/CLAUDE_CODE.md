@@ -80,8 +80,10 @@ You should see results from your GBrain knowledge base.
 > on the host. New brains from `gbrain init` default it ON; brains upgraded from an
 > older release stay OFF until you opt in. Enable it on the host with
 > `gbrain config set mcp.publish_skills true`. The core tools (search, query,
-> get_page, put_page, think, find_experts) work regardless. Note: `capture` is a
-> CLI-only command, not an MCP tool — the agent writes over MCP with `put_page`.
+> get_page, commit_page, put_page, think, find_experts) work regardless. Note:
+> `capture` is a CLI-only command, not an MCP tool. Canonical remote writes use
+> `commit_page` preview then approved apply; `put_page` is the low-level
+> compatibility and ingestion surface.
 
 ## Remove
 

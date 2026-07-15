@@ -68,14 +68,17 @@ export const AGENT_IDS: AgentId[] = ['claude-code', 'codex', 'perplexity', 'gene
 
 // The named tools MUST be real MCP-exposed ops (verified by the round-trip
 // E2E). `capture` is intentionally absent: it's a CLI-only convenience wrapper,
-// not an MCP tool — the agent writes over MCP with `put_page`.
+// not an MCP tool. Canonical remote writes use `commit_page` preview/apply;
+// `put_page` remains exposed for compatibility and low-level ingestion.
 export const LEARN_INSTRUCTION =
   'Once connected, call the `get_brain_identity` tool (whose brain this is), then ' +
   '`list_skills` (everything it can do; if it errors, the host has not enabled skill ' +
-  'publishing — these core tools still work: search, query, get_page, put_page, ' +
+  'publishing — these core tools still work: search, query, get_page, commit_page, ' +
   'think, find_experts). Then call `list_brain_skillpack`: if this brain ships a ' +
   'skillpack, ask the user whether to install it (gbrain skillpack scaffold <spec>). ' +
-  'Always search the brain before answering or writing.';
+  'Always search the brain before answering. For canonical writes, call `commit_page` ' +
+  'with mode=preview, show the diff for approval, then apply the identical content with ' +
+  'the returned HEAD and SHA-256 tokens.';
 
 const SECRET_NOTE =
   'Note: that bearer token is a long-lived, full-access secret — keep it private and ' +

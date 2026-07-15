@@ -11,6 +11,7 @@ import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
 import { writePageThrough } from './write-through.ts';
+import { gitFirstPageWrite, GitPageWriteError } from './git-page-write.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
@@ -1114,6 +1115,103 @@ const put_page: Operation = {
     };
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
+};
+
+/**
+ * Canonical remote write surface: git is committed + pushed first, then the
+ * derived index is updated. `put_page` remains the low-level DB/write-through
+ * primitive for local pipelines and backwards compatibility.
+ */
+const commit_page: Operation = {
+  name: 'commit_page',
+  description:
+    'Preview or apply a canonical markdown page write. Apply requires the exact HEAD and content SHA-256 returned by preview, commits and pushes the source Git repo first, then updates the derived index for immediate recall. Remote use is fail-closed until writer.commit_page.enabled=true.',
+  params: {
+    mode: { type: 'string', required: true, enum: ['preview', 'apply'], description: 'preview returns a bounded diff and concurrency tokens; apply performs the approved write.' },
+    slug: { type: 'string', required: true, description: 'Repo-relative page slug without .md.' },
+    content: { type: 'string', required: true, description: 'Complete markdown page with valid YAML frontmatter.' },
+    commit_message: { type: 'string', description: 'Required for apply; one-line commit subject.' },
+    expected_head: { type: 'string', description: 'Required for apply; head_before returned by preview.' },
+    expected_content_sha256: { type: 'string', description: 'Required for apply; content_sha256 returned by preview.' },
+  },
+  mutating: true,
+  scope: 'write',
+  handler: async (ctx, p) => {
+    const mode = p.mode === 'preview' || p.mode === 'apply' ? p.mode : null;
+    if (!mode) throw new OperationError('invalid_params', "commit_page mode must be 'preview' or 'apply'");
+
+    if (ctx.remote !== false) {
+      const enabled = await ctx.engine.getConfig('writer.commit_page.enabled');
+      if (enabled !== 'true') {
+        throw new OperationError(
+          'permission_denied',
+          'remote commit_page is disabled',
+          'An operator must set writer.commit_page.enabled=true on the brain host.',
+        );
+      }
+      if (!ctx.sourceId) {
+        throw new OperationError(
+          'permission_denied',
+          'remote commit_page requires an OAuth client scoped to one write source',
+        );
+      }
+    }
+
+    const sourceId = ctx.sourceId ?? 'default';
+    const protectedRaw = (await ctx.engine.getConfig('writer.commit_page.protected_slugs')) ?? '';
+    const protectedSlugs = protectedRaw.split(',').map((s) => s.trim()).filter(Boolean);
+    const actor = ctx.auth?.clientName
+      ? `mcp:${ctx.auth.clientName}`
+      : ctx.auth?.clientId
+        ? `mcp:${ctx.auth.clientId.slice(0, 12)}`
+        : 'local-cli';
+
+    try {
+      const gitResult = await gitFirstPageWrite(ctx.engine, {
+        mode,
+        sourceId,
+        slug: String(p.slug),
+        content: String(p.content),
+        expectedHead: typeof p.expected_head === 'string' ? p.expected_head : undefined,
+        expectedContentSha256: typeof p.expected_content_sha256 === 'string' ? p.expected_content_sha256 : undefined,
+        commitMessage: typeof p.commit_message === 'string' ? p.commit_message : undefined,
+        actor,
+        protectedSlugs,
+      });
+
+      if (mode === 'preview') return { ...gitResult, indexed: false };
+
+      // Git is now canonical and remote-durable. Indexing is deliberately
+      // second; if it fails, the sync daemon reconciles from the pushed repo.
+      const { isAvailable } = await import('./ai/gateway.ts');
+      const indexed = await importFromContent(ctx.engine, gitResult.slug, String(p.content), {
+        noEmbed: !isAvailable('embedding'),
+        sourceId,
+        sourcePath: `${gitResult.slug}.md`,
+        remote: ctx.remote !== false,
+        source_kind: ctx.remote === false ? 'commit_page' : 'mcp:commit_page',
+        source_uri: null,
+        ingested_via: 'mcp:commit_page',
+      });
+      const page = await ctx.engine.getPage(gitResult.slug, { sourceId });
+      return {
+        ...gitResult,
+        indexed: indexed.status !== 'error' && !!page,
+        index_status: indexed.status,
+        index_error: indexed.error,
+        verified_slug: page?.slug ?? null,
+      };
+    } catch (e) {
+      if (e instanceof GitPageWriteError) {
+        const permissionCodes = new Set(['disabled', 'protected_path']);
+        throw new OperationError(
+          permissionCodes.has(e.code) ? 'permission_denied' : e.code,
+          e.message,
+        );
+      }
+      throw e;
+    }
+  },
 };
 
 // v0.31.2: isFactsBackstopEligible moved to src/core/facts/eligibility.ts
@@ -5632,7 +5730,7 @@ const pat_revoke: Operation = {
 
 export const operations: Operation[] = [
   // Page CRUD
-  get_page, put_page, delete_page, list_pages,
+  get_page, put_page, commit_page, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
   restore_page, purge_deleted_pages,
   // Search
