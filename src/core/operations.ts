@@ -261,6 +261,10 @@ export interface AuthInfo {
   clientName?: string;
   scopes: string[];
   expiresAt?: number;
+  /** Credential authority. Governance-minted opaque tokens use a `gtok_*`
+   * audit id rather than the local `gbrain_cl_*` prefix, so transports must
+   * not infer their issuer from clientId alone. */
+  issuer?: 'governance';
   /**
    * v0.34.1 (#861, D2): the source the calling OAuth client is scoped
    * to (write authority). Sourced from `oauth_clients.source_id` at
@@ -3880,14 +3884,23 @@ const whoami: Operation = {
           'or set ctx.remote === false.',
       );
     }
-    // OAuth tokens have client_id starting with 'gbrain_cl_'; legacy
+    // Local OAuth tokens have client_id starting with 'gbrain_cl_'.
+    // Governance OAuth tokens carry a gtok_* audit id plus issuer metadata;
+    // treating those as legacy hides the canonical authority and drops their
+    // real expiry from this diagnostic surface.
+    // Legacy
     // access_tokens reuse `name` as both clientId and clientName (verifyAccessToken
     // at oauth-provider.ts:417-430). Detect by inspecting the prefix.
-    const isOauth = ctx.auth.clientId.startsWith('gbrain_cl_');
+    const isGovernanceOauth = ctx.auth.issuer === 'governance';
+    const isOauth = isGovernanceOauth || ctx.auth.clientId.startsWith('gbrain_cl_');
     if (isOauth) {
+      const vouchedClientId = isGovernanceOauth && ctx.auth.clientName?.startsWith('oauth:')
+        ? ctx.auth.clientName.slice('oauth:'.length)
+        : ctx.auth.clientId;
       return {
         transport: 'oauth',
-        client_id: ctx.auth.clientId,
+        issuer: isGovernanceOauth ? 'governance' : 'local',
+        client_id: vouchedClientId,
         client_name: ctx.auth.clientName ?? ctx.auth.clientId,
         scopes: ctx.auth.scopes,
         expires_at: ctx.auth.expiresAt ?? null,

@@ -1043,6 +1043,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       scopes: scopes.length > 0 ? scopes : ['read'],
       // PAT (expires_at NULL) → revocable-immortal; SDK requires a number.
       expiresAt: expiresAt ?? (now + 365 * 24 * 3600),
+      issuer: 'governance',
       // allowedSources is the scope driver; leave sourceId undefined so
       // sourceScopeOpts prefers the federated array (operations.ts:435-443).
       allowedSources,

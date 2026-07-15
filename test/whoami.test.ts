@@ -69,10 +69,31 @@ describe('whoami op contract', () => {
       {},
     )) as any;
     expect(result.transport).toBe('oauth');
+    expect(result.issuer).toBe('local');
     expect(result.client_id).toBe('gbrain_cl_abc');
     expect(result.client_name).toBe('gstack-test');
     expect(result.scopes).toEqual(['read', 'sources_admin']);
     expect(result.expires_at).toBe(1234567890);
+  });
+
+  test('governance OAuth transport is not misreported as legacy', async () => {
+    const auth: AuthInfo = {
+      token: 'hab_at_xxx',
+      clientId: 'gtok_abc',
+      clientName: 'oauth:gbrain_cl_governed',
+      scopes: ['read'],
+      expiresAt: 1234567890,
+      issuer: 'governance',
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    expect(result).toMatchObject({
+      transport: 'oauth',
+      issuer: 'governance',
+      client_id: 'gbrain_cl_governed',
+      client_name: 'oauth:gbrain_cl_governed',
+      scopes: ['read'],
+      expires_at: 1234567890,
+    });
   });
 
   test('legacy transport (token name as clientId, no gbrain_cl_ prefix)', async () => {
