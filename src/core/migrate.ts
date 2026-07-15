@@ -6007,6 +6007,42 @@ export const MIGRATIONS: Migration[] = [
       return (pol[0]?.n ?? 0) === 11;
     },
   },
+  {
+    version: 126,
+    name: 'rls_search_support_grants',
+    // Remote query/search runs under the v125 gbrain_request role. The hybrid
+    // path also reads the cache-generation sequence and page aliases before it
+    // reaches the corpus tables; both are read-only support objects, but v125
+    // omitted their privileges. Existing nodes need a new migration because
+    // editing the already-recorded v125 handler would not repair them.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind !== 'postgres') return;
+      await engine.runMigration(126, `
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'gbrain_request') THEN
+            GRANT SELECT ON SEQUENCE page_generation_clock_seq TO gbrain_request;
+            GRANT SELECT ON TABLE page_aliases TO gbrain_request;
+          END IF;
+        END $$;
+      `);
+    },
+    verify: async (engine) => {
+      if (engine.kind !== 'postgres') return true;
+      const role = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'gbrain_request'`,
+      );
+      if ((role[0]?.n ?? 0) === 0) return true;
+      const privileges = await engine.executeRaw<{ sequence_ok: boolean; aliases_ok: boolean }>(
+        `SELECT
+           has_sequence_privilege('gbrain_request', 'page_generation_clock_seq', 'SELECT') AS sequence_ok,
+           has_table_privilege('gbrain_request', 'page_aliases', 'SELECT') AS aliases_ok`,
+      );
+      return privileges[0]?.sequence_ok === true && privileges[0]?.aliases_ok === true;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

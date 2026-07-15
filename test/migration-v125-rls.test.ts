@@ -1,5 +1,5 @@
 /**
- * Migration v125 — source RLS policies + the `gbrain_request` request role
+ * Migrations v125-v126 — source RLS policies, request role, and search support
  * (Knowledge System KS-C, in-DB row-level security).
  *
  * This suite runs on PGLite (Postgres 17.5 in WASM), where the whole v125
@@ -17,7 +17,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runMigrations, LATEST_VERSION } from '../src/core/migrate.ts';
 
-describe('migration v125 — source RLS policies (PGLite no-op contract)', () => {
+describe('migrations v125-v126 — source RLS policies (PGLite no-op contract)', () => {
   let engine: PGLiteEngine;
 
   beforeAll(async () => {
@@ -30,13 +30,13 @@ describe('migration v125 — source RLS policies (PGLite no-op contract)', () =>
     await engine.disconnect();
   });
 
-  test('v125 is the latest migration version', () => {
-    expect(LATEST_VERSION).toBeGreaterThanOrEqual(125);
+  test('v126 is the latest migration version', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(126);
   });
 
-  test('schema version reached >= 125 after initSchema', async () => {
+  test('schema version reached >= 126 after initSchema', async () => {
     const v = await engine.getConfig('version');
-    expect(parseInt(v || '0', 10)).toBeGreaterThanOrEqual(125);
+    expect(parseInt(v || '0', 10)).toBeGreaterThanOrEqual(126);
   });
 
   test('PGLite no-op: no gbrain_request role is created', async () => {
