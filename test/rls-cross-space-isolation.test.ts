@@ -66,6 +66,10 @@ describeRls('KS-C in-DB RLS cross-space isolation (real Postgres)', () => {
       INSERT INTO content_chunks (page_id, chunk_index, chunk_text) VALUES
         (${idA}, 0, ${CHUNK_A}),
         (${idB}, 0, ${CHUNK_B})`;
+    await sql`
+      UPDATE content_chunks
+         SET search_vector = to_tsvector('english', chunk_text)
+       WHERE page_id = ANY(${[idA, idB]})`;
   }, 60_000);
 
   afterAll(async () => {
@@ -189,5 +193,17 @@ describeRls('KS-C in-DB RLS cross-space isolation (real Postgres)', () => {
     );
     expect(resid[0].v ?? '').toBe('');
     expect(resid[0].v ?? '').not.toContain(SRC_A);
+  });
+
+  test('keyword search can open its timeout scope inside the outer RLS transaction', async () => {
+    const results = await engine.withRlsScope([SRC_A], (e) =>
+      e.searchKeyword('alpha', { sourceIds: [SRC_A], limit: 10 }),
+    );
+
+    // The regression assertion is reaching the query result without
+    // `sql.begin is not a function`; corpus visibility is proven separately
+    // above because ranking fixtures are intentionally outside this RLS suite.
+    expect(Array.isArray(results)).toBe(true);
+    expect(results.every((row) => row.source_id !== SRC_B)).toBe(true);
   });
 });

@@ -81,6 +81,35 @@ function toPgTextArrayLiteral(values: readonly string[]): string {
   return '{' + values.map((v) => '"' + v.replace(/(["\\])/g, '\\$1') + '"').join(',') + '}';
 }
 
+/**
+ * postgres.js transaction handles expose `savepoint()`, not `begin()`. Engine
+ * methods such as the search paths deliberately call `this.sql.begin()` to
+ * scope their own SET LOCAL values. When those methods run inside the outer
+ * RLS transaction, preserve that contract by mapping nested `begin()` calls to
+ * savepoints on the existing transaction.
+ */
+function transactionCompatibleSql(
+  tx: postgres.TransactionSql,
+): ReturnType<typeof postgres> {
+  const begin = (<T>(
+    cbOrOptions: string | ((sql: postgres.TransactionSql) => T | Promise<T>),
+    _optionalCb?: (sql: postgres.TransactionSql) => T | Promise<T>,
+  ) => {
+    if (typeof cbOrOptions === 'string') {
+      throw new TypeError('Nested transaction options are unsupported inside an RLS scope');
+    }
+    return tx.savepoint(cbOrOptions);
+  }) as ReturnType<typeof postgres>['begin'];
+
+  return new Proxy(tx, {
+    get(target, property, receiver) {
+      return property === 'begin'
+        ? begin
+        : Reflect.get(target, property, receiver);
+    },
+  }) as unknown as ReturnType<typeof postgres>;
+}
+
 export function getPostgresSchema(
   dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
   model: string = DEFAULT_EMBEDDING_MODEL,
@@ -898,11 +927,12 @@ export class PostgresEngine implements BrainEngine {
     return conn.begin(async (tx) => {
       await tx`SET LOCAL ROLE gbrain_request`;
       await tx`SELECT set_config('app.allowed_sources', ${literal}, true)`;
+      const scopedSql = transactionCompatibleSql(tx);
       // Scoped engine over the tx connection (mirrors `transaction()` above);
       // no shared-state mutation, so concurrent requests stay isolated.
       const txEngine = Object.create(this) as PostgresEngine;
-      Object.defineProperty(txEngine, 'sql', { get: () => tx });
-      Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
+      Object.defineProperty(txEngine, 'sql', { get: () => scopedSql });
+      Object.defineProperty(txEngine, '_sql', { value: scopedSql, writable: false });
       return fn(txEngine);
     }) as Promise<T>;
   }
