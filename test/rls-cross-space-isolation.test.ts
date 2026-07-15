@@ -114,6 +114,15 @@ describeRls('KS-C in-DB RLS cross-space isolation (real Postgres)', () => {
     expect(rows[0].n).toBe(11);
   });
 
+  test('request role can read the support objects used by hybrid search', async () => {
+    await underRole(`{${SRC_A}}`, async (tx) => {
+      const clock = await tx`SELECT last_value FROM page_generation_clock_seq`;
+      const aliases = await tx`SELECT count(*)::int AS n FROM page_aliases`;
+      expect(clock.length).toBe(1);
+      expect(Number(aliases[0].n)).toBeGreaterThanOrEqual(0);
+    });
+  });
+
   test('scoped to A: pages — asking for B returns 0 rows, A returns the row', async () => {
     await underRole(`{${SRC_A}}`, async (tx) => {
       const b = await tx`SELECT source_id FROM pages WHERE source_id = ${SRC_B}`;
