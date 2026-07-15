@@ -901,6 +901,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // the advisor exposes operational diagnostics (version/jobs/key presence),
   // not prose skills. Default OFF; read-only over MCP.
   'mcp.publish_advisor',
+  // Git-first remote page writes. Disabled unless the operator opts in;
+  // protected_slugs is a comma-separated exact/glob list (e.g. voice/*).
+  'writer.commit_page.enabled',
+  'writer.commit_page.protected_slugs',
   // Skill-nag suppression (#2180): brain-resident pack install nag off-switch.
   'skillpack.nag_disabled',
   // Self-upgrade (v0.42; file plane, read on the hot path)

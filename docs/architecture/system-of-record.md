@@ -4,6 +4,14 @@
 The Postgres/PGLite database is a derived cache. We do not back up
 the database — we rebuild it from the repo.**
 
+Remote agents write canonical knowledge through `commit_page`, not raw
+`put_page`. `commit_page` is a two-step MCP operation: `mode=preview` returns
+the diff plus the current Git HEAD and content SHA-256; `mode=apply` requires
+those exact tokens, commits and pushes the source repo, and only then updates
+the derived index. It is disabled by default and requires a write-scoped OAuth
+client bound to one source. `put_page` remains the lower-level ingestion/index
+primitive for local pipelines and backwards compatibility.
+
 This document is the canonical reference for that contract. Every code
 path that writes user-knowledge state should match the pattern
 described here. The CI gate at `scripts/check-system-of-record.sh`

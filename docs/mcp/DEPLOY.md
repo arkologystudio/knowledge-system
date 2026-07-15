@@ -183,7 +183,22 @@ filesystem surface area.
 | Scope | What it allows |
 |-------|---------------|
 | `read` | `search`, `query`, `get_page`, `list_pages`, graph traversal |
-| `write` | `put_page`, `delete_page`, `add_link`, `add_timeline_entry` |
+| `write` | `commit_page`, `put_page`, `delete_page`, `add_link`, `add_timeline_entry` |
+
+For durable remote knowledge writes, enable and use the Git-first surface:
+
+```bash
+gbrain config set writer.commit_page.enabled true
+gbrain config set writer.commit_page.protected_slugs 'north-star,voice/*'
+```
+
+Call `commit_page` once with `mode=preview`, show the returned diff to the
+operator, then call `mode=apply` with the returned `head_before` and
+`content_sha256`. Apply fails if either token has changed, if the checkout is
+dirty, if a pull conflicts, or if the slug matches the protected list. The Git
+push completes before the derived index is updated. Keep `put_page` for trusted
+local ingestion pipelines or compatibility clients that deliberately accept
+DB-first semantics.
 | `admin` | Client management, token revocation, sweep, local-only ops |
 
 ## Legacy Bearer Token Setup
