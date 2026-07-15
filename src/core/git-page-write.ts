@@ -40,6 +40,16 @@ const MAX_DIFF_CHARS = 40_000;
 const LOCK_NAME = 'gbrain-commit-page.lock';
 const PROTECTED_FRONTMATTER = [QUARANTINE_KEY, CONTENT_FLAG_KEY, EMBED_SKIP_KEY] as const;
 
+// Strips userinfo (user:pass@ or user@) from any scheme://host URL found in
+// git stderr before it reaches a GitPageWriteError, which is reachable by
+// remote MCP callers via commit_page. Mirrors the redaction git-remote.ts
+// applies to pushProbe output — a credential-helper failure or a remote URL
+// with an embedded token can otherwise echo the secret into git's error text.
+const URL_USERINFO_RE = /([a-z][a-z0-9+.-]*:\/\/)[^\s@/]+@/gi;
+function redactGitError(message: string): string {
+  return message.replace(URL_USERINFO_RE, '$1***@');
+}
+
 export type GitPageWriteMode = 'preview' | 'apply';
 
 export interface GitPageWriteInput {
@@ -296,7 +306,7 @@ export async function gitFirstPageWrite(
         try { git(repoPath, ['restore', '--source=HEAD', '--', `${slug}.md`], 10_000); } catch {
           if (!before) rmSync(filePath, { force: true });
         }
-        throw new GitPageWriteError('commit_failed', e instanceof Error ? e.message : String(e));
+        throw new GitPageWriteError('commit_failed', redactGitError(e instanceof Error ? e.message : String(e)));
       }
 
       const committedHead = git(repoPath, ['rev-parse', 'HEAD'], 10_000);
@@ -308,7 +318,7 @@ export async function gitFirstPageWrite(
       } catch (e) {
         throw new GitPageWriteError(
           'push_failed',
-          `commit ${committedHead.slice(0, 12)} is local-only; push failed: ${e instanceof Error ? e.message : String(e)}`,
+          `commit ${committedHead.slice(0, 12)} is local-only; push failed: ${redactGitError(e instanceof Error ? e.message : String(e))}`,
         );
       }
 

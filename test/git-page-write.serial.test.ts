@@ -121,6 +121,33 @@ describe('gitFirstPageWrite', () => {
     })).rejects.toMatchObject({ code: 'repo_dirty' });
     expect(fs.readFileSync(path.join(checkout, 'unrelated.txt'), 'utf8')).toBe('mine');
   });
+
+  test('redacts URL credentials from push failures returned to remote callers', async () => {
+    const preview = await gitFirstPageWrite(engine, {
+      mode: 'preview', sourceId: 'default', slug: 'wiki/concepts/redacted-error', content: page('Safe'), actor: 'mcp:test',
+    });
+    const hook = path.join(remote, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, '#!/bin/sh\necho "rejected by https://alice:super-secret@example.invalid/repo" >&2\nexit 1\n');
+    fs.chmodSync(hook, 0o755);
+
+    try {
+      await gitFirstPageWrite(engine, {
+        mode: 'apply',
+        sourceId: 'default',
+        slug: 'wiki/concepts/redacted-error',
+        content: page('Safe'),
+        actor: 'mcp:test',
+        commitMessage: 'synthesis: redacted error',
+        expectedHead: preview.head_before,
+        expectedContentSha256: preview.content_sha256,
+      });
+      throw new Error('expected push to fail');
+    } catch (error) {
+      expect(error).toBeInstanceOf(GitPageWriteError);
+      expect((error as Error).message).toContain('https://***@example.invalid/repo');
+      expect((error as Error).message).not.toContain('super-secret');
+    }
+  });
 });
 
 test('commit_page operation is write-scoped and MCP-visible', () => {
