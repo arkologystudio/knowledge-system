@@ -54,8 +54,10 @@ everything it can do.
 > **`list_skills` empty?** It's gated by `mcp.publish_skills` on the host (default
 > ON for `gbrain init` brains, OFF for brains upgraded from older releases). Enable
 > it on the host: `gbrain config set mcp.publish_skills true`. The core tools
-> (search, query, get_page, put_page, think, find_experts) work regardless.
-> `capture` is CLI-only, not an MCP tool — write over MCP with `put_page`.
+> (search, query, get_page, commit_page, put_page, think, find_experts) work regardless.
+> `capture` is CLI-only, not an MCP tool. For canonical remote writes, use
+> `commit_page` preview then apply; use `put_page` only for low-level
+> ingestion/index compatibility.
 
 ## Remove
 
