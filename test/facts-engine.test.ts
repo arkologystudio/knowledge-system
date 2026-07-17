@@ -15,11 +15,13 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 let engine: PGLiteEngine;
+let embeddingDimensions: number;
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  embeddingDimensions = Number(await engine.getConfig('embedding_dimensions'));
 });
 
 afterAll(async () => {
@@ -27,7 +29,7 @@ afterAll(async () => {
 });
 
 const vec = (...vals: number[]): Float32Array => {
-  const a = new Float32Array(1536);
+  const a = new Float32Array(embeddingDimensions);
   for (let i = 0; i < vals.length; i++) a[i] = vals[i];
   return a;
 };

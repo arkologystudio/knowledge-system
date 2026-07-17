@@ -2,6 +2,18 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.2] - 2026-07-17
+
+**The required CI gate runs cleanly again: secret scanning no longer depends on an unavailable organization license, tests obey the repository's isolation contract, and embedding fixtures work with any configured vector width.**
+
+### Fixed
+- **Secret scanning remains enforced without a commercial Action license.** CI installs the open-source Gitleaks v8.30.1 CLI from a checksum-pinned archive, then scans both the working tree and full Git history.
+- **Artifact ingestion tests no longer leak environment or database state.** Environment changes use the repository's restoration helper, and the corpus-walk tests share one lifecycle-managed PGLite engine.
+- **Embedding tests follow the database schema.** Facts and artifact fixtures derive their vector width from the initialized brain instead of assuming 1536 dimensions, so fresh 1280-dimensional installs and configured legacy brains exercise the same contract.
+
+### To take advantage of v0.43.0.2
+No runtime upgrade is required. Repository CI uses the repaired checks automatically on the next workflow run.
+
 ## [0.43.0.1] - 2026-07-17
 
 **Remote retrieval works again for source-scoped OAuth and legacy-token clients. A missing row-level-security policy had made healthy indexed content invisible to search while direct slug reads continued to succeed.**

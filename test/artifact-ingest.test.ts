@@ -30,16 +30,9 @@ import type { IngestionEvent, IngestionSourceContext } from '../src/core/ingesti
 import { makeIngestBulkHandler } from '../src/core/minions/handlers/ingest-bulk.ts';
 import type { MinionJobContext } from '../src/core/minions/types.ts';
 import { operationsByName } from '../src/core/operations.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 const CORPUS = join(import.meta.dir, 'fixtures', 'artifact-corpus');
-
-/** Deterministic 1536-dim embedder — no gateway, fits the `embedding` column. */
-const fakeEmbed = async (texts: string[]): Promise<Float32Array[]> =>
-  texts.map((t, i) => {
-    const v = new Float32Array(1536);
-    v.fill((i + 1) * 0.001 + (t.length % 7) * 0.0001);
-    return v;
-  });
 
 function recorderCtx(engine: PGLiteEngine, events: IngestionEvent[]): IngestionSourceContext {
   return {
@@ -74,13 +67,12 @@ describe('T2 — extractors', () => {
 
   test('unstructured is registered but inert without an off-box URL', async () => {
     expect(listExtractors()).toContain('unstructured');
-    const prev = process.env.GBRAIN_UNSTRUCTURED_URL;
-    delete process.env.GBRAIN_UNSTRUCTURED_URL;
-    const ex = new UnstructuredExtractor();
-    await expect(ex.extract({ bytes: new Uint8Array([1, 2, 3]) })).rejects.toBeInstanceOf(
-      ExtractorUnavailableError,
-    );
-    if (prev !== undefined) process.env.GBRAIN_UNSTRUCTURED_URL = prev;
+    await withEnv({ GBRAIN_UNSTRUCTURED_URL: undefined }, async () => {
+      const ex = new UnstructuredExtractor();
+      await expect(ex.extract({ bytes: new Uint8Array([1, 2, 3]) })).rejects.toBeInstanceOf(
+        ExtractorUnavailableError,
+      );
+    });
   });
 
   test('resolveExtractor: preferred wins, else per-extension, else plaintext', () => {
@@ -98,11 +90,19 @@ describe('T2 — extractors', () => {
 
 describe('T2 — ingestArtifact persistence', () => {
   let engine: PGLiteEngine;
+  let fakeEmbed: (texts: string[]) => Promise<Float32Array[]>;
 
   beforeAll(async () => {
     engine = new PGLiteEngine();
     await engine.connect({});
     await engine.initSchema();
+    const dimensions = Number(await engine.getConfig('embedding_dimensions'));
+    fakeEmbed = async (texts: string[]): Promise<Float32Array[]> =>
+      texts.map((t, i) => {
+        const v = new Float32Array(dimensions);
+        v.fill((i + 1) * 0.001 + (t.length % 7) * 0.0001);
+        return v;
+      });
   });
   afterAll(async () => {
     await engine.disconnect();
@@ -188,42 +188,39 @@ describe('T2 — ingestArtifact persistence', () => {
 });
 
 describe('T2 — ArtifactBulkSource corpus walk', () => {
-  test('walks the fixture corpus recursively, extracts, tags content_class=artifact', async () => {
-    const engine = new PGLiteEngine();
+  let engine: PGLiteEngine;
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
     await engine.connect({});
     await engine.initSchema();
-    try {
-      const events: IngestionEvent[] = [];
-      const source = new ArtifactBulkSource({ dir: CORPUS, sourceId: 'walk-test' });
-      await source.start(recorderCtx(engine, events));
+  });
+  afterAll(async () => {
+    await engine.disconnect();
+  });
 
-      // 3 text docs (alpha.md, beta.txt, nested/gamma.md); skip-me.png filtered out.
-      expect(events.length).toBe(3);
-      expect(source.stats.emitted).toBe(3);
-      for (const e of events) {
-        expect(e.source_kind).toBe('artifact-bulk');
-        expect((e.metadata as Record<string, unknown>).content_class).toBe('artifact');
-        expect(e.content_hash).toMatch(/^[0-9a-f]{64}$/);
-      }
-      const paths = events.map((e) => (e.metadata as Record<string, unknown>).original_path).sort();
-      expect(paths).toEqual(['alpha-report.md', 'beta-notes.txt', 'nested/gamma-memo.md']);
-    } finally {
-      await engine.disconnect();
+  test('walks the fixture corpus recursively, extracts, tags content_class=artifact', async () => {
+    const events: IngestionEvent[] = [];
+    const source = new ArtifactBulkSource({ dir: CORPUS, sourceId: 'walk-test' });
+    await source.start(recorderCtx(engine, events));
+
+    // 3 text docs (alpha.md, beta.txt, nested/gamma.md); skip-me.png filtered out.
+    expect(events.length).toBe(3);
+    expect(source.stats.emitted).toBe(3);
+    for (const e of events) {
+      expect(e.source_kind).toBe('artifact-bulk');
+      expect((e.metadata as Record<string, unknown>).content_class).toBe('artifact');
+      expect(e.content_hash).toMatch(/^[0-9a-f]{64}$/);
     }
+    const paths = events.map((e) => (e.metadata as Record<string, unknown>).original_path).sort();
+    expect(paths).toEqual(['alpha-report.md', 'beta-notes.txt', 'nested/gamma-memo.md']);
   });
 
   test('limit caps the number of documents processed', async () => {
-    const engine = new PGLiteEngine();
-    await engine.connect({});
-    await engine.initSchema();
-    try {
-      const events: IngestionEvent[] = [];
-      const source = new ArtifactBulkSource({ dir: CORPUS, limit: 1 });
-      await source.start(recorderCtx(engine, events));
-      expect(events.length).toBe(1);
-    } finally {
-      await engine.disconnect();
-    }
+    const events: IngestionEvent[] = [];
+    const source = new ArtifactBulkSource({ dir: CORPUS, limit: 1 });
+    await source.start(recorderCtx(engine, events));
+    expect(events.length).toBe(1);
   });
 });
 
