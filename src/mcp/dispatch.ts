@@ -15,8 +15,9 @@ import { loadConfig } from '../core/config.ts';
  * KS-C: the confidential-corpus read ops whose ENTIRE read surface lies within
  * the v125 RLS-covered tables (pages, content_chunks, artifacts, links,
  * timeline_entries, tags, raw_data, page_versions, facts, files, ingest_log)
- * plus the granted support tables (sources, config, query_cache). ONLY these
- * are safe to run under the NOBYPASSRLS `gbrain_request` role.
+ * plus the policy-scoped support tables (sources, config, query_cache,
+ * page_aliases, slug_aliases). ONLY these are safe to run under the
+ * NOBYPASSRLS `gbrain_request` role.
  *
  * Every OTHER read op touches a DEFERRED table (decision D: takes / calibration
  * / eval / code-edges / oauth / identity …) that `gbrain_request` has no SELECT
@@ -29,8 +30,9 @@ import { loadConfig } from '../core/config.ts';
  *
  * Verified per-op against handlers + engine methods (2026-07-10):
  *   query / search     → hybridSearch/searchVector read content_chunks, pages,
- *                        query_cache, config, sources; relationalFanout reads
- *                        pages, links, content_chunks — all covered/granted.
+ *                        query_cache, config, sources, page_aliases,
+ *                        slug_aliases; relationalFanout reads pages, links,
+ *                        content_chunks — all covered/granted/policy-scoped.
  *   get_page           → pages, tags.        get_chunks → content_chunks.
  *   get_links / get_backlinks / list_link_sources → links, pages.
  *   get_timeline       → timeline_entries, pages.

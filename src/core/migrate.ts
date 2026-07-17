@@ -6043,6 +6043,81 @@ export const MIGRATIONS: Migration[] = [
       return privileges[0]?.sequence_ok === true && privileges[0]?.aliases_ok === true;
     },
   },
+  {
+    version: 127,
+    name: 'rls_search_support_policies',
+    // v125 granted the request role access to search support tables, but the
+    // v35 auto-RLS backfill had already enabled RLS on those tables. With no
+    // policies, SELECT returned zero rows from `sources` (eliminating every
+    // search candidate at the archive-visibility join) and alias/cache support
+    // was either invisible or permission-denied. Add the missing policies at
+    // the same source boundary as the confidential corpus tables.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind !== 'postgres') return;
+      await engine.runMigration(127, `
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'gbrain_request') THEN
+            GRANT SELECT ON TABLE slug_aliases TO gbrain_request;
+
+            DROP POLICY IF EXISTS ks_source_isolation ON sources;
+            CREATE POLICY ks_source_isolation ON sources FOR SELECT TO gbrain_request
+              USING (id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+            DROP POLICY IF EXISTS ks_source_isolation ON page_aliases;
+            CREATE POLICY ks_source_isolation ON page_aliases FOR SELECT TO gbrain_request
+              USING (source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+            DROP POLICY IF EXISTS ks_source_isolation ON slug_aliases;
+            CREATE POLICY ks_source_isolation ON slug_aliases FOR SELECT TO gbrain_request
+              USING (source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+            DROP POLICY IF EXISTS ks_request_read ON config;
+            CREATE POLICY ks_request_read ON config FOR SELECT TO gbrain_request
+              USING (true);
+
+            DROP POLICY IF EXISTS ks_source_isolation ON query_cache;
+            CREATE POLICY ks_source_isolation ON query_cache FOR ALL TO gbrain_request
+              USING (
+                source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])
+                OR source_id = '__set__:' || array_to_string(
+                  NULLIF(current_setting('app.allowed_sources', true), '')::text[], ','
+                )
+              )
+              WITH CHECK (
+                source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])
+                OR source_id = '__set__:' || array_to_string(
+                  NULLIF(current_setting('app.allowed_sources', true), '')::text[], ','
+                )
+              );
+          END IF;
+        END $$;
+      `);
+    },
+    verify: async (engine) => {
+      if (engine.kind !== 'postgres') return true;
+      const role = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'gbrain_request'`,
+      );
+      if ((role[0]?.n ?? 0) === 0) return true;
+      const rows = await engine.executeRaw<{ privileges_ok: boolean; policies_ok: boolean }>(
+        `SELECT
+           has_table_privilege('gbrain_request', 'slug_aliases', 'SELECT') AS privileges_ok,
+           (
+             SELECT count(*) = 4 FROM pg_policies
+              WHERE schemaname = 'public' AND policyname = 'ks_source_isolation'
+                AND tablename IN ('sources', 'page_aliases', 'slug_aliases', 'query_cache')
+           ) AND EXISTS (
+             SELECT 1 FROM pg_policies
+              WHERE schemaname = 'public' AND tablename = 'config'
+                AND policyname = 'ks_request_read'
+           ) AS policies_ok`,
+      );
+      return rows[0]?.privileges_ok === true && rows[0]?.policies_ok === true;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

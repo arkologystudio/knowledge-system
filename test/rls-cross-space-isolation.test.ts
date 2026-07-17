@@ -37,6 +37,8 @@ const SRC_A = 'ks-rls-src-a';
 const SRC_B = 'ks-rls-src-b';
 const CHUNK_A = 'alpha chunk ks-rls-fixture';
 const CHUNK_B = 'bravo chunk ks-rls-fixture';
+const CACHE_A = 'ks-rls-cache-a';
+const CACHE_B = 'ks-rls-cache-b';
 
 describeRls('KS-C in-DB RLS cross-space isolation (real Postgres)', () => {
   let engine: PostgresEngine;
@@ -50,7 +52,10 @@ describeRls('KS-C in-DB RLS cross-space isolation (real Postgres)', () => {
     sql = postgres(DATABASE_URL!, { prepare: false });
 
     // Clean slate for our two fixture sources (cascades pages/chunks), then seed.
+    await sql`DELETE FROM page_aliases WHERE source_id = ANY(${[SRC_A, SRC_B]})`;
+    await sql`DELETE FROM slug_aliases WHERE source_id = ANY(${[SRC_A, SRC_B]})`;
     await sql`DELETE FROM sources WHERE id = ANY(${[SRC_A, SRC_B]})`;
+    await sql`DELETE FROM query_cache WHERE id = ANY(${[CACHE_A, CACHE_B]})`;
     await sql`INSERT INTO sources (id, name) VALUES (${SRC_A}, 'KS-RLS A'), (${SRC_B}, 'KS-RLS B') ON CONFLICT (id) DO NOTHING`;
     await sql`
       INSERT INTO pages (source_id, slug, type, title) VALUES
@@ -70,11 +75,29 @@ describeRls('KS-C in-DB RLS cross-space isolation (real Postgres)', () => {
       UPDATE content_chunks
          SET search_vector = to_tsvector('english', chunk_text)
        WHERE page_id = ANY(${[idA, idB]})`;
+    await sql`
+      INSERT INTO page_aliases (source_id, alias_norm, slug) VALUES
+        (${SRC_A}, 'ks rls alias a', 'ks-rls-a-page'),
+        (${SRC_B}, 'ks rls alias b', 'ks-rls-b-page')
+      ON CONFLICT DO NOTHING`;
+    await sql`
+      INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug) VALUES
+        (${SRC_A}, 'ks-rls-old-a', 'ks-rls-a-page'),
+        (${SRC_B}, 'ks-rls-old-b', 'ks-rls-b-page')
+      ON CONFLICT DO NOTHING`;
+    await sql`
+      INSERT INTO query_cache (id, query_text, source_id) VALUES
+        (${CACHE_A}, 'ks rls cache a', ${`__set__:${SRC_A}`}),
+        (${CACHE_B}, 'ks rls cache b', ${`__set__:${SRC_B}`})
+      ON CONFLICT (id) DO UPDATE SET source_id = EXCLUDED.source_id`;
   }, 60_000);
 
   afterAll(async () => {
     if (sql) {
+      await sql`DELETE FROM page_aliases WHERE source_id = ANY(${[SRC_A, SRC_B]})`;
+      await sql`DELETE FROM slug_aliases WHERE source_id = ANY(${[SRC_A, SRC_B]})`;
       await sql`DELETE FROM sources WHERE id = ANY(${[SRC_A, SRC_B]})`; // cascades pages + chunks
+      await sql`DELETE FROM query_cache WHERE id = ANY(${[CACHE_A, CACHE_B]})`;
       await sql.end();
     }
     if (engine) await engine.disconnect();
@@ -114,12 +137,23 @@ describeRls('KS-C in-DB RLS cross-space isolation (real Postgres)', () => {
     expect(rows[0].n).toBe(11);
   });
 
-  test('request role can read the support objects used by hybrid search', async () => {
+  test('request role can read only its scoped search-support rows', async () => {
     await underRole(`{${SRC_A}}`, async (tx) => {
       const clock = await tx`SELECT last_value FROM page_generation_clock_seq`;
-      const aliases = await tx`SELECT count(*)::int AS n FROM page_aliases`;
+      const sources = await tx<{ id: string }[]>`SELECT id FROM sources WHERE id = ANY(${[SRC_A, SRC_B]})`;
+      const aliases = await tx<{ source_id: string }[]>`
+        SELECT source_id FROM page_aliases WHERE source_id = ANY(${[SRC_A, SRC_B]})`;
+      const slugAliases = await tx<{ source_id: string }[]>`
+        SELECT source_id FROM slug_aliases WHERE source_id = ANY(${[SRC_A, SRC_B]})`;
+      const config = await tx`SELECT value FROM config WHERE key = 'version'`;
+      const cache = await tx<{ id: string }[]>`
+        SELECT id FROM query_cache WHERE id = ANY(${[CACHE_A, CACHE_B]})`;
       expect(clock.length).toBe(1);
-      expect(Number(aliases[0].n)).toBeGreaterThanOrEqual(0);
+      expect(sources.map((row) => row.id)).toEqual([SRC_A]);
+      expect(aliases.map((row) => row.source_id)).toEqual([SRC_A]);
+      expect(slugAliases.map((row) => row.source_id)).toEqual([SRC_A]);
+      expect(config.length).toBe(1);
+      expect(cache.map((row) => row.id)).toEqual([CACHE_A]);
     });
   });
 
@@ -209,10 +243,8 @@ describeRls('KS-C in-DB RLS cross-space isolation (real Postgres)', () => {
       e.searchKeyword('alpha', { sourceIds: [SRC_A], limit: 10 }),
     );
 
-    // The regression assertion is reaching the query result without
-    // `sql.begin is not a function`; corpus visibility is proven separately
-    // above because ranking fixtures are intentionally outside this RLS suite.
     expect(Array.isArray(results)).toBe(true);
+    expect(results.some((row) => row.source_id === SRC_A && row.chunk_text.includes('alpha'))).toBe(true);
     expect(results.every((row) => row.source_id !== SRC_B)).toBe(true);
   });
 });
