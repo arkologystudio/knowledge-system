@@ -78,7 +78,11 @@ function escapeSqlStringLiteral(value: string): string {
  */
 function toPgTextArrayLiteral(values: readonly string[]): string {
   if (values.length === 0) return '{}';
-  return '{' + values.map((v) => '"' + v.replace(/(["\\])/g, '\\$1') + '"').join(',') + '}';
+  // `cacheScopeKey()` sorts federated source ids before constructing its
+  // `__set__:` key. Keep the RLS GUC in the same canonical order so the
+  // query-cache policy can match that exact scope without broadening access.
+  const sorted = [...values].sort();
+  return '{' + sorted.map((v) => '"' + v.replace(/(["\\])/g, '\\$1') + '"').join(',') + '}';
 }
 
 /**

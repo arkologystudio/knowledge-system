@@ -2,6 +2,18 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.1] - 2026-07-17
+
+**Remote retrieval works again for source-scoped OAuth and legacy-token clients. A missing row-level-security policy had made healthy indexed content invisible to search while direct slug reads continued to succeed.**
+
+### Fixed
+- **Search support tables now respect the caller's source grant.** The request role can read only the allowed rows in `sources`, page/slug aliases, and query cache, while global read-only configuration remains available. This restores keyword and vector retrieval without weakening cross-source isolation.
+- **Federated query-cache scopes are canonical.** Allowed source IDs are sorted before entering the PostgreSQL request context, matching the cache key used by the RLS policy.
+- **The regression test now requires a real search hit.** The source-isolation suite previously accepted an empty result set, which masked this failure mode; it now proves authorized content is returned and unauthorized content remains hidden.
+
+### To take advantage of v0.43.0.1
+Upgrade the server and run `gbrain apply-migrations --yes` (or any command that opens the brain) to apply migration v127. No reindex or re-embedding is required.
+
 ## [0.43.0.0] - 2026-07-15
 
 **Approved agents can now propose and commit canonical wiki pages through the same remote MCP surface they already use for retrieval, without needing a local checkout or shell access. Every write is previewed, concurrency-checked, committed to Git, pushed, and indexed before success is reported.**
