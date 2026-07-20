@@ -6,7 +6,7 @@ import * as path from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { gitFirstPageWrite, GitPageWriteError } from '../src/core/git-page-write.ts';
-import { operations } from '../src/core/operations.ts';
+import { operations, type OperationContext } from '../src/core/operations.ts';
 
 let engine: PGLiteEngine;
 let root: string;
@@ -156,4 +156,53 @@ test('commit_page operation is write-scoped and MCP-visible', () => {
   expect(op?.scope).toBe('write');
   expect(op?.localOnly).not.toBe(true);
   expect(op?.params.mode.enum).toEqual(['preview', 'apply']);
+});
+
+test('Git-first mode rejects remote and missing-trust index-only page mutations', async () => {
+  const putOp = operations.find((candidate) => candidate.name === 'put_page');
+  const deleteOp = operations.find((candidate) => candidate.name === 'delete_page');
+  expect(putOp).toBeDefined();
+  expect(deleteOp).toBeDefined();
+  await engine.setConfig('writer.commit_page.enabled', 'true');
+
+  try {
+    for (const remote of [true, undefined]) {
+      const ctx = {
+        engine,
+        config: {},
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        dryRun: false,
+        remote,
+        sourceId: 'default',
+      } as unknown as OperationContext;
+
+      await expect(putOp!.handler(ctx, {
+        slug: 'wiki/concepts/must-use-git',
+        content: page('This must never bypass Git.'),
+      })).rejects.toMatchObject({
+        code: 'permission_denied',
+        suggestion: expect.stringContaining('commit_page'),
+      });
+
+      await engine.putPage('wiki/concepts/must-delete-through-git', {
+        title: 'Must delete through Git',
+        type: 'note',
+        frontmatter: {},
+        compiled_truth: 'Canonical content remains.',
+        content_hash: `delete-guard-${String(remote)}`,
+        source_path: 'wiki/concepts/must-delete-through-git.md',
+      }, { sourceId: 'default' });
+      await expect(deleteOp!.handler(ctx, {
+        slug: 'wiki/concepts/must-delete-through-git',
+      })).rejects.toMatchObject({
+        code: 'permission_denied',
+        suggestion: expect.stringContaining('canonical Git repository'),
+      });
+      expect(await engine.getPage('wiki/concepts/must-delete-through-git', { sourceId: 'default' })).not.toBeNull();
+    }
+    expect(await engine.getPage('wiki/concepts/must-use-git', { sourceId: 'default' })).toBeNull();
+    expect(git(checkout, ['status', '--porcelain'])).toBe('');
+  } finally {
+    await engine.setConfig('writer.commit_page.enabled', 'false');
+  }
 });

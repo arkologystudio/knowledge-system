@@ -746,7 +746,7 @@ const get_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
+  description: 'Low-level write/update of a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. Remote callers are denied when writer.commit_page.enabled=true; use commit_page preview/apply so Git stays canonical. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
@@ -764,6 +764,23 @@ const put_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+
+    // `commit_page` exists to make Git the source of truth for remote writes.
+    // Letting the same remote client call `put_page` would bypass that contract:
+    // its disk write-through dirties the checkout, then every subsequent
+    // `commit_page` preview fails with repo_dirty. Enabling the Git-first surface
+    // therefore closes the legacy remote path as one atomic operator choice.
+    // Trusted local pipelines keep using put_page for capture, sync, and dream.
+    if (ctx.remote !== false) {
+      const gitFirstEnabled = await ctx.engine.getConfig('writer.commit_page.enabled');
+      if (gitFirstEnabled === 'true') {
+        throw new OperationError(
+          'permission_denied',
+          'remote put_page is disabled while canonical Git-first writes are enabled',
+          'Use commit_page with mode=preview, then mode=apply with the returned HEAD and content SHA-256.',
+        );
+      }
+    }
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
     // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
@@ -1401,7 +1418,7 @@ async function runAutoLink(
 
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
+  description: 'Low-level soft-delete of an indexed page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. Remote callers are denied when writer.commit_page.enabled=true because deleting only the derived index leaves the canonical Git page in place for sync to re-import. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
   params: {
     slug: { type: 'string', required: true },
   },
@@ -1409,6 +1426,23 @@ const delete_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+
+    // A remote soft-delete only mutates the derived index. If the source page
+    // remains in the canonical Git checkout, the next sync restores it. Keep
+    // the Git-first operator choice symmetric with put_page: once canonical
+    // remote writes are enabled, untrusted callers cannot bypass Git in either
+    // direction. Local maintenance retains the recovery-oriented soft-delete.
+    if (ctx.remote !== false) {
+      const gitFirstEnabled = await ctx.engine.getConfig('writer.commit_page.enabled');
+      if (gitFirstEnabled === 'true') {
+        throw new OperationError(
+          'permission_denied',
+          'remote delete_page is disabled while canonical Git-first writes are enabled',
+          'Delete the markdown page through the canonical Git repository; the sync worker will remove it from the derived index.',
+        );
+      }
+    }
+
     if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug };
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
     // intended row instead of always targeting (default, slug).
