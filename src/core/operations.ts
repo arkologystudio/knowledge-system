@@ -1418,7 +1418,7 @@ async function runAutoLink(
 
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
+  description: 'Low-level soft-delete of an indexed page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. Remote callers are denied when writer.commit_page.enabled=true because deleting only the derived index leaves the canonical Git page in place for sync to re-import. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
   params: {
     slug: { type: 'string', required: true },
   },
@@ -1426,6 +1426,23 @@ const delete_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+
+    // A remote soft-delete only mutates the derived index. If the source page
+    // remains in the canonical Git checkout, the next sync restores it. Keep
+    // the Git-first operator choice symmetric with put_page: once canonical
+    // remote writes are enabled, untrusted callers cannot bypass Git in either
+    // direction. Local maintenance retains the recovery-oriented soft-delete.
+    if (ctx.remote !== false) {
+      const gitFirstEnabled = await ctx.engine.getConfig('writer.commit_page.enabled');
+      if (gitFirstEnabled === 'true') {
+        throw new OperationError(
+          'permission_denied',
+          'remote delete_page is disabled while canonical Git-first writes are enabled',
+          'Delete the markdown page through the canonical Git repository; the sync worker will remove it from the derived index.',
+        );
+      }
+    }
+
     if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug };
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
     // intended row instead of always targeting (default, slug).
