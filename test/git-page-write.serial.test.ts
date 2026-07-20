@@ -6,7 +6,7 @@ import * as path from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { gitFirstPageWrite, GitPageWriteError } from '../src/core/git-page-write.ts';
-import { operations } from '../src/core/operations.ts';
+import { operations, type OperationContext } from '../src/core/operations.ts';
 
 let engine: PGLiteEngine;
 let root: string;
@@ -156,4 +156,35 @@ test('commit_page operation is write-scoped and MCP-visible', () => {
   expect(op?.scope).toBe('write');
   expect(op?.localOnly).not.toBe(true);
   expect(op?.params.mode.enum).toEqual(['preview', 'apply']);
+});
+
+test('Git-first mode rejects remote and missing-trust put_page before mutation', async () => {
+  const op = operations.find((candidate) => candidate.name === 'put_page');
+  expect(op).toBeDefined();
+  await engine.setConfig('writer.commit_page.enabled', 'true');
+
+  try {
+    for (const remote of [true, undefined]) {
+      const ctx = {
+        engine,
+        config: {},
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        dryRun: false,
+        remote,
+        sourceId: 'default',
+      } as unknown as OperationContext;
+
+      await expect(op!.handler(ctx, {
+        slug: 'wiki/concepts/must-use-git',
+        content: page('This must never bypass Git.'),
+      })).rejects.toMatchObject({
+        code: 'permission_denied',
+        suggestion: expect.stringContaining('commit_page'),
+      });
+    }
+    expect(await engine.getPage('wiki/concepts/must-use-git', { sourceId: 'default' })).toBeNull();
+    expect(git(checkout, ['status', '--porcelain'])).toBe('');
+  } finally {
+    await engine.setConfig('writer.commit_page.enabled', 'false');
+  }
 });
