@@ -143,6 +143,23 @@ export interface Page {
    */
   source_id: string;
 
+  /**
+   * v128 — Reference Identifier. The page's PERMANENT name, minted once and
+   * never reissued: `orn:<namespace>:<reference>` per the KOI Object Reference
+   * Name syntax (grammar in `src/core/rid.ts`).
+   *
+   * Renaming, moving, or reassigning the page to a different source leaves this
+   * untouched — which is the whole point, since slug-derived identity dies on
+   * rename and takes every inbound reference with it. Note `source_id` above is
+   * mutable and routing-assigned, so it deliberately does NOT appear in the RID.
+   *
+   * Optional on the type (not in the DB) for the same three-state reason as the
+   * provenance columns: `undefined` when a SELECT didn't project the column, so
+   * older code paths and synthetic test fixtures keep compiling. The DB column
+   * is `NOT NULL` with a generated default.
+   */
+  rid?: string;
+
   // v0.39.3.0 provenance read-path (WARN-8 + CV5). Migration v81 columns
   // surfaced through getPage / list_pages so `gbrain call get_page | jq
   // .source_kind` actually returns the value the put_page op wrote. NULL
@@ -284,6 +301,26 @@ export interface PageInput {
    * NULL on historical rows that pre-date v0.38.
    */
   ingested_at?: Date | null;
+
+  /**
+   * v128 — Reference Identifier carried in from an external system.
+   *
+   * Omit it and the DB default mints a fresh `orn:habitat.page:<uuid>`. Supply
+   * it only when the page originates elsewhere and the upstream system's own
+   * stable id should key the identity — that is what makes a full re-ingest
+   * reproduce identical identifiers.
+   *
+   * MINT-ONCE is enforced at the engine layer by COALESCE-preserve
+   * (`COALESCE(pages.rid, EXCLUDED.rid)` — note the argument order is the
+   * INVERSE of the other COALESCE-preserve columns: for provenance the stored
+   * value wins only when the caller omits, whereas for identity the stored value
+   * wins ALWAYS). Re-importing a page never re-mints or overwrites its RID.
+   *
+   * Hijack is guarded at the import layer (`import-file.ts`), the same class as
+   * the slug hijack: a frontmatter-supplied RID is accepted only when unclaimed
+   * or already held by this same (source_id, slug).
+   */
+  rid?: string | null;
 }
 
 export interface PageFilters {
@@ -674,6 +711,14 @@ export interface ChunkInput {
 export interface SearchResult {
   slug: string;
   page_id: number;
+  /**
+   * v128 — the result page's Reference Identifier, stamped post-fusion by
+   * `stampRefIds`. This is what makes a citation survive a rename: an agent
+   * answering a question can cite `rid` instead of `slug` and the reference
+   * stays valid after the cited page moves. Absent when the stamping lookup
+   * failed (fail-soft — a RID lookup must never break retrieval).
+   */
+  rid?: string;
   title: string;
   type: PageType;
   chunk_text: string;

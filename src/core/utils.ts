@@ -110,6 +110,11 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const sourceUri = row.source_uri === undefined ? undefined : (row.source_uri as string | null);
   const ingestedVia = row.ingested_via === undefined ? undefined : (row.ingested_via as string | null);
   const ingestedAt = readOptionalDate(row.ingested_at);
+  // v128 — Reference Identifier. Two-state (not three): the DB column is
+  // NOT NULL, so the only reason it's absent is a SELECT that didn't project
+  // it. Omitting the key rather than setting null keeps that distinction
+  // visible to callers instead of implying "this page has no identity".
+  const rid = typeof row.rid === 'string' && row.rid.length > 0 ? row.rid : undefined;
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -143,6 +148,8 @@ export function rowToPage(row: Record<string, unknown>): Page {
     // an upstream caller bypassed the projection check; better to surface than
     // silently mis-attribute).
     source_id: (row.source_id as string | undefined) ?? 'default',
+    // v128: present whenever the SELECT projected `rid`; absent otherwise.
+    ...(rid !== undefined && { rid }),
   };
 }
 

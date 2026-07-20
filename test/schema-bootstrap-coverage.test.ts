@@ -168,6 +168,12 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // SCHEMA_SQL replay creates the index. Powers `gbrain extract --stale` + the
   // `links_extraction_lag` doctor check.
   { kind: 'column', table: 'pages', column: 'links_extracted_at' },
+  // v128 (pages_reference_identifier) — forward-referenced by
+  // `CREATE UNIQUE INDEX idx_pages_rid ON pages(rid)`. Pre-v128 brains have
+  // pages without this column; bootstrap adds it (and backfills, so the UNIQUE
+  // index has a collision-free column to build on) before SCHEMA_SQL replay
+  // creates the index.
+  { kind: 'column', table: 'pages', column: 'rid' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -253,6 +259,10 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       ALTER TABLE pages DROP COLUMN IF EXISTS generation;
       ALTER TABLE pages DROP COLUMN IF EXISTS contextual_retrieval_mode;
       ALTER TABLE pages DROP COLUMN IF EXISTS corpus_generation;
+
+      -- v128 rid strip so the needsPagesRid bootstrap branch has work to do.
+      DROP INDEX IF EXISTS idx_pages_rid;
+      ALTER TABLE pages DROP COLUMN IF EXISTS rid;
     `);
 
     // Note: we don't strip sources.archived* here because they're inline in the
@@ -325,6 +335,9 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE pages DROP COLUMN IF EXISTS import_filename;
       ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
       ALTER TABLE pages DROP COLUMN IF EXISTS emotional_weight;
+
+      DROP INDEX IF EXISTS idx_pages_rid;
+      ALTER TABLE pages DROP COLUMN IF EXISTS rid;
     `);
 
     // Bootstrap, then schema replay. Either step crashing fails the test.

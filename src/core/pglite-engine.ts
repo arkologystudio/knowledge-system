@@ -46,6 +46,7 @@ import type {
   EnrichCandidatesOpts, EnrichCandidate,
 } from './types.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, takeRowToTake, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
+import { validateRid } from './rid.ts';
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { executeRawJsonb } from './sql-query.ts';
@@ -518,7 +519,9 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='pages' AND column_name='embedding_signature') AS pages_embedding_signature_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='pages' AND column_name='links_extracted_at') AS pages_links_extracted_at_exists
+                WHERE table_schema='public' AND table_name='pages' AND column_name='links_extracted_at') AS pages_links_extracted_at_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='pages' AND column_name='rid') AS pages_rid_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -561,6 +564,7 @@ export class PGLiteEngine implements BrainEngine {
       pages_generation_exists: boolean;
       pages_embedding_signature_exists: boolean;
       pages_links_extracted_at_exists: boolean;
+      pages_rid_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
@@ -637,6 +641,12 @@ export class PGLiteEngine implements BrainEngine {
     // it; pre-v112 brains crash without the column, so bootstrap adds it before
     // the CREATE INDEX runs. v112 runs later via runMigrations and is idempotent.
     const needsPagesLinksExtractedAt = probe.pages_exists && !probe.pages_links_extracted_at_exists;
+    // v128 (pages_reference_identifier): pages.rid, the permanent page name.
+    // `CREATE UNIQUE INDEX idx_pages_rid ON pages(rid)` in PGLITE_SCHEMA_SQL
+    // references it, so a pre-v128 brain wedges on the blob replay unless
+    // bootstrap adds the column first. v128 runs later via runMigrations and is
+    // idempotent (it re-backfills nothing, since the DEFAULT already minted).
+    const needsPagesRid = probe.pages_exists && !probe.pages_rid_exists;
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
@@ -648,7 +658,8 @@ export class PGLiteEngine implements BrainEngine {
         && !needsPagesProvenance
         && !needsContextualRetrievalColumns && !needsPagesGeneration
         && !needsPagesEmbeddingSignature
-        && !needsPagesLinksExtractedAt) return;
+        && !needsPagesLinksExtractedAt
+        && !needsPagesRid) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -895,6 +906,19 @@ export class PGLiteEngine implements BrainEngine {
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS links_extracted_at TIMESTAMPTZ;
       `);
     }
+
+    if (needsPagesRid) {
+      // v128 (pages_reference_identifier): the page's permanent name. Add the
+      // column WITH its generated default and backfill in the same pass so the
+      // blob's `CREATE UNIQUE INDEX idx_pages_rid` has a fully-populated,
+      // collision-free column to index. Mirrors postgres-engine.ts.
+      await this.db.exec(`
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS rid TEXT;
+        UPDATE pages SET rid = 'orn:habitat.page:' || gen_random_uuid() WHERE rid IS NULL;
+        ALTER TABLE pages ALTER COLUMN rid SET DEFAULT ('orn:habitat.page:' || gen_random_uuid());
+        ALTER TABLE pages ALTER COLUMN rid SET NOT NULL;
+      `);
+    }
   }
 
   async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
@@ -948,7 +972,7 @@ export class PGLiteEngine implements BrainEngine {
     }
     const { rows } = await this.db.query(
       `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
-              source_kind, source_uri, ingested_via, ingested_at
+              source_kind, source_uri, ingested_via, ingested_at, rid
        FROM pages WHERE ${where.join(' AND ')} LIMIT 1`,
       params
     );
@@ -1008,9 +1032,12 @@ export class PGLiteEngine implements BrainEngine {
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date().toISOString() : null;
+    // v128 — Reference Identifier. NULL means "let the DB default mint one".
+    // Validated at the same chokepoint as the Postgres engine (parity).
+    const rid = page.rid ? validateRid(page.rid) : null;
     const { rows } = await this.db.query(
-      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, 1), $14, $15, $16, $17, $18::timestamptz)
+      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at, rid)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, 1), $14, $15, $16, $17, $18::timestamptz, COALESCE($19, 'orn:habitat.page:' || gen_random_uuid()))
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          page_kind = EXCLUDED.page_kind,
@@ -1028,9 +1055,14 @@ export class PGLiteEngine implements BrainEngine {
          source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
          source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
          ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
-         ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
-       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
-      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt]
+         ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at),
+         -- v128 MINT-ONCE: argument order is the INVERSE of the preserve group
+         -- above. Those keep the stored value only when the caller omits;
+         -- identity keeps the stored value ALWAYS. A re-import can never
+         -- re-mint or overwrite an existing RID. Mirrors postgres-engine.ts.
+         rid                   = COALESCE(pages.rid,                     EXCLUDED.rid)
+       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at, rid`,
+      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, rid]
     );
     return rowToPage(rows[0] as Record<string, unknown>);
   }
@@ -3197,6 +3229,52 @@ export class PGLiteEngine implements BrainEngine {
       result.set(Number(r.id), { reason: r.reason, detail: r.detail ?? '' });
     }
     return result;
+  }
+
+  async getRidsByPageIds(pageIds: number[]): Promise<Map<number, string>> {
+    const result = new Map<number, string>();
+    if (pageIds.length === 0) return result;
+    // Parity with PostgresEngine.getRidsByPageIds (v128).
+    const { rows } = await this.db.query(
+      `SELECT id, rid FROM pages WHERE id = ANY($1::int[]) AND rid IS NOT NULL`,
+      [pageIds]
+    );
+    for (const r of rows as { id: number; rid: string }[]) {
+      result.set(Number(r.id), r.rid);
+    }
+    return result;
+  }
+
+  async getPageByRid(
+    rid: string,
+    opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean },
+  ): Promise<Page | null> {
+    // Parity with PostgresEngine.getPageByRid (v128). Same source-scope
+    // precedence ladder as getPage — identity is global, so an unscoped lookup
+    // would read across every source in the brain.
+    const includeDeleted = opts?.includeDeleted === true;
+    const sourceId = opts?.sourceId;
+    const sourceIds = opts?.sourceIds;
+    const where: string[] = ['rid = $1'];
+    const params: unknown[] = [rid];
+    if (sourceIds && sourceIds.length > 0) {
+      params.push(sourceIds);
+      where.push(`source_id = ANY($${params.length}::text[])`);
+    } else if (sourceId) {
+      params.push(sourceId);
+      where.push(`source_id = $${params.length}`);
+    }
+    if (!includeDeleted) {
+      where.push('deleted_at IS NULL');
+    }
+    const { rows } = await this.db.query(
+      `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
+              source_kind, source_uri, ingested_via, ingested_at, rid
+       FROM pages WHERE ${where.join(' AND ')} LIMIT 1`,
+      params
+    );
+    if (rows.length === 0) return null;
+    return rowToPage(rows[0] as Record<string, unknown>);
   }
 
   async getPageTimestamps(slugs: string[]): Promise<Map<string, Date>> {
