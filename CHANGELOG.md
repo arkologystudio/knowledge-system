@@ -2,6 +2,19 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.3] - 2026-07-20
+
+**Pages written by agents are hashed the same way as pages imported from markdown, so unchanged content stops being re-chunked and re-embedded.**
+
+### Fixed
+
+- **Content-hash divergence between the two write paths.** `putPage` falls back to `contentHash()` whenever a caller omits `content_hash`, which is the path every agent-generated page takes — cycle synthesis, chronicle, think, enrichment and the output writer all write without a precomputed hash. That fallback omitted the ephemeral-frontmatter strip and the `tags` field while its docstring claimed to match `importFromContent`; it matched neither. Omitting the strip silently reintroduced the unbounded re-embed bug that CV8 and #1699 each fixed on the import side, because timestamp-bearing frontmatter produced a fresh hash on every write. Both paths now derive from a single `computeCanonicalPageHash` in `src/core/content-hash.ts`, and a drift test pins it against a literal replica of the import expression so the two cannot separate again.
+
+### Notes
+
+- The canonical helper reproduces the import-file algorithm bit-for-bit rather than improving it, so **no hash changes on the markdown import path**. Pages previously hashed through the fallback will re-chunk once as they converge.
+- Two limitations are preserved deliberately and tracked separately: key order is not canonicalised (fixing it needs RFC 8785 and rehashes the corpus, so it belongs with the Manifest work), and `PageInput` carries no `tags`, so a tagged page written through `putPage` still differs by one hash from the same page imported from markdown.
+
 ## [0.43.0.2] - 2026-07-17
 
 **The required CI gate runs cleanly again: secret scanning no longer depends on an unavailable organization license, tests obey the repository's isolation contract, and embedding fixtures work with any configured vector width.**
