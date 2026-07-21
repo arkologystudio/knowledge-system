@@ -39,6 +39,7 @@ import {
 import { resolvePageFilePath } from '../core/markdown.ts';
 import { validateSourceId } from '../core/utils.ts';
 import { createProgress } from '../core/progress.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import {
   RID_FRONTMATTER_KEY,
@@ -60,7 +61,7 @@ export async function runRid(engine: BrainEngine, args: string[]): Promise<void>
 
   process.stderr.write(`Unknown subcommand: rid ${sub}\n\n`);
   printHelp();
-  process.exitCode = 1;
+  setCliExitVerdict(1);
 }
 
 function printHelp(): void {
@@ -114,7 +115,7 @@ async function runBackfill(engine: BrainEngine, args: string[]): Promise<void> {
       `[rid] source "${sourceId}" has no local_path, so there are no source files to stamp.\n` +
       `      Register the source's checkout with: gbrain sources add\n`,
     );
-    process.exitCode = 1;
+    setCliExitVerdict(1);
     return;
   }
   const localPath = source.local_path;
@@ -233,7 +234,7 @@ async function runBackfill(engine: BrainEngine, args: string[]): Promise<void> {
       );
     }
   }
-  if (result.errors.length > 0) process.exitCode = 1;
+  if (result.errors.length > 0) setCliExitVerdict(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -245,14 +246,14 @@ async function runResolve(engine: BrainEngine, args: string[]): Promise<void> {
   const rid = args.find(a => !a.startsWith('--'));
   if (!rid) {
     process.stderr.write('Usage: gbrain rid resolve <rid> [--json]\n');
-    process.exitCode = 1;
+    setCliExitVerdict(1);
     return;
   }
   try {
     validateRid(rid);
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n`);
-    process.exitCode = 1;
+    setCliExitVerdict(1);
     return;
   }
 
@@ -290,20 +291,20 @@ async function runManifest(engine: BrainEngine, args: string[]): Promise<void> {
   const slug = args.find(a => !a.startsWith('--') && a !== sourceId);
   if (!slug) {
     process.stderr.write('Usage: gbrain rid manifest <slug> [--source <id>] [--json]\n');
-    process.exitCode = 1;
+    setCliExitVerdict(1);
     return;
   }
   const page = await engine.getPage(slug, { sourceId });
   if (!page) {
     process.stderr.write(`Page not found: ${slug} (source "${sourceId}")\n`);
-    process.exitCode = 1;
+    setCliExitVerdict(1);
     return;
   }
   if (!page.rid) {
     process.stderr.write(
       `Page ${slug} has no rid. Run \`gbrain apply-migrations\` so migration v128 lands.\n`,
     );
-    process.exitCode = 1;
+    setCliExitVerdict(1);
     return;
   }
   const tags = await engine.getTags(page.slug, { sourceId: page.source_id });
