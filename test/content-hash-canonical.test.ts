@@ -24,6 +24,7 @@ import {
 import { contentHash } from '../src/core/utils.ts';
 import { QUARANTINE_KEY, CONTENT_FLAG_KEY } from '../src/core/quarantine.ts';
 import { EMBED_SKIP_KEY } from '../src/core/embed-skip.ts';
+import { RID_FRONTMATTER_KEY } from '../src/core/rid.ts';
 import type { PageType } from '../src/core/types.ts';
 
 /** Literal replica of the hash expression in importFromContent. */
@@ -35,7 +36,10 @@ function importFileAlgorithm(parsed: {
   frontmatter: Record<string, unknown>;
   tags: string[];
 }): string {
-  const EPHEMERAL = ['captured_at', 'ingested_at', QUARANTINE_KEY, CONTENT_FLAG_KEY, EMBED_SKIP_KEY];
+  const EPHEMERAL = [
+    'captured_at', 'ingested_at', QUARANTINE_KEY, CONTENT_FLAG_KEY, EMBED_SKIP_KEY,
+    RID_FRONTMATTER_KEY,
+  ];
   const stableFrontmatter: Record<string, unknown> = { ...parsed.frontmatter };
   for (const k of EPHEMERAL) delete stableFrontmatter[k];
   return createHash('sha256')
@@ -121,6 +125,34 @@ describe('canonical page content hash', () => {
     const original = { domain: 'example', captured_at: 'x' };
     stripEphemeralFrontmatter(original);
     expect(original.captured_at).toBe('x');
+  });
+
+  /**
+   * The v128 near-miss, pinned.
+   *
+   * The Reference Identifier work added `ref_id` to import-file's own copy of
+   * the ephemeral list while this module was being written. The two lived in
+   * different files, so git merged them clean and every suite stayed green
+   * while the algorithms had silently forked. `ref_id` persists into stored
+   * frontmatter (import's strip is hash-only), so the fork would have meant
+   * import and putPage disagreeing PERMANENTLY on every stamped page — a
+   * corpus-wide re-embed on each alternation between the two write paths.
+   *
+   * These two assertions fail if `ref_id` is ever dropped from the shared list.
+   */
+  test('a page carrying ref_id hashes identically on both paths', () => {
+    const fm = { ...basePage.frontmatter, [RID_FRONTMATTER_KEY]: 'orn:habitat.page:0b7d…' };
+    expect(computeCanonicalPageHash({ ...basePage, frontmatter: fm }))
+      .toBe(importFileAlgorithm({ ...basePage, frontmatter: { ...fm } }));
+  });
+
+  test('stamping ref_id does not change a page hash — the backfill re-embed guard', () => {
+    const unstamped = computeCanonicalPageHash(basePage);
+    const stamped = computeCanonicalPageHash({
+      ...basePage,
+      frontmatter: { ...basePage.frontmatter, [RID_FRONTMATTER_KEY]: 'orn:habitat.page:0b7d…' },
+    });
+    expect(stamped).toBe(unstamped);
   });
 
   test('utils.contentHash delegates — tagless page matches the import algorithm', () => {

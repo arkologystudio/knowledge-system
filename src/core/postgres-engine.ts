@@ -61,6 +61,7 @@ import * as db from './db.ts';
 import { ConnectionManager } from './connection-manager.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
+import { validateRid } from './rid.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte, UNIFIED_SLUG_EXPR, UNIFIED_SOURCE_ID_EXPR, UNIFIED_TITLE_EXPR, UNIFIED_TYPE_EXPR, UNIFIED_EFFECTIVE_DATE_EXPR, CONTENT_CLASS_EXPR, UNIFIED_CONTENT_FROM_JOIN, UNIFIED_CONTENT_VALID_CLAUSE } from './search/sql-ranking.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
@@ -551,7 +552,9 @@ export class PostgresEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'embedding_signature') AS pages_embedding_signature_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'links_extracted_at') AS pages_links_extracted_at_exists
+                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'links_extracted_at') AS pages_links_extracted_at_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'rid') AS pages_rid_exists
     `;
     const probe = probeRows[0]!;
 
@@ -628,6 +631,7 @@ export class PostgresEngine implements BrainEngine {
       pages_generation_exists?: boolean;
       pages_embedding_signature_exists?: boolean;
       pages_links_extracted_at_exists?: boolean;
+      pages_rid_exists?: boolean;
     };
     const needsContextualRetrievalColumns = (probe.pages_exists
         && (!probeCr.pages_cr_mode_exists || !probeCr.pages_corpus_generation_exists))
@@ -647,6 +651,11 @@ export class PostgresEngine implements BrainEngine {
     // SCHEMA_SQL replay creates the index. v112 runs later via runMigrations
     // and is idempotent.
     const needsPagesLinksExtractedAt = probe.pages_exists && !probeCr.pages_links_extracted_at_exists;
+    // v128 (pages_reference_identifier): pages.rid, the permanent page name.
+    // `CREATE UNIQUE INDEX idx_pages_rid ON pages(rid)` in SCHEMA_SQL references
+    // it, so a pre-v128 brain wedges on the blob replay unless bootstrap adds
+    // the column first. v128 runs later via runMigrations and is idempotent.
+    const needsPagesRid = probe.pages_exists && !probeCr.pages_rid_exists;
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
@@ -657,7 +666,8 @@ export class PostgresEngine implements BrainEngine {
         && !needsPagesProvenance
         && !needsContextualRetrievalColumns && !needsPagesGeneration
         && !needsPagesEmbeddingSignature
-        && !needsPagesLinksExtractedAt) return;
+        && !needsPagesLinksExtractedAt
+        && !needsPagesRid) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -904,6 +914,19 @@ export class PostgresEngine implements BrainEngine {
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS links_extracted_at TIMESTAMPTZ;
       `);
     }
+
+    if (needsPagesRid) {
+      // v128 (pages_reference_identifier): the page's permanent name. Add the
+      // column WITH its generated default and backfill in the same pass so the
+      // blob's `CREATE UNIQUE INDEX idx_pages_rid` has a fully-populated,
+      // collision-free column to index. Mirrors pglite-engine.ts.
+      await conn.unsafe(`
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS rid TEXT;
+        UPDATE pages SET rid = 'orn:habitat.page:' || gen_random_uuid() WHERE rid IS NULL;
+        ALTER TABLE pages ALTER COLUMN rid SET DEFAULT ('orn:habitat.page:' || gen_random_uuid());
+        ALTER TABLE pages ALTER COLUMN rid SET NOT NULL;
+      `);
+    }
   }
 
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
@@ -987,7 +1010,7 @@ export class PostgresEngine implements BrainEngine {
     const deletedCondition = includeDeleted ? sql`` : sql`AND deleted_at IS NULL`;
     const rows = await sql`
       SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
-             source_kind, source_uri, ingested_via, ingested_at
+             source_kind, source_uri, ingested_via, ingested_at, rid
       FROM pages
       WHERE slug = ${slug} ${sourceCondition} ${deletedCondition}
       LIMIT 1
@@ -1054,9 +1077,14 @@ export class PostgresEngine implements BrainEngine {
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
+    // v128 — Reference Identifier. NULL means "let the DB default mint one";
+    // a non-null value is an externally-keyed identity carried in by the
+    // importer. Validated here because putPage is the shared chokepoint for
+    // every write path on both engines (the validateSlug precedent).
+    const rid = page.rid ? validateRid(page.rid) : null;
     const rows = await sql`
-      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, 1), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
+      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at, rid)
+      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, 1), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt}, COALESCE(${rid}, 'orn:habitat.page:' || gen_random_uuid()))
       ON CONFLICT (source_id, slug) DO UPDATE SET
         type = EXCLUDED.type,
         page_kind = EXCLUDED.page_kind,
@@ -1074,8 +1102,13 @@ export class PostgresEngine implements BrainEngine {
         source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
         source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
         ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
-        ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
-      RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at
+        ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at),
+        -- v128 MINT-ONCE: argument order is the INVERSE of the preserve group
+        -- above. Those keep the stored value only when the caller omits;
+        -- identity keeps the stored value ALWAYS. A re-import can never re-mint
+        -- or overwrite an existing RID, which is what "never reissued" means.
+        rid                   = COALESCE(pages.rid,                      EXCLUDED.rid)
+      RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at, rid
     `;
     return rowToPage(rows[0]);
   }
@@ -3300,6 +3333,48 @@ export class PostgresEngine implements BrainEngine {
       result.set(Number(r.id), { reason: r.reason, detail: r.detail ?? '' });
     }
     return result;
+  }
+
+  async getRidsByPageIds(pageIds: number[]): Promise<Map<number, string>> {
+    const result = new Map<number, string>();
+    if (pageIds.length === 0) return result;
+    const sql = this.sql;
+    const rows = await sql`
+      SELECT id, rid FROM pages WHERE id = ANY(${pageIds}::int[]) AND rid IS NOT NULL
+    `;
+    for (const r of rows as unknown as { id: number; rid: string }[]) {
+      result.set(Number(r.id), r.rid);
+    }
+    return result;
+  }
+
+  async getPageByRid(
+    rid: string,
+    opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean },
+  ): Promise<Page | null> {
+    const sql = this.sql;
+    const includeDeleted = opts?.includeDeleted === true;
+    const sourceId = opts?.sourceId;
+    const sourceIds = opts?.sourceIds;
+    // Same precedence ladder as getPage (#1393): a federated grant wins over a
+    // scalar source. Identity is global, so without this the lookup would read
+    // across every source in the brain.
+    const sourceCondition =
+      sourceIds && sourceIds.length > 0
+        ? sql`AND source_id = ANY(${sourceIds}::text[])`
+        : sourceId
+          ? sql`AND source_id = ${sourceId}`
+          : sql``;
+    const deletedCondition = includeDeleted ? sql`` : sql`AND deleted_at IS NULL`;
+    const rows = await sql`
+      SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
+             source_kind, source_uri, ingested_via, ingested_at, rid
+      FROM pages
+      WHERE rid = ${rid} ${sourceCondition} ${deletedCondition}
+      LIMIT 1
+    `;
+    if (rows.length === 0) return null;
+    return rowToPage(rows[0]);
   }
 
   async getPageTimestamps(slugs: string[]): Promise<Map<string, Date>> {

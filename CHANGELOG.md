@@ -2,6 +2,24 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.4] - 2026-07-21
+
+**Every page now carries a permanent identifier that survives being renamed, moved, or reassigned to a different space — so references between pages stop breaking. Identity used to be the page's path, which meant a rename read as a deletion plus a creation and every inbound link died with it.**
+
+### Added
+- **Reference Identifiers on every page.** Each page is minted a permanent name of the form `orn:<namespace>:<reference>`, following the published KOI Object Reference Name syntax so the identifier is legible outside this system. It is minted once and never reissued: renaming a page, moving it between directories, or reassigning it to a different space all leave it untouched. The space a page belongs to is deliberately not part of its identity — that is routing, and routing changes.
+- **Identifiers that survive a full re-index.** A page originating in an external system is keyed on that system's own stable id, so re-ingesting the same source object always yields the same identifier. `gbrain rid backfill` stamps each identifier into its source markdown, which is what makes identity a property of the content rather than of database state. The stamped field is excluded from the content hash, so the backfill pass does not re-embed the corpus.
+- **A portable descriptor.** `gbrain rid manifest <slug>` emits an identifier, timestamp, and content hash that a recipient can verify against the content they received. The hash follows RFC 8785 canonical JSON, so an implementation in another language reproduces it exactly — pinned by a committed cross-language test vector.
+- **Resolution from an identifier to a page, and to locators.** The `resolve_rid` operation (`gbrain rid resolve`) answers an identifier with the page it names, honouring the caller's source grant exactly as `get_page` does. It always returns the locator list, so an identifier for an object mirrored from an external system points at the original even when this brain holds no copy.
+- **Rename-proof citations.** Retrieval results carry the identifier alongside the slug, so an agent answering a question can cite a page in a way that stays valid after the page is renamed.
+
+### Changed
+- **The two content-hash implementations are now genuinely one.** `importFromContent` imports the shared ephemeral-key list and strip from `src/core/content-hash.ts` instead of restating them, and `ref_id` is excluded there rather than only on the import side. The strip during import is hash-only, so the identifier persists into stored frontmatter; had the two lists stayed separate, pages written by agents and the same pages imported from markdown would have disagreed permanently once the backfill ran, re-chunking and re-embedding on every alternation between the write paths.
+- **Existing brains are migrated in place.** Migration v128 adds the identifier column, mints one for every existing page, and enforces uniqueness. No link is broken and existing slugs continue to resolve — aliases locate a page, identifiers name it, and the two compose.
+
+### To take advantage of v0.43.0.4
+Upgrade and run `gbrain apply-migrations --yes` (or any command that opens the brain) to apply migration v128. Every existing page is given an identifier automatically; no reindex or re-embedding is required. To make those identifiers survive a future wipe-and-re-ingest, run `gbrain rid backfill --dry-run` to preview, then `gbrain rid backfill` to stamp them into your source files. Every file it writes is backed up first.
+
 ## [0.43.0.3] - 2026-07-20
 
 **Pages written by agents are hashed the same way as pages imported from markdown, so unchanged content stops being re-chunked and re-embedded.**

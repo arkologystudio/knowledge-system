@@ -149,8 +149,20 @@ CREATE TABLE IF NOT EXISTS pages (
   -- the content allow-list IS DISTINCT FROM. Read by the per-page snapshot
   -- check in query-cache-gate.ts.
   generation     BIGINT NOT NULL DEFAULT 1,
+  -- Reference Identifier (migration v128). The page's permanent name: minted
+  -- once, never reissued, and untouched by renaming, moving, or reassigning
+  -- the page to a different source. Slug-derived identity dies on rename;
+  -- this does not. Grammar `orn:<namespace>:<reference>` per the KOI Object
+  -- Reference Name syntax — see src/core/rid.ts. `source_id` deliberately does
+  -- NOT appear in a RID: it is mutable and routing-assigned, so it belongs to
+  -- addressing, not identity.
+  rid            TEXT NOT NULL DEFAULT ('orn:habitat.page:' || gen_random_uuid()),
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
+
+-- v128: identity is GLOBAL, not per-source — a page that moves between sources
+-- keeps its RID — so uniqueness is on rid alone, unlike (source_id, slug).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_rid ON pages(rid);
 
 -- v0.40.3.0 cache invalidation trigger (migration v91; mirrored in
 -- src/core/pglite-schema.ts). BEFORE INSERT OR UPDATE so every write path

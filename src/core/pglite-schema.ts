@@ -115,8 +115,16 @@ CREATE TABLE IF NOT EXISTS pages (
   -- when content columns IS DISTINCT FROM. Read by the per-page snapshot
   -- check in query-cache-gate.ts.
   generation     BIGINT NOT NULL DEFAULT 1,
+  -- Reference Identifier (migration v128; mirrors src/schema.sql). The page's
+  -- permanent name: minted once, never reissued, untouched by rename / move /
+  -- source reassignment. Grammar orn:<namespace>:<reference> per the KOI
+  -- Object Reference Name syntax — see src/core/rid.ts.
+  rid            TEXT NOT NULL DEFAULT ('orn:habitat.page:' || gen_random_uuid()),
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
+
+-- v128: identity is GLOBAL, not per-source, so uniqueness is on rid alone.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_rid ON pages(rid);
 
 -- v0.40.3.0 cache invalidation trigger (migration v91; mirrors src/schema.sql).
 -- BEFORE INSERT OR UPDATE so every write path bumps generation per D6 /

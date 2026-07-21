@@ -1316,6 +1316,30 @@ export interface BrainEngine {
     pageIds: number[],
   ): Promise<Map<number, { reason: string; detail: string }>>;
   /**
+   * v128 — for a list of page_ids, return their Reference Identifiers. Used by
+   * `stampRefIds` to decorate search results post-fusion so an agent can cite a
+   * page by an identifier that survives the page being renamed. Single SQL
+   * query, not N+1 (the `getContentFlagsByPageIds` precedent). Empty input →
+   * empty map, no query.
+   *
+   * Read-only and behaviour-inert: nothing about scope or ranking consults it.
+   */
+  getRidsByPageIds(pageIds: number[]): Promise<Map<number, string>>;
+  /**
+   * v128 — resolve a Reference Identifier to its page.
+   *
+   * MUST be source-scoped by the caller exactly like `getPage`: RIDs are global
+   * (identity does not carry a source), so an unscoped lookup would be a
+   * cross-source read of any page by identifier — the same leak class
+   * `resolve_slugs` still has. Returns null when the RID is unknown, or known
+   * but outside the caller's scope; the two are deliberately indistinguishable
+   * so a caller can't probe for the existence of pages it cannot read.
+   */
+  getPageByRid(
+    rid: string,
+    opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean },
+  ): Promise<Page | null>;
+  /**
    * v0.27.0: for a list of slugs, return their updated_at timestamps (or created_at fallback).
    * Used by hybrid search recency boost. Single SQL query, not N+1.
    * Slugs with no timestamp get no entry in the map.
