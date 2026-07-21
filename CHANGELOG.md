@@ -13,6 +13,9 @@ All notable changes to GBrain will be documented in this file.
 - **Resolution from an identifier to a page, and to locators.** The `resolve_rid` operation (`gbrain rid resolve`) answers an identifier with the page it names, honouring the caller's source grant exactly as `get_page` does. It always returns the locator list, so an identifier for an object mirrored from an external system points at the original even when this brain holds no copy.
 - **Rename-proof citations.** Retrieval results carry the identifier alongside the slug, so an agent answering a question can cite a page in a way that stays valid after the page is renamed.
 
+### Fixed
+- **`gbrain rid` reports failure correctly.** Its exit-code writes went straight to `process.exitCode`, which the deliberate flush-exit zeroes — so a failed `rid backfill` would have exited 0 and reported success. All eight writes now route through `setCliExitVerdict`, the owned verdict channel the rest of the CLI uses.
+
 ### Changed
 - **The two content-hash implementations are now genuinely one.** `importFromContent` imports the shared ephemeral-key list and strip from `src/core/content-hash.ts` instead of restating them, and `ref_id` is excluded there rather than only on the import side. The strip during import is hash-only, so the identifier persists into stored frontmatter; had the two lists stayed separate, pages written by agents and the same pages imported from markdown would have disagreed permanently once the backfill ran, re-chunking and re-embedding on every alternation between the write paths.
 - **Existing brains are migrated in place.** Migration v128 adds the identifier column, mints one for every existing page, and enforces uniqueness. No link is broken and existing slugs continue to resolve — aliases locate a page, identifiers name it, and the two compose.
