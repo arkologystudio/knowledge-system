@@ -6118,6 +6118,68 @@ export const MIGRATIONS: Migration[] = [
       return rows[0]?.privileges_ok === true && rows[0]?.policies_ok === true;
     },
   },
+  {
+    version: 128,
+    name: 'pages_reference_identifier',
+    // Reference Identifiers (RIDs) — KOI-compatible stable page identity.
+    //
+    // Identity today is the slug, and the slug is derived from the path. So a
+    // rename reads to the engine as a delete plus a create and every inbound
+    // reference dies. `rid` is the permanent name: minted once, never reissued,
+    // and untouched by renaming, moving, or reassigning the page to a different
+    // source. `source_id` stays outside identity precisely because it is mutable
+    // and routing-assigned.
+    //
+    // Shape mirrors the `artifacts.object_id` precedent from v123 (:5541-5542,
+    // unique index at :5582) — pages are getting the stable-external-identity
+    // column artefacts already have. Grammar + validation live in
+    // `src/core/rid.ts`; the DB only needs to mint and enforce uniqueness.
+    //
+    // Mint-fresh rather than derive: nothing in the current corpus is stable
+    // enough to derive from, and deriving from the slug would reintroduce the
+    // exact defect being fixed. The generated DEFAULT means concurrent ingest is
+    // safe with no application-level coordination — the value is produced per
+    // row inside the insert.
+    //
+    // Four-step ADD → backfill → SET DEFAULT → SET NOT NULL, rather than a
+    // single `ADD COLUMN ... NOT NULL DEFAULT`: the one-shot form would work on
+    // modern Postgres but rewrites semantics differ across the PGLite/Postgres
+    // pair, and the explicit sequence is unambiguous on both and re-runnable.
+    //
+    // BEHAVIOUR-INERT ON THE SECURITY SURFACE by construction: nothing in grants
+    // (principal_source_grants, v124), RLS (v125–v127), or retrieval scoping
+    // reads `rid`, so this migration cannot widen or narrow any scope.
+    idempotent: true,
+    sql: `
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS rid TEXT;
+
+      -- Backfill before the NOT NULL so an existing corpus migrates in place.
+      -- gen_random_uuid() is core in Postgres 13+ (and pgcrypto is enabled in
+      -- schema.sql as the fallback), so this needs no extension work.
+      UPDATE pages SET rid = 'orn:habitat.page:' || gen_random_uuid() WHERE rid IS NULL;
+
+      ALTER TABLE pages ALTER COLUMN rid SET DEFAULT ('orn:habitat.page:' || gen_random_uuid());
+      ALTER TABLE pages ALTER COLUMN rid SET NOT NULL;
+
+      -- Identity is global, not per-source: a page that moves between sources
+      -- keeps its RID, so the uniqueness constraint must NOT be scoped by
+      -- source_id the way (source_id, slug) is.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_rid ON pages(rid);
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_ok: boolean; index_ok: boolean }>(
+        `SELECT
+           EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'pages' AND column_name = 'rid'
+                      AND is_nullable = 'NO') AS column_ok,
+           EXISTS (SELECT 1 FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND tablename = 'pages' AND indexname = 'idx_pages_rid') AS index_ok`,
+      );
+      return rows[0]?.column_ok === true && rows[0]?.index_ok === true;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

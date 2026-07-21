@@ -37,6 +37,8 @@ import {
 import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
 import { normalizeAliasList } from './search/alias-normalize.ts';
 import { isUndefinedTableError, warnOncePerProcess } from './utils.ts';
+import { RID_FRONTMATTER_KEY, validateRid, tryParseRid } from './rid.ts';
+import { stripEphemeralFrontmatter } from './content-hash.ts';
 import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 import { runGuardrails } from './guardrails.ts';
 
@@ -204,6 +206,55 @@ export interface ImportResult {
 }
 
 const MAX_FILE_SIZE = 5_000_000; // 5MB
+
+/**
+ * v128 — resolve the Reference Identifier an incoming file declares in its
+ * frontmatter, rejecting a hijack attempt.
+ *
+ * Returns the RID to write, or `null` meaning "mint a fresh one at the DB
+ * default". Throws when the file declares a RID that another page already
+ * holds.
+ *
+ * The three cases:
+ *   - No `ref_id` in frontmatter → null (mint). The overwhelmingly common path.
+ *   - `ref_id` unclaimed, or held by THIS (source_id, slug) → honour it. This is
+ *     what makes re-ingest reproducible: a stamped file re-imported after a
+ *     wipe restores its original identity instead of getting a new one.
+ *   - `ref_id` held by a DIFFERENT page → throw. Identity theft, refused.
+ *
+ * Fail-open on a missing engine method (`getPageByRid`) so the many test doubles
+ * in this codebase that implement a partial `BrainEngine` don't break; the DB's
+ * unique index is the real backstop either way.
+ */
+async function resolveIncomingRid(
+  engine: BrainEngine,
+  raw: unknown,
+  ctx: { slug: string; sourceId: string; sourcePath?: string },
+): Promise<string | null> {
+  if (typeof raw !== 'string' || raw.trim().length === 0) return null;
+  const candidate = raw.trim();
+
+  // Malformed identifiers are rejected at the same chokepoint every other write
+  // path uses, so a bad `ref_id` can't reach the DB via the import lane.
+  validateRid(candidate);
+  if (!tryParseRid(candidate)) return null;
+
+  if (typeof engine.getPageByRid !== 'function') return candidate;
+
+  // includeDeleted: a soft-deleted page still HOLDS its identity (the row is
+  // recoverable for 72h and the unique index still covers it), so a tombstone
+  // must block the claim rather than let a second page take the name.
+  const holder = await engine.getPageByRid(candidate, { includeDeleted: true });
+  if (!holder) return candidate;
+  if (holder.slug === ctx.slug && holder.source_id === ctx.sourceId) return candidate;
+
+  throw new Error(
+    `[import] refusing ${ctx.sourcePath ?? ctx.slug}: frontmatter ${RID_FRONTMATTER_KEY} ` +
+    `"${candidate}" is already held by a different page. A Reference Identifier is ` +
+    `minted once and never reissued. Remove the ${RID_FRONTMATTER_KEY} field to have a ` +
+    `fresh identifier minted for this page.`,
+  );
+}
 
 /**
  * Import content from a string. Core pipeline:
@@ -526,17 +577,11 @@ export async function importFromContent(
   // is real, unbounded embedding spend). Same bug class as the captured_at /
   // ingested_at fix above; the gate re-derives the markers deterministically
   // on the next import, so dropping them from the hash is safe.
-  const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
-    'captured_at',
-    'ingested_at',
-    QUARANTINE_KEY,
-    CONTENT_FLAG_KEY,
-    EMBED_SKIP_KEY,
-  ];
-  const stableFrontmatter: Record<string, unknown> = { ...parsed.frontmatter };
-  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) {
-    delete stableFrontmatter[k];
-  }
+  // The key list and the strip both live in src/core/content-hash.ts. They used
+  // to be duplicated here, the copies disagreed, and `putPage`'s fallback hashed
+  // agent-written pages by the divergent one. Import the shared helper rather
+  // than restating it — including `ref_id` (v128), which is stripped there.
+  const stableFrontmatter = stripEphemeralFrontmatter(parsed.frontmatter);
   // Hash includes all meaningful fields for idempotency.
   const hash = createHash('sha256')
     .update(JSON.stringify({
@@ -562,6 +607,31 @@ export async function importFromContent(
   if (existing?.content_hash === hash && !opts.forceRechunk) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
+
+  // v128 — Reference Identifier from frontmatter, with a hijack guard.
+  //
+  // Same class as the slug hijack guarded in `importFromFile`: in a shared brain
+  // where PRs are mergeable, a file could otherwise declare another page's RID
+  // in its frontmatter and steal that page's identity — which is strictly worse
+  // than stealing its slug, because every external reference held by a partner
+  // would silently start resolving to the attacker's content.
+  //
+  // Accept a frontmatter RID ONLY when it is unclaimed, or already held by this
+  // very (source_id, slug). Anything else is rejected loudly rather than
+  // dropped: a page whose declared identity we refuse to honour is a situation
+  // the operator must see, not one to paper over by silently minting a fresh
+  // identifier.
+  //
+  // The claim check is deliberately UNSCOPED by source: the `idx_pages_rid`
+  // unique index is global, so a scoped check would pass and the INSERT would
+  // then fail with an opaque constraint violation. Reading across sources here
+  // is safe — this is the trusted local ingest path (never a remote caller),
+  // and the only thing observed is whether a RID is taken.
+  const ridFromFrontmatter = await resolveIncomingRid(
+    engine,
+    (parsed.frontmatter as Record<string, unknown> | undefined)?.[RID_FRONTMATTER_KEY],
+    { slug, sourceId: sourceId ?? 'default', sourcePath: opts.sourcePath },
+  );
 
   // v0.41.13 (#1309) — identity-based cross-slug dedup pre-check.
   //
@@ -773,6 +843,12 @@ export async function importFromContent(
       ingested_via: opts.ingested_via ?? null,
       // ingested_at is server-stamped at the engine layer when any
       // provenance write fires; never client-controlled.
+      //
+      // v128: NULL lets the DB default mint a fresh `orn:habitat.page:<uuid>`.
+      // A non-null value came from frontmatter and has already cleared the
+      // hijack guard above. Either way the engine's COALESCE-preserve makes
+      // this mint-once — a re-import never overwrites an existing RID.
+      rid: ridFromFrontmatter,
     }, txOpts);
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside

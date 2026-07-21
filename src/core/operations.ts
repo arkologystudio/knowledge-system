@@ -13,6 +13,7 @@ import { importFromContent } from './import-file.ts';
 import { writePageThrough } from './write-through.ts';
 import { gitFirstPageWrite, GitPageWriteError } from './git-page-write.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
+import { validateRid, resolveLocators } from './rid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
@@ -579,6 +580,36 @@ export function resolvePerCallMode(ctx: OperationContext, raw: unknown): string 
 /** T4 — stamp evidence/create_safety on a result set, fail-soft. */
 function stampEvidenceSafe(results: SearchResult[]): void {
   try { stampEvidence(results); } catch { /* non-fatal */ }
+}
+
+/**
+ * v128 — stamp each result's Reference Identifier, fail-soft.
+ *
+ * This is what makes a citation survive a rename. An agent answering a question
+ * cites `rid` rather than `slug`; the slug is a path and paths move, the RID is
+ * identity and does not. Post-fusion decoration (the `stampContentFlags` /
+ * `stampEvidence` precedent) rather than a change to the search SQL — lower
+ * risk, and identity has no business influencing ranking.
+ *
+ * Fail-soft by construction: an identifier lookup that fails must degrade the
+ * citation, never break retrieval.
+ */
+async function stampRefIds(engine: BrainEngine, results: SearchResult[]): Promise<void> {
+  if (results.length === 0) return;
+  try {
+    const ids = [...new Set(
+      results.map((r) => r.page_id).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)),
+    )];
+    if (ids.length === 0) return;
+    const rids = await engine.getRidsByPageIds(ids);
+    if (rids.size === 0) return;
+    for (const r of results) {
+      const rid = rids.get(r.page_id);
+      if (rid) r.rid = rid;
+    }
+  } catch {
+    // best-effort: an identifier lookup failure must not break retrieval.
+  }
 }
 
 /** T4 — shared eval-capture for the `search` op (keyword-only + cheap-hybrid paths). */
@@ -1527,6 +1558,10 @@ const list_pages: Operation = {
       type: pg.type,
       title: pg.title,
       updated_at: pg.updated_at,
+      // v128: surface the Reference Identifier so a caller enumerating pages
+      // can hold a reference that survives the page being renamed. Omitted
+      // when the engine's listPages projection didn't include the column.
+      ...(pg.rid ? { rid: pg.rid } : {}),
       ...(pg.deleted_at ? { deleted_at: pg.deleted_at } : {}),
     }));
   },
@@ -1570,6 +1605,8 @@ const search: Operation = {
       // agent-warning channel (hybridSearch stamps it; this branch bypasses
       // hybridSearch, so stamp explicitly). Fail-open inside the helper.
       await stampContentFlags(ctx.engine, results);
+      // v128: rename-proof citations on the keyword-only path too.
+      await stampRefIds(ctx.engine, results);
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
       return results;
@@ -1587,6 +1624,8 @@ const search: Operation = {
       onMeta: (m) => { capturedMeta = m; },
     });
     const latency_ms = Date.now() - startedAt;
+    // v128: rename-proof citations.
+    await stampRefIds(ctx.engine, results);
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id).filter((n): n is number => typeof n === 'number' && Number.isFinite(n)));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
     return results;
@@ -1793,6 +1832,11 @@ const query: Operation = {
       relationalRetrieval: typeof p.relational === 'boolean' ? (p.relational as boolean) : undefined,
     });
     const latency_ms = Date.now() - startedAt;
+
+    // v128: rename-proof citations. `query` is the op an agent actually answers
+    // questions through, so this is the site the acceptance criterion
+    // "citations still resolve after the cited page is renamed" lands on.
+    await stampRefIds(ctx.engine, results);
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
     // search handler — fire-and-forget, internal callers bypass this path.
@@ -2723,6 +2767,74 @@ const resolve_slugs: Operation = {
     return ctx.engine.resolveSlugs(p.partial as string);
   },
   scope: 'read',
+};
+
+const resolve_rid: Operation = {
+  name: 'resolve_rid',
+  description:
+    'v128 — resolve a Reference Identifier (orn:<namespace>:<reference>) to the page it names, plus its locators. ' +
+    'Unlike a slug, a RID is permanent: it survives the page being renamed, moved, or reassigned to a different source, ' +
+    'so it is the identifier to hold in a citation or hand across a boundary. Returns the resolved page (slug, title, type) ' +
+    'when the identifier names a page in this brain, and always returns the locator list — for an identifier minted by an ' +
+    'external system (Drive, Notion) at least one locator reaches the original where it actually lives, even when this brain ' +
+    'holds no copy.',
+  params: {
+    rid: { type: 'string', required: true, description: 'Reference Identifier, e.g. orn:habitat.page:<uuid>' },
+    include_deleted: { type: 'boolean', description: 'Surface a soft-deleted page (default: false). A soft-deleted page still holds its identity.' },
+  },
+  handler: async (ctx, p) => {
+    const raw = p.rid as string;
+    // Validate before touching the DB so a malformed identifier gets a precise
+    // grammar error rather than a silent not-found.
+    let rid: string;
+    try {
+      rid = validateRid(raw);
+    } catch (e) {
+      throw new OperationError(
+        'invalid_params',
+        (e as Error).message,
+        'A Reference Identifier looks like orn:habitat.page:<uuid>.',
+      );
+    }
+
+    // Locators are pure — computable without the DB, and meaningful even when
+    // this brain holds no copy of the object. Resolve them first so an external
+    // identifier still answers usefully.
+    const locators = resolveLocators(rid);
+
+    // SOURCE SCOPING IS LOAD-BEARING: a RID carries no source, so an unscoped
+    // lookup would read any page in the brain by identifier. Copy `get_page`'s
+    // ladder — explicitly NOT `resolve_slugs`' shape above, which drops scope
+    // entirely and looks like a live isolation gap.
+    const sourceOpts = sourceScopeOpts(ctx);
+    const page = typeof ctx.engine.getPageByRid === 'function'
+      ? await ctx.engine.getPageByRid(rid, {
+          includeDeleted: (p.include_deleted as boolean) === true,
+          ...sourceOpts,
+        })
+      : null;
+
+    if (!page) {
+      // Deliberately does NOT distinguish "unknown identifier" from "known but
+      // outside your scope" — the two must be indistinguishable or the op
+      // becomes an existence oracle for pages the caller cannot read.
+      return { rid, resolved: false, locators };
+    }
+
+    return {
+      rid,
+      resolved: true,
+      slug: page.slug,
+      title: page.title,
+      type: page.type,
+      source_id: page.source_id,
+      updated_at: page.updated_at,
+      ...(page.deleted_at ? { deleted_at: page.deleted_at } : {}),
+      locators,
+    };
+  },
+  scope: 'read',
+  cliHints: { name: 'rid-resolve', positional: ['rid'] },
 };
 
 const get_chunks: Operation = {
@@ -5769,7 +5881,7 @@ export const operations: Operation[] = [
   // Raw data
   put_raw_data, get_raw_data,
   // Resolution & chunks
-  resolve_slugs, get_chunks,
+  resolve_slugs, resolve_rid, get_chunks,
   // Ingest log
   log_ingest, get_ingest_log,
   // Files

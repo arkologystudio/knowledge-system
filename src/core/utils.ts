@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'crypto';
 import type { Page, PageInput, PageType, Chunk, SearchResult, StalePageRow } from './types.ts';
 import type { Take, TakeKind } from './engine.ts';
+import { computeCanonicalPageHash } from './content-hash.ts';
 
 /**
  * SHA-256 hash a token/secret for storage. Never store plaintext tokens.
@@ -54,18 +55,32 @@ export function validateSlug(slug: string): string {
 
 /**
  * SHA-256 hash of page content, used for import idempotency.
- * Hashes all PageInput fields to match importFromContent's hash algorithm.
+ *
+ * This is the fallback `putPage` uses when a caller omits `content_hash`
+ * (`page.content_hash || contentHash(page)` in both engines), which is the
+ * path every agent-generated page takes — cycle synthesis, chronicle, think,
+ * enrichment and the output writer all write without a precomputed hash.
+ *
+ * Delegates to `computeCanonicalPageHash` so that path agrees with the
+ * markdown import path. The previous inline implementation omitted the
+ * ephemeral-frontmatter strip and the `tags` field, while its docstring
+ * claimed to match `importFromContent` — it did neither. Omitting the strip
+ * silently reintroduced the unbounded re-embed bug that CV8 and #1699 each
+ * fixed on the import side.
+ *
+ * Known residual gap: `PageInput` carries no `tags`, so a tagged page written
+ * through `putPage` still differs by one hash from the same page imported
+ * from markdown, converging after a single re-import. Closing that needs a
+ * `PageInput` signature change and is tracked separately.
  */
 export function contentHash(page: PageInput): string {
-  return createHash('sha256')
-    .update(JSON.stringify({
-      title: page.title,
-      type: page.type,
-      compiled_truth: page.compiled_truth,
-      timeline: page.timeline || '',
-      frontmatter: page.frontmatter || {},
-    }))
-    .digest('hex');
+  return computeCanonicalPageHash({
+    title: page.title,
+    type: page.type,
+    compiled_truth: page.compiled_truth,
+    timeline: page.timeline,
+    frontmatter: page.frontmatter,
+  });
 }
 
 /**
@@ -110,6 +125,11 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const sourceUri = row.source_uri === undefined ? undefined : (row.source_uri as string | null);
   const ingestedVia = row.ingested_via === undefined ? undefined : (row.ingested_via as string | null);
   const ingestedAt = readOptionalDate(row.ingested_at);
+  // v128 — Reference Identifier. Two-state (not three): the DB column is
+  // NOT NULL, so the only reason it's absent is a SELECT that didn't project
+  // it. Omitting the key rather than setting null keeps that distinction
+  // visible to callers instead of implying "this page has no identity".
+  const rid = typeof row.rid === 'string' && row.rid.length > 0 ? row.rid : undefined;
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -143,6 +163,8 @@ export function rowToPage(row: Record<string, unknown>): Page {
     // an upstream caller bypassed the projection check; better to surface than
     // silently mis-attribute).
     source_id: (row.source_id as string | undefined) ?? 'default',
+    // v128: present whenever the SELECT projected `rid`; absent otherwise.
+    ...(rid !== undefined && { rid }),
   };
 }
 

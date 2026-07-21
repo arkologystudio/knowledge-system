@@ -2,6 +2,40 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.4] - 2026-07-21
+
+**Every page now carries a permanent identifier that survives being renamed, moved, or reassigned to a different space — so references between pages stop breaking. Identity used to be the page's path, which meant a rename read as a deletion plus a creation and every inbound link died with it.**
+
+### Added
+- **Reference Identifiers on every page.** Each page is minted a permanent name of the form `orn:<namespace>:<reference>`, following the published KOI Object Reference Name syntax so the identifier is legible outside this system. It is minted once and never reissued: renaming a page, moving it between directories, or reassigning it to a different space all leave it untouched. The space a page belongs to is deliberately not part of its identity — that is routing, and routing changes.
+- **Identifiers that survive a full re-index.** A page originating in an external system is keyed on that system's own stable id, so re-ingesting the same source object always yields the same identifier. `gbrain rid backfill` stamps each identifier into its source markdown, which is what makes identity a property of the content rather than of database state. The stamped field is excluded from the content hash, so the backfill pass does not re-embed the corpus.
+- **A portable descriptor.** `gbrain rid manifest <slug>` emits an identifier, timestamp, and content hash that a recipient can verify against the content they received. The hash follows RFC 8785 canonical JSON, so an implementation in another language reproduces it exactly — pinned by a committed cross-language test vector.
+- **Resolution from an identifier to a page, and to locators.** The `resolve_rid` operation (`gbrain rid resolve`) answers an identifier with the page it names, honouring the caller's source grant exactly as `get_page` does. It always returns the locator list, so an identifier for an object mirrored from an external system points at the original even when this brain holds no copy.
+- **Rename-proof citations.** Retrieval results carry the identifier alongside the slug, so an agent answering a question can cite a page in a way that stays valid after the page is renamed.
+
+### Fixed
+- **`gbrain rid` reports failure correctly.** Its exit-code writes went straight to `process.exitCode`, which the deliberate flush-exit zeroes — so a failed `rid backfill` would have exited 0 and reported success. All eight writes now route through `setCliExitVerdict`, the owned verdict channel the rest of the CLI uses.
+
+### Changed
+- **The two content-hash implementations are now genuinely one.** `importFromContent` imports the shared ephemeral-key list and strip from `src/core/content-hash.ts` instead of restating them, and `ref_id` is excluded there rather than only on the import side. The strip during import is hash-only, so the identifier persists into stored frontmatter; had the two lists stayed separate, pages written by agents and the same pages imported from markdown would have disagreed permanently once the backfill ran, re-chunking and re-embedding on every alternation between the write paths.
+- **Existing brains are migrated in place.** Migration v128 adds the identifier column, mints one for every existing page, and enforces uniqueness. No link is broken and existing slugs continue to resolve — aliases locate a page, identifiers name it, and the two compose.
+
+### To take advantage of v0.43.0.4
+Upgrade and run `gbrain apply-migrations --yes` (or any command that opens the brain) to apply migration v128. Every existing page is given an identifier automatically; no reindex or re-embedding is required. To make those identifiers survive a future wipe-and-re-ingest, run `gbrain rid backfill --dry-run` to preview, then `gbrain rid backfill` to stamp them into your source files. Every file it writes is backed up first.
+
+## [0.43.0.3] - 2026-07-20
+
+**Pages written by agents are hashed the same way as pages imported from markdown, so unchanged content stops being re-chunked and re-embedded.**
+
+### Fixed
+
+- **Content-hash divergence between the two write paths.** `putPage` falls back to `contentHash()` whenever a caller omits `content_hash`, which is the path every agent-generated page takes — cycle synthesis, chronicle, think, enrichment and the output writer all write without a precomputed hash. That fallback omitted the ephemeral-frontmatter strip and the `tags` field while its docstring claimed to match `importFromContent`; it matched neither. Omitting the strip silently reintroduced the unbounded re-embed bug that CV8 and #1699 each fixed on the import side, because timestamp-bearing frontmatter produced a fresh hash on every write. Both paths now derive from a single `computeCanonicalPageHash` in `src/core/content-hash.ts`, and a drift test pins it against a literal replica of the import expression so the two cannot separate again.
+
+### Notes
+
+- The canonical helper reproduces the import-file algorithm bit-for-bit rather than improving it, so **no hash changes on the markdown import path**. Pages previously hashed through the fallback will re-chunk once as they converge.
+- Two limitations are preserved deliberately and tracked separately: key order is not canonicalised (fixing it needs RFC 8785 and rehashes the corpus, so it belongs with the Manifest work), and `PageInput` carries no `tags`, so a tagged page written through `putPage` still differs by one hash from the same page imported from markdown.
+
 ## [0.43.0.2] - 2026-07-17
 
 **The required CI gate runs cleanly again: secret scanning no longer depends on an unavailable organization license, tests obey the repository's isolation contract, and embedding fixtures work with any configured vector width.**
