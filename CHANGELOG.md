@@ -14,6 +14,7 @@ All notable changes to GBrain will be documented in this file.
 - **Rename-proof citations.** Retrieval results carry the identifier alongside the slug, so an agent answering a question can cite a page in a way that stays valid after the page is renamed.
 
 ### Changed
+- **The two content-hash implementations are now genuinely one.** `importFromContent` imports the shared ephemeral-key list and strip from `src/core/content-hash.ts` instead of restating them, and `ref_id` is excluded there rather than only on the import side. The strip during import is hash-only, so the identifier persists into stored frontmatter; had the two lists stayed separate, pages written by agents and the same pages imported from markdown would have disagreed permanently once the backfill ran, re-chunking and re-embedding on every alternation between the write paths.
 - **Existing brains are migrated in place.** Migration v128 adds the identifier column, mints one for every existing page, and enforces uniqueness. No link is broken and existing slugs continue to resolve — aliases locate a page, identifiers name it, and the two compose.
 
 ### To take advantage of v0.43.0.4

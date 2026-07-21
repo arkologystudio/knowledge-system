@@ -38,6 +38,7 @@ import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
 import { normalizeAliasList } from './search/alias-normalize.ts';
 import { isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { RID_FRONTMATTER_KEY, validateRid, tryParseRid } from './rid.ts';
+import { stripEphemeralFrontmatter } from './content-hash.ts';
 import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 import { runGuardrails } from './guardrails.ts';
 
@@ -576,24 +577,11 @@ export async function importFromContent(
   // is real, unbounded embedding spend). Same bug class as the captured_at /
   // ingested_at fix above; the gate re-derives the markers deterministically
   // on the next import, so dropping them from the hash is safe.
-  const HASH_EPHEMERAL_FRONTMATTER_KEYS = [
-    'captured_at',
-    'ingested_at',
-    QUARANTINE_KEY,
-    CONTENT_FLAG_KEY,
-    EMBED_SKIP_KEY,
-    // v128: the Reference Identifier is IDENTITY, not content. `gbrain rid
-    // backfill` stamps it into every source file on disk; if the key counted
-    // toward the hash, that single stamping pass would change every page's
-    // content_hash and re-chunk + re-embed the entire corpus for a value that
-    // says nothing about what the page says. Same bug class as the captured_at
-    // / assessed_at exclusions above.
-    RID_FRONTMATTER_KEY,
-  ];
-  const stableFrontmatter: Record<string, unknown> = { ...parsed.frontmatter };
-  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) {
-    delete stableFrontmatter[k];
-  }
+  // The key list and the strip both live in src/core/content-hash.ts. They used
+  // to be duplicated here, the copies disagreed, and `putPage`'s fallback hashed
+  // agent-written pages by the divergent one. Import the shared helper rather
+  // than restating it — including `ref_id` (v128), which is stripped there.
+  const stableFrontmatter = stripEphemeralFrontmatter(parsed.frontmatter);
   // Hash includes all meaningful fields for idempotency.
   const hash = createHash('sha256')
     .update(JSON.stringify({

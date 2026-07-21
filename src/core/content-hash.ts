@@ -40,6 +40,7 @@
 import { createHash } from 'crypto';
 import { QUARANTINE_KEY, CONTENT_FLAG_KEY } from './quarantine.ts';
 import { EMBED_SKIP_KEY } from './embed-skip.ts';
+import { RID_FRONTMATTER_KEY } from './rid.ts';
 
 /**
  * Frontmatter keys excluded from the content hash.
@@ -52,6 +53,13 @@ import { EMBED_SKIP_KEY } from './embed-skip.ts';
  * Only the timestamp-bearing keys are stripped, never the whole frontmatter
  * object — a user adding a tag must still change the hash, or tag
  * reconciliation silently no-ops behind the hash-match short-circuit.
+ *
+ * This list is THE list. `importFromContent` imports it rather than holding its
+ * own copy: the two were separate once, disagreed, and the disagreement is what
+ * this module exists to end. v128 nearly recreated it — the Reference Identifier
+ * work added `ref_id` to the import-side copy while this module was being
+ * written, and because the two live in different files git merged them clean.
+ * Keep them in one place so that cannot happen again.
  */
 export const HASH_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [
   'captured_at',
@@ -59,6 +67,18 @@ export const HASH_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [
   QUARANTINE_KEY,
   CONTENT_FLAG_KEY,
   EMBED_SKIP_KEY,
+  // v128: the Reference Identifier is IDENTITY, not content. `gbrain rid
+  // backfill` stamps it into every source file on disk; counting it toward the
+  // hash would change every page's content_hash on that single pass and
+  // re-chunk + re-embed the entire corpus for a value that says nothing about
+  // what the page says. Same bug class as captured_at / ingested_at above.
+  //
+  // It also has to be stripped HERE, not only on the import side: the strip in
+  // importFromContent is hash-only, so `ref_id` persists into stored
+  // frontmatter. If putPage's fallback hashed it while import did not, the two
+  // paths would disagree permanently for every stamped page — the exact defect
+  // this module was written to close.
+  RID_FRONTMATTER_KEY,
 ];
 
 /** Fields that participate in the content hash. */
