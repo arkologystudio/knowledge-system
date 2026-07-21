@@ -26,11 +26,17 @@
  * Writes go through `writeBrainPage`, whose mandatory backup is the contract
  * that replaces git-tree-clean for non-git brain repos. Every file this command
  * touches gets a backup under ~/.gbrain/backups/frontmatter/ first.
+ *
+ * The CONTENT handed to that writer is produced by `stampFrontmatterKey`, which
+ * splices one line into the raw bytes. It is never produced by re-serialising a
+ * parsed page — see src/core/frontmatter-stamp.ts for the 330-file/1475-deletion
+ * incident that rule comes from. A backup only helps an operator who NOTICES the
+ * damage; the surgical write is what makes there be no damage to notice.
  */
 
 import { existsSync, readFileSync } from 'fs';
 import type { BrainEngine } from '../core/engine.ts';
-import { serializeMarkdown, parseMarkdown } from '../core/markdown.ts';
+import { stampFrontmatterKey } from '../core/frontmatter-stamp.ts';
 import {
   writeBrainPage,
   makeFrontmatterBackupRunId,
@@ -95,6 +101,9 @@ interface BackfillResult {
   stamped: number;
   already_stamped: number;
   missing_file: number;
+  /** Source file exists but carries no terminated frontmatter block, so there
+   *  is nothing to stamp into. Skipped, not synthesized — see runBackfill. */
+  no_frontmatter: number;
   errors: Array<{ slug: string; error: string }>;
   dry_run: boolean;
 }
@@ -130,6 +139,7 @@ async function runBackfill(engine: BrainEngine, args: string[]): Promise<void> {
     stamped: 0,
     already_stamped: 0,
     missing_file: 0,
+    no_frontmatter: 0,
     errors: [],
     dry_run: dryRun,
   };
@@ -169,22 +179,36 @@ async function runBackfill(engine: BrainEngine, args: string[]): Promise<void> {
       }
 
       const raw = readFileSync(filePath, 'utf8');
-      const parsed = parseMarkdown(raw);
-      const existingRid = (parsed.frontmatter as Record<string, unknown>)[RID_FRONTMATTER_KEY];
-      if (typeof existingRid === 'string' && existingRid === page.rid) {
+
+      // Surgical: splice ONE `ref_id:` line into the raw bytes. Never parse the
+      // file into a page and re-emit it — that round-trip is what turned a
+      // 330-line stamp into a 1475-line deletion across the real corpus.
+      const outcome = stampFrontmatterKey(raw, RID_FRONTMATTER_KEY, page.rid);
+
+      if (outcome.status === 'already_stamped') {
         result.already_stamped++;
         continue;
       }
-      if (typeof existingRid === 'string' && existingRid.length > 0 && existingRid !== page.rid) {
+      if (outcome.status === 'conflict') {
         // The file claims a DIFFERENT identity than the DB row holds. Never
         // silently overwrite an identifier — that is the one operation a
         // mint-once system must refuse. Surface it and move on.
         result.errors.push({
           slug: page.slug,
           error:
-            `file declares ${RID_FRONTMATTER_KEY} "${existingRid}" but the brain holds ` +
+            `file declares ${RID_FRONTMATTER_KEY} "${outcome.existing}" but the brain holds ` +
             `"${page.rid}". Refusing to overwrite an identifier; reconcile by hand.`,
         });
+        continue;
+      }
+      if (outcome.status === 'no_frontmatter') {
+        // Deliberate SKIP rather than synthesis. A backfill's mandate is to add
+        // the one field it came to add; authoring a frontmatter block for a file
+        // whose author chose not to have one is content creation, and it changes
+        // how the whole document parses. The identifier already lives in the DB,
+        // so nothing is lost — only its on-disk durability is deferred until the
+        // file has a block to stamp. Reported so the operator can see the gap.
+        result.no_frontmatter++;
         continue;
       }
 
@@ -193,14 +217,7 @@ async function runBackfill(engine: BrainEngine, args: string[]): Promise<void> {
         continue;
       }
 
-      const stamped = serializeMarkdown(
-        { ...(parsed.frontmatter as Record<string, unknown>), [RID_FRONTMATTER_KEY]: page.rid },
-        parsed.compiled_truth ?? '',
-        parsed.timeline ?? '',
-        { type: parsed.type, title: parsed.title, tags: parsed.tags },
-      );
-
-      writeBrainPage(filePath, stamped, {
+      writeBrainPage(filePath, outcome.content, {
         sourcePath: localPath,
         backupRunId,
       });
@@ -221,6 +238,7 @@ async function runBackfill(engine: BrainEngine, args: string[]): Promise<void> {
       `  scanned:         ${result.scanned}\n` +
       `  already stamped: ${result.already_stamped}\n` +
       `  no source file:  ${result.missing_file}\n` +
+      `  no frontmatter:  ${result.no_frontmatter}\n` +
       `  errors:          ${result.errors.length}\n`,
     );
     for (const e of result.errors) {
@@ -229,6 +247,8 @@ async function runBackfill(engine: BrainEngine, args: string[]): Promise<void> {
     if (!dryRun && result.stamped > 0) {
       process.stdout.write(
         `\nBackups for this run: ~/.gbrain/backups/frontmatter/${backupRunId}/\n` +
+        `Every file changed by exactly one added "${RID_FRONTMATTER_KEY}:" line — no other byte ` +
+        `is rewritten, so the diff is ${result.stamped} insertion(s) and 0 deletions.\n` +
         `The stamped ${RID_FRONTMATTER_KEY} field does NOT change any page's content hash, ` +
         `so this pass does not trigger a re-embed.\n`,
       );

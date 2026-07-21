@@ -2,6 +2,23 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.5] - 2026-07-21
+
+**`gbrain rid backfill` now adds one line to each of your files and changes nothing else. It used to rewrite every file it touched — reordering frontmatter, normalising your dates, stripping your quoting and comments, and deleting fields it did not recognise.**
+
+### Fixed
+- **`rid backfill` rewrote source files instead of stamping them.** The pass read each file, parsed it into a page, and re-serialised that page back over the original. Parsing is lossy by design — it exists to render a page the engine composed, not to edit a file a person wrote — so everything it does not model was dropped and everything it normalises was normalised on disk. Against a real 356-page corpus the pass reported success while producing 330 files changed, 3634 insertions and 1475 deletions, for 330 wanted lines. It reordered keys, injected a `type` it inferred from the file's path, invented `title: Untitled` where a file declared no title, deleted `slug` and every YAML comment, turned `created: 2026-05-04` into an ISO timestamp, rewrote quoting and list style including the quoting of names inside author lists, converted folded scalars to literal ones — changing the text itself — and materialised empty values into `null`. The command now finds the frontmatter block in the raw bytes and splices in a single `ref_id:` line before the closing delimiter. Key order, quoting, indentation, comments, blank lines, the body, CRLF line endings, a byte-order mark, and the presence or absence of a trailing newline all survive untouched, because they are never re-emitted — they are carried through by string identity.
+- **A file with no frontmatter is skipped and reported, not invented.** Authoring a frontmatter block for a file whose author chose not to have one is content creation, and it changes how the whole document parses. These files are counted under a new `no frontmatter` line in the summary. Their identifiers still live in the brain; only the on-disk copy waits for a block to stamp.
+- **A file whose `ref_id` is already present is left alone byte-for-byte**, whether it was written quoted or bare. A file claiming a different identifier is still refused rather than overwritten, and a malformed `ref_id:` with no value is now refused too — completing it would mean removing a line its author wrote.
+
+### Notes
+- Backups are unchanged: every file written is still copied to `~/.gbrain/backups/frontmatter/<run-id>/` first. That safety net was working during the incident. It is not sufficient on its own, because a backup only helps an operator who notices the damage in time to use it.
+- Hashing is untouched. `ref_id` remains excluded from the content hash, so the pass still does not re-embed the corpus.
+- The defect existed because nothing asserted the shape of the diff. `test/rid-backfill-diff-shape.test.ts` now builds a corpus of deliberately awkward frontmatter, runs the real command over it on a real filesystem, and asserts against actual before-and-after bytes that every added line begins with `ref_id:`, that no line is ever removed, and that deleting the inserted line reconstructs each original file exactly. It fails against the previous implementation.
+
+### To take advantage of v0.43.0.5
+If you deferred `gbrain rid backfill` because of the diff it produced, it is now safe to run. Preview with `gbrain rid backfill --dry-run`, then run it; the result should be one added line per file and no deletions.
+
 ## [0.43.0.4] - 2026-07-21
 
 **Every page now carries a permanent identifier that survives being renamed, moved, or reassigned to a different space — so references between pages stop breaking. Identity used to be the page's path, which meant a rename read as a deletion plus a creation and every inbound link died with it.**
