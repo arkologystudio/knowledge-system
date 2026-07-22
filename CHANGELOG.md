@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.7] - 2026-07-22
+
+**Source Mirror — the Google Drive leg.** Points the mirror at a curated Google Drive folder: Google Docs export natively to markdown, and born-digital binaries (PDF, DOCX, …) are downloaded, text-extracted, and stored as a markdown stub carrying the extracted text plus a link back to the retained Drive original — the binary itself never enters the repository. Images, video, and unknown types get a reference stub. Text extraction reuses the engine's existing extractor registry (the same off-box service the artefact importer uses), so there is no new dependency, and a file whose extractor is unavailable degrades to a stub rather than failing the run. Identity is the stable Drive file id, so renaming a document upstream moves its mirrored page instead of breaking links into it.
+
+To take advantage of v0.43.0.7: the leg registers as source kind `google_drive` and runs via `bun run mirror`; connecting a real Drive needs an rclone remote (a human `rclone config` step) and, for born-digital extraction, the unstructured service. Both are wired at phase promotion.
+
 ## [0.43.0.6] - 2026-07-22
 
 **Foundations for the Source Mirror — the path that pulls an organisation's existing knowledge out of Google Drive, Notion and Obsidian into a git repository of markdown the brain already knows how to index.** This release lands the source-agnostic harness the source legs plug into: a `sources/`-only write allowlist enforced in code (a mirror defect can never reach authored `wiki/` content), a diffable state file keyed on stable identity (so an upstream rename moves a page instead of breaking every link into it), deterministic provenance frontmatter minted through the shipped RID layer, a mass-deletion guard that refuses to commit when an upstream returns a suspiciously empty result, per-leg isolation, and a dry-run-by-default CLI. Seed and sync are one idempotent code path — running twice with no upstream change produces no second commit. No engine, schema, or ingestion-contract change: the mirror writes markdown into git, and the brain indexes it through its existing git sync.

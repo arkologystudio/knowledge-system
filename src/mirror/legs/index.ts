@@ -3,4 +3,4 @@
  * registry. The harness ships with no legs — the Google Drive, Notion, and
  * Obsidian legs land in their own tasks and add their imports here.
  */
-export {};
+import './drive';
