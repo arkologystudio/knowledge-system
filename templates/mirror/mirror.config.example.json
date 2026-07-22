@@ -1,0 +1,16 @@
+{
+  "$comment": "Example Source Mirror config. Copy into the brain repo and edit. The CI runner invokes: bun run mirror run --repo <brain-repo> --config mirror.config.json [--apply]. Credentials are NEVER in this file — Drive reads an rclone remote (human `rclone config`), Notion reads NOTION_TOKEN from the environment (a human-provisioned secret). Obsidian is intentionally absent: it is not an API-fetched leg (see templates/mirror/obsidian-setup.md).",
+  "massDeletionThreshold": 0.5,
+  "legs": [
+    {
+      "kind": "google_drive",
+      "id": "drive",
+      "remote": "gdrive",
+      "folder": "Arkology"
+    },
+    {
+      "kind": "notion",
+      "id": "notion"
+    }
+  ]
+}

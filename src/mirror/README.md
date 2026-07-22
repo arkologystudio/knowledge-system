@@ -6,11 +6,25 @@ Knowledge System then indexes through its existing git sync. No SaaS connector
 lives in the engine; the repository is the canonical corpus and the brain is an
 index over it.
 
-This directory is the **harness** — the source-agnostic spine. The Google Drive,
-Notion, and Obsidian legs plug into it and land in their own tasks.
+This directory is the **harness** — the source-agnostic spine.
 
 Design: `arkology-wiki/projects/habitats/wiki/syntheses/source-mirror-pattern.md`.
 Decisions: `arkology-architecture-and-development-tooling/projects/arkology-habitat/DECISIONS.md` (D-SM-1..4).
+
+## The three legs
+
+| Leg | Mechanism | Kind |
+|---|---|---|
+| **Google Drive** | `rclone` — Google Docs export to markdown; born-digital binaries text-extracted (binary never committed). | `google_drive` (`legs/drive.ts`) |
+| **Notion** | Internal integration — search enumeration + block-API → markdown converter. | `notion` (`legs/notion.ts`) |
+| **Obsidian** | The **Obsidian Git community plugin** pushes a dedicated org vault into `sources/obsidian/`. No fetch code — configuration only. | *(none)* — see `templates/mirror/obsidian-setup.md` |
+
+Two of the three legs are configuration rather than software. Only Notion needs
+real conversion code. Obsidian has **no `MirrorSource`**: the vault is authored
+markdown the brain already ingests via git-sync, and identity/provenance ride the
+engine's shipped `gbrain rid` surgical stamp — the mirror never rewrites authored
+files. See `templates/mirror/obsidian-setup.md` and the example runner config at
+`templates/mirror/mirror.config.example.json`.
 
 ## Load-bearing invariants
 

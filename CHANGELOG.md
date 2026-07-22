@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.9] - 2026-07-22
+
+**Source Mirror — the Obsidian leg (configuration).** An Obsidian vault is already a folder of markdown, so the right mechanism is the Obsidian Git community plugin, which pushes a dedicated organisational vault into the mirror's `sources/obsidian/` on an interval — the author keeps working exactly as before, and an edit reaches the brain within one sync. There is deliberately no fetch code and no `obsidian` source kind: the vault is authored content the brain already ingests via git, and note identity is stamped in place by the existing surgical `ref_id` pass, so authored files are never rewritten. Ships with an operator setup guide, an example runner config, and a registry smoke test.
+
+To take advantage of v0.43.0.9: see `templates/mirror/obsidian-setup.md`. Connecting a vault is a one-time, shell-free plugin setup done at phase promotion.
+
 ## [0.43.0.8] - 2026-07-22
 
 **Source Mirror — the Notion leg.** Points the mirror at a Notion workspace: an internal integration enumerates the pages it has been shared, and each is fetched through the block API and converted to markdown — headings, lists, to-dos, quotes, callouts, code, nested blocks, links, and inline styling all carried across. Least privilege is inherent: only pages explicitly shared with the integration are ever seen, so nothing leaks in by accident. Identity is the stable Notion page id, so renaming a page upstream moves its mirrored copy rather than breaking links into it. This is the only leg that needs real conversion code — the official markdown export is limited to public integrations, so the internal integration walks the blocks itself.
