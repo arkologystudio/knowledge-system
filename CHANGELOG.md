@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.11] - 2026-07-22
+
+**Source Mirror — onboarding for a non-technical operator.** A single browser-only setup guide that connects Google Drive, Notion, and an Obsidian vault to a brain in about 30 minutes, written for someone who has never opened a terminal. It walks through creating the brain repo, the rclone browser sign-in for Drive, the Notion integration and per-page sharing (which doubles as the privacy control), the Obsidian plugin, turning on the scheduled workflow, and pointing the brain at the repo — and it names exactly which credentials the operator creates, with the standing rule that no assistant ever mints or pastes a token on their behalf. Completes the Source Mirror phase.
+
+To take advantage of v0.43.0.11: read `docs/guides/source-mirror-onboarding.md`.
+
 ## [0.43.0.10] - 2026-07-22
 
 **Source Mirror — the scheduled runner.** The mirror runs as a scheduled GitHub Actions job on the brain (corpus) repository, not as a daemon on the organisation's own machine — so extraction and every credential only ever touch an ephemeral runner, and the organisation's server keeps running exactly one service. It syncs every four hours (inside the free-tier compute allowance) plus on-demand, reads all credentials from Actions secrets rather than files placed over SSH, and pushes the mirrored markdown — which triggers the brain's existing reindex so a refresh lands within one sync interval. Per-leg isolation holds end to end: one source failing still pushes the others and surfaces the failure as a job notification. Shipped as a template the brain repo adopts, with a structural test pinning every one of those properties.
