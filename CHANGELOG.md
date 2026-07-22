@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.10] - 2026-07-22
+
+**Source Mirror — the scheduled runner.** The mirror runs as a scheduled GitHub Actions job on the brain (corpus) repository, not as a daemon on the organisation's own machine — so extraction and every credential only ever touch an ephemeral runner, and the organisation's server keeps running exactly one service. It syncs every four hours (inside the free-tier compute allowance) plus on-demand, reads all credentials from Actions secrets rather than files placed over SSH, and pushes the mirrored markdown — which triggers the brain's existing reindex so a refresh lands within one sync interval. Per-leg isolation holds end to end: one source failing still pushes the others and surfaces the failure as a job notification. Shipped as a template the brain repo adopts, with a structural test pinning every one of those properties.
+
+To take advantage of v0.43.0.10: copy `templates/mirror/mirror.yml` into the brain repo's `.github/workflows/`, provision the four secrets (a human step), and SHA-pin the actions. Wired at phase promotion.
+
 ## [0.43.0.9] - 2026-07-22
 
 **Source Mirror — the Obsidian leg (configuration).** An Obsidian vault is already a folder of markdown, so the right mechanism is the Obsidian Git community plugin, which pushes a dedicated organisational vault into the mirror's `sources/obsidian/` on an interval — the author keeps working exactly as before, and an edit reaches the brain within one sync. There is deliberately no fetch code and no `obsidian` source kind: the vault is authored content the brain already ingests via git, and note identity is stamped in place by the existing surgical `ref_id` pass, so authored files are never rewritten. Ships with an operator setup guide, an example runner config, and a registry smoke test.
