@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.6] - 2026-07-22
+
+**Foundations for the Source Mirror — the path that pulls an organisation's existing knowledge out of Google Drive, Notion and Obsidian into a git repository of markdown the brain already knows how to index.** This release lands the source-agnostic harness the source legs plug into: a `sources/`-only write allowlist enforced in code (a mirror defect can never reach authored `wiki/` content), a diffable state file keyed on stable identity (so an upstream rename moves a page instead of breaking every link into it), deterministic provenance frontmatter minted through the shipped RID layer, a mass-deletion guard that refuses to commit when an upstream returns a suspiciously empty result, per-leg isolation, and a dry-run-by-default CLI. Seed and sync are one idempotent code path — running twice with no upstream change produces no second commit. No engine, schema, or ingestion-contract change: the mirror writes markdown into git, and the brain indexes it through its existing git sync.
+
+To take advantage of v0.43.0.6: nothing to do yet — the Google Drive, Notion and Obsidian legs that feed the harness land in follow-up releases. The harness ships behind the new `bun run mirror` entry point and is exercised end-to-end by its own test suite.
+
 ## [0.43.0.5] - 2026-07-21
 
 **`gbrain rid backfill` now adds one line to each of your files and changes nothing else. It used to rewrite every file it touched — reordering frontmatter, normalising your dates, stripping your quoting and comments, and deleting fields it did not recognise.**
