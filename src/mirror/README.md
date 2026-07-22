@@ -69,3 +69,15 @@ bun run mirror run --repo /path/to/brain-repo --config mirror.config.json --appl
 The config lists the legs to run; each is built from the registry by its `kind`.
 With no legs registered this is a well-behaved no-op — the harness is exercised by
 `test/mirror-*.test.ts` against an in-memory fake leg.
+
+## Scheduled runner
+
+In production the mirror runs as a **scheduled GitHub Actions job on the brain
+(corpus) repository**, not as a daemon on the organisation's own server — so
+extraction and credentials only ever touch an ephemeral runner. Copy
+`templates/mirror/mirror.yml` into the brain repo's `.github/workflows/`. It runs
+4-hourly (inside the free-tier allowance) plus manual dispatch, reads every
+credential from Actions secrets (never inline), pushes successful legs even when a
+leg failed (per-leg isolation end-to-end), and fails the job — GitHub's built-in
+notification — when any leg errors. The push triggers the brain's existing reindex
+webhook, so a refresh reaches the brain within one sync interval.
