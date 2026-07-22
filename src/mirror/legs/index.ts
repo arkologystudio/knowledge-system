@@ -4,3 +4,4 @@
  * Obsidian legs land in their own tasks and add their imports here.
  */
 import './drive';
+import './notion';

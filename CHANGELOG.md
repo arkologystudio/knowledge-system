@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.8] - 2026-07-22
+
+**Source Mirror — the Notion leg.** Points the mirror at a Notion workspace: an internal integration enumerates the pages it has been shared, and each is fetched through the block API and converted to markdown — headings, lists, to-dos, quotes, callouts, code, nested blocks, links, and inline styling all carried across. Least privilege is inherent: only pages explicitly shared with the integration are ever seen, so nothing leaks in by accident. Identity is the stable Notion page id, so renaming a page upstream moves its mirrored copy rather than breaking links into it. This is the only leg that needs real conversion code — the official markdown export is limited to public integrations, so the internal integration walks the blocks itself.
+
+To take advantage of v0.43.0.8: the leg registers as source kind `notion` and runs via `bun run mirror`; connecting a workspace needs an internal-integration token (a human step — create the integration, share the pages, set the secret) which is wired at phase promotion.
+
 ## [0.43.0.7] - 2026-07-22
 
 **Source Mirror — the Google Drive leg.** Points the mirror at a curated Google Drive folder: Google Docs export natively to markdown, and born-digital binaries (PDF, DOCX, …) are downloaded, text-extracted, and stored as a markdown stub carrying the extracted text plus a link back to the retained Drive original — the binary itself never enters the repository. Images, video, and unknown types get a reference stub. Text extraction reuses the engine's existing extractor registry (the same off-box service the artefact importer uses), so there is no new dependency, and a file whose extractor is unavailable degrades to a stub rather than failing the run. Identity is the stable Drive file id, so renaming a document upstream moves its mirrored page instead of breaking links into it.
