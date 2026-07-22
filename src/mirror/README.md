@@ -8,6 +8,9 @@ index over it.
 
 This directory is the **harness** — the source-agnostic spine.
 
+**Setting it up?** Non-technical operator guide (no terminal, ~30 min):
+[`docs/guides/source-mirror-onboarding.md`](../../docs/guides/source-mirror-onboarding.md).
+
 Design: `arkology-wiki/projects/habitats/wiki/syntheses/source-mirror-pattern.md`.
 Decisions: `arkology-architecture-and-development-tooling/projects/arkology-habitat/DECISIONS.md` (D-SM-1..4).
 
