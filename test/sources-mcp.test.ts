@@ -47,6 +47,13 @@ if [ "$has_remote_get_url" = "1" ]; then
   echo "https://github.com/example/repo"
   exit 0
 fi
+# Bare \`git remote\` lists remote NAMES. readOriginUrl calls this first to tell
+# "no origin" apart from "git is broken"; without it every clone reads as having
+# no origin at all.
+if [ "\${@: -1}" = "remote" ]; then
+  echo "origin"
+  exit 0
+fi
 exit 0
 `;
   const path = join(FAKE_GIT_DIR, 'git');

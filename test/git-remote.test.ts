@@ -11,6 +11,7 @@ import {
   pullRepo,
   GitOperationError,
   validateRepoState,
+  readOriginUrl,
 } from '../src/core/git-remote.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -34,12 +35,34 @@ function writeFakeGit(): void {
 # Fake git for git-remote.test.ts
 { printf '['; for arg in "$@"; do printf '%s,' "$(printf '%s' "$arg" | jq -Rs .)"; done; printf 'null]\\n'; } >> "${FAKE_GIT_LOG}"
 mode=$(cat "${FAKE_GIT_MODE}" 2>/dev/null || echo ok)
-case "$mode" in
-  fail) exit 1 ;;
-  url-drift) echo "https://github.com/different/url" ;;
-  url-match) echo "https://github.com/expected/url" ;;
-  *) ;;
-esac
+if [ "$mode" = "fail" ]; then exit 1; fi
+
+# readOriginUrl issues TWO distinct calls and they must answer differently:
+#   \`git remote\`                  -> newline-separated remote NAMES (exit 0 even if none)
+#   \`git remote get-url origin\`   -> the URL
+# The bare-list call is what separates "repo has no origin" from "git is broken",
+# so the fake has to be subcommand-aware or every remote-less repo reads as
+# corrupted.
+is_get_url=0
+for a in "$@"; do [ "$a" = "get-url" ] && is_get_url=1; done
+last=\${@: -1}
+
+if [ "$is_get_url" = "0" ] && [ "$last" = "remote" ]; then
+  case "$mode" in
+    no-origin) ;;            # repo genuinely has no origin
+    *) echo "origin" ;;
+  esac
+  exit 0
+fi
+
+if [ "$is_get_url" = "1" ]; then
+  case "$mode" in
+    url-drift) echo "https://github.com/different/url" ;;
+    url-match) echo "https://github.com/expected/url" ;;
+    *) ;;
+  esac
+  exit 0
+fi
 exit 0
 `;
   const path = join(FAKE_GIT_DIR, 'git');
@@ -62,7 +85,7 @@ function clearArgvLog(): void {
   writeFileSync(FAKE_GIT_LOG, '');
 }
 
-function setMode(mode: 'ok' | 'fail' | 'url-drift' | 'url-match'): void {
+function setMode(mode: 'ok' | 'fail' | 'url-drift' | 'url-match' | 'no-origin'): void {
   writeFileSync(FAKE_GIT_MODE, mode);
 }
 
@@ -413,6 +436,88 @@ describe('validateRepoState', () => {
     setMode('ok');
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p)).toBe('healthy');
+    });
+  });
+
+  // ── null-expectation: config records NO remote ────────────────────────────
+  // The regression this suite missed. `undefined` and `null` used to collapse
+  // to the same "no expectation" branch, so a source gbrain could never pull
+  // reported 'healthy' — indistinguishable from a genuinely healthy clone.
+
+  test("returns 'unmanaged-remote' when config expects none but clone has an origin", async () => {
+    const p = join(fixtureDir, 'unmanaged-repo');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('url-match');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(validateRepoState(p, null)).toBe('unmanaged-remote');
+    });
+  });
+
+  test("returns 'healthy' when config expects none and clone has no origin", async () => {
+    const p = join(fixtureDir, 'genuinely-local');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('no-origin');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(validateRepoState(p, null)).toBe('healthy');
+    });
+  });
+
+  test('null and undefined are NOT interchangeable (the actual defect)', async () => {
+    const p = join(fixtureDir, 'null-vs-undefined');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('url-match');
+    await withEnv({ PATH: fakePath() }, async () => {
+      // undefined = "caller has no expectation" — unchanged legacy behavior.
+      expect(validateRepoState(p, undefined)).toBe('healthy');
+      // null = "config says there is no remote" — a clone with one disagrees.
+      expect(validateRepoState(p, null)).toBe('unmanaged-remote');
+    });
+  });
+
+  test("a repo with no origin is no longer misreported as 'corrupted'", async () => {
+    const p = join(fixtureDir, 'no-origin-unexpecting');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('no-origin');
+    await withEnv({ PATH: fakePath() }, async () => {
+      // Pre-fix, `git remote get-url origin` exiting non-zero was the ONLY
+      // signal, so "no origin" and "git is broken" both read as corrupted.
+      expect(validateRepoState(p)).toBe('healthy');
+    });
+  });
+});
+
+describe('readOriginUrl', () => {
+  const fixtureDir = join(FAKE_GIT_DIR, 'origin-url-fixtures');
+
+  beforeEach(() => {
+    rmSync(fixtureDir, { recursive: true, force: true });
+    mkdirSync(fixtureDir, { recursive: true });
+  });
+
+  test('returns the origin URL when one is configured', async () => {
+    const p = join(fixtureDir, 'has-origin');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('url-match');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(readOriginUrl(p)).toBe('https://github.com/expected/url');
+    });
+  });
+
+  test('returns null when the repo has no origin remote', async () => {
+    const p = join(fixtureDir, 'no-origin');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('no-origin');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(readOriginUrl(p)).toBeNull();
+    });
+  });
+
+  test('throws when git itself fails (distinct from "no origin")', async () => {
+    const p = join(fixtureDir, 'broken');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('fail');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(() => readOriginUrl(p)).toThrow();
     });
   });
 });

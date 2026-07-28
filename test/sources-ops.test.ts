@@ -21,6 +21,7 @@ import {
   listSources,
   removeSource,
   getSourceStatus,
+  setSourceRemoteUrl,
   recloneIfMissing,
   isPathContained,
   isOwnedClone,
@@ -79,6 +80,13 @@ if [ "$has_clone" = "1" ]; then
 fi
 if [ "$has_remote_get_url" = "1" ]; then
   echo "https://github.com/example/repo"
+  exit 0
+fi
+# Bare \`git remote\` lists remote NAMES. readOriginUrl calls this first to tell
+# "no origin" apart from "git is broken". NO_ORIGIN=1 simulates a clone with no
+# origin configured.
+if [ "\${@: -1}" = "remote" ]; then
+  if [ "\${NO_ORIGIN:-}" != "1" ]; then echo "origin"; fi
   exit 0
 fi
 exit 0
@@ -464,6 +472,151 @@ describe('getSourceStatus', () => {
     await withEnv2(async () => {
       try {
         await getSourceStatus(engine, 'never-existed');
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(e).toBeInstanceOf(SourceOpError);
+        expect((e as SourceOpError).code).toBe('not_found');
+      }
+    });
+  });
+
+  // ── the misleading-healthy regression ─────────────────────────────────────
+  // A source registered by --path whose clone nonetheless tracks an origin.
+  // gbrain's sync will never pull it (no config.remote_url), yet this reported
+  // clone_state 'healthy' — so a brain frozen against a stale snapshot looked
+  // identical to a live one on every diagnostic surface.
+
+  test('clone_state = "unmanaged-remote" when config has no remote_url but the clone has an origin', async () => {
+    await withEnv2(async () => {
+      const userPath = join(GBRAIN_HOME, 'unmanaged-fixture');
+      mkdirSync(join(userPath, '.git'), { recursive: true });
+      await addSource(engine, { id: 'status-unmanaged', localPath: userPath });
+      const s = await getSourceStatus(engine, 'status-unmanaged');
+      expect(s.remote_url).toBeNull();
+      expect(s.clone_state).toBe('unmanaged-remote');
+      // The fact that was missing entirely: what the clone actually tracks.
+      expect(s.clone_remote_url).toBe('https://github.com/example/repo');
+      rmSync(userPath, { recursive: true, force: true });
+    });
+  });
+
+  test('clone_state stays "healthy" for a genuinely local repo with no origin', async () => {
+    await withEnv2(async () => {
+      const userPath = join(GBRAIN_HOME, 'local-only-fixture');
+      mkdirSync(join(userPath, '.git'), { recursive: true });
+      await addSource(engine, { id: 'status-local-only', localPath: userPath });
+      await withEnv({ NO_ORIGIN: '1' }, async () => {
+        const s = await getSourceStatus(engine, 'status-local-only');
+        expect(s.clone_state).toBe('healthy');
+        expect(s.clone_remote_url).toBeNull();
+      });
+      rmSync(userPath, { recursive: true, force: true });
+    });
+  });
+
+  test('clone_remote_url is reported alongside remote_url for a managed clone', async () => {
+    await withEnv2(async () => {
+      await addSource(engine, {
+        id: 'status-both-urls',
+        remoteUrl: 'https://github.com/example/repo',
+      });
+      const s = await getSourceStatus(engine, 'status-both-urls');
+      expect(s.remote_url).toBe('https://github.com/example/repo');
+      expect(s.clone_remote_url).toBe('https://github.com/example/repo');
+      expect(s.clone_state).toBe('healthy');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setSourceRemoteUrl — the non-destructive repair path
+// ---------------------------------------------------------------------------
+
+describe('setSourceRemoteUrl', () => {
+  test('records remote_url on a path-registered source without touching content', async () => {
+    await withEnv2(async () => {
+      const userPath = join(GBRAIN_HOME, 'seturl-fixture');
+      mkdirSync(join(userPath, '.git'), { recursive: true });
+      await addSource(engine, { id: 'seturl-basic', localPath: userPath });
+
+      const before = await getSourceStatus(engine, 'seturl-basic');
+      expect(before.remote_url).toBeNull();
+      expect(before.clone_state).toBe('unmanaged-remote');
+
+      const res = await setSourceRemoteUrl(
+        engine, 'seturl-basic', 'https://github.com/example/repo',
+      );
+      expect(res.previous_remote_url).toBeNull();
+      expect(res.remote_url).toBe('https://github.com/example/repo');
+      expect(res.matches_clone).toBe(true);
+
+      const after = await getSourceStatus(engine, 'seturl-basic');
+      expect(after.remote_url).toBe('https://github.com/example/repo');
+      expect(after.clone_state).toBe('healthy');
+      // Non-destructive: the sync bookmark and page count are untouched, so no
+      // re-index is triggered and no page RID can be invalidated.
+      expect(after.last_commit).toBe(before.last_commit);
+      expect(after.page_count).toBe(before.page_count);
+      rmSync(userPath, { recursive: true, force: true });
+    });
+  });
+
+  test('refuses a URL that does not match the clone origin (would brick sync)', async () => {
+    await withEnv2(async () => {
+      const userPath = join(GBRAIN_HOME, 'seturl-mismatch');
+      mkdirSync(join(userPath, '.git'), { recursive: true });
+      await addSource(engine, { id: 'seturl-mismatch', localPath: userPath });
+      try {
+        await setSourceRemoteUrl(engine, 'seturl-mismatch', 'https://github.com/other/repo');
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(e).toBeInstanceOf(SourceOpError);
+        expect((e as SourceOpError).code).toBe('clone_url_mismatch');
+      }
+      // Config untouched by the refusal.
+      const s = await getSourceStatus(engine, 'seturl-mismatch');
+      expect(s.remote_url).toBeNull();
+      rmSync(userPath, { recursive: true, force: true });
+    });
+  });
+
+  test('--force records a mismatching URL and lands the source in url-drift', async () => {
+    await withEnv2(async () => {
+      const userPath = join(GBRAIN_HOME, 'seturl-force');
+      mkdirSync(join(userPath, '.git'), { recursive: true });
+      await addSource(engine, { id: 'seturl-force', localPath: userPath });
+      const res = await setSourceRemoteUrl(
+        engine, 'seturl-force', 'https://github.com/other/repo', { allowMismatch: true },
+      );
+      expect(res.matches_clone).toBe(false);
+      const s = await getSourceStatus(engine, 'seturl-force');
+      expect(s.clone_state).toBe('url-drift');
+      rmSync(userPath, { recursive: true, force: true });
+    });
+  });
+
+  test('rejects a non-HTTPS remote through the SSRF gate', async () => {
+    await withEnv2(async () => {
+      const userPath = join(GBRAIN_HOME, 'seturl-ssh');
+      mkdirSync(join(userPath, '.git'), { recursive: true });
+      await addSource(engine, { id: 'seturl-ssh', localPath: userPath });
+      try {
+        // An SSH host alias — exactly the shape a deploy-key clone uses. It
+        // cannot be recorded, so such a source stays 'unmanaged-remote'.
+        await setSourceRemoteUrl(engine, 'seturl-ssh', 'wiki-gh:acme-example/wiki.git');
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(e).toBeInstanceOf(SourceOpError);
+        expect((e as SourceOpError).code).toBe('invalid_remote_url');
+      }
+      rmSync(userPath, { recursive: true, force: true });
+    });
+  });
+
+  test('throws not_found for unknown id', async () => {
+    await withEnv2(async () => {
+      try {
+        await setSourceRemoteUrl(engine, 'never-existed', 'https://github.com/example/repo');
         throw new Error('expected throw');
       } catch (e) {
         expect(e).toBeInstanceOf(SourceOpError);
