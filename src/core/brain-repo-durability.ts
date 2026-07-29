@@ -36,6 +36,7 @@ import {
   GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
   type PullOutcome, type PushProbeResult,
 } from './git-remote.ts';
+import { acquireRepoLock } from './repo-lock.ts';
 import { findResolverFile, RESOLVER_FILENAMES } from './resolver-filenames.ts';
 import { redactSecretsInText } from './minions/handlers/shell-redact.ts';
 // Static import → bundled into the --compile binary so the taxonomy never drifts
@@ -622,9 +623,17 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
   if (currentBranch(repoPath) === 'HEAD') {
     push('pull', { status: 'needs_attention', detail: 'detached HEAD — checkout a branch before hardening' });
   } else {
-    // 1. pull current state
-    try { push('pull', pullDetail(divergenceSafePull(repoPath, branch))); }
-    catch (e) { push('pull', { status: 'needs_attention', detail: `fetch/pull failed: ${(e as Error).message.slice(0, 140)}` }); }
+    // 1. pull current state — under the repo lock, so this cannot interleave
+    // FETCH_HEAD with the sync loop's pull (which breaks `pull --ff-only` with
+    // "Cannot fast-forward to multiple branches").
+    const pullLock = await acquireRepoLock(repoPath, { timeoutMs: 60_000 });
+    if (!pullLock) {
+      push('pull', { status: 'needs_attention', detail: 'another gbrain process is operating this checkout — skipped pull' });
+    } else {
+      try { push('pull', pullDetail(divergenceSafePull(repoPath, branch))); }
+      catch (e) { push('pull', { status: 'needs_attention', detail: `fetch/pull failed: ${(e as Error).message.slice(0, 140)}` }); }
+      finally { pullLock.release(); }
+    }
   }
 
   // 2. credential
