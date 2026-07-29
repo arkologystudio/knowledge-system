@@ -1,0 +1,16 @@
+[Unit]
+Description=Arkology Knowledge System - wiki sync (git pull + reindex, 5-min backstop)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gbrain/gbrain.env
+Environment=PATH=/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/.bun/bin/gbrain sync --watch --interval 300 --source default --repo /srv/brain-repos/arkology
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

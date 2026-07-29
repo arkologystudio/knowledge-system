@@ -1,0 +1,8 @@
+[Unit]
+Description=Arkology Knowledge System - alarm when wiki sync stops pulling
+Documentation=https://github.com/arkologystudio/knowledge-system/blob/master/ops/kb-vps/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gbrain-pull-watch
+User=root
