@@ -1,0 +1,20 @@
+[Unit]
+Description=Arkology Knowledge System - HTTP MCP/OAuth server
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/knowledge-system
+Environment=PATH=/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/gbrain/gbrain.env
+EnvironmentFile=/etc/gbrain/http.env
+EnvironmentFile=-/etc/gbrain/governance.env
+ExecStart=/usr/local/bin/gbrain serve --http --port 3131 --bind 172.18.0.1 --public-url https://kb.arkology.studio --suppress-bootstrap-token
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
