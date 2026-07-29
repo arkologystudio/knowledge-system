@@ -16,7 +16,7 @@ have survived a rebuild.
 | `gbrain-pull-watch.sh` | Guard: alarms when the wiki sync stops reaching the remote |
 | `systemd/gbrain-pull-watch.{service,timer}` | Runs the guard every 15 minutes |
 | `systemd/knowledge-system-sync.service` | The 5-minute wiki sync (`gbrain sync --watch`) |
-| `systemd/knowledge-system-http.service` | HTTP MCP / OAuth server on :3131 |
+| `knowledge-system-http.service` | HTTP MCP / OAuth server on :3131 (top level, not `systemd/` — tracked there first by the KS-E governance work, with a comment block explaining its non-obvious bind address; referenced by `docs/deploy/KS-E-governance-retrieval.md`) |
 | `systemd/knowledge-system-dream.{service,timer}` | Nightly 02:30 maintenance cycle |
 | `install.sh` | Idempotent installer |
 
