@@ -108,14 +108,32 @@ chosen to replace it. It is now disabled, and `install.sh` warns if it returns.
   newlines, so git's stderr landed as a *separate* journal entry from the
   "Warning: git pull failed" line — easy to miss when grepping for the warning.
 
-### Known gap (not yet fixed)
+### Structural fix (v0.43.0.13)
 
-`sync.ts` does not take the `gbrain-commit-page.lock` file lock that
-`src/core/git-page-write.ts` uses for MCP page writes. Nothing currently
-serialises sync's `git pull` against another process operating on the same
-clone. Disabling the autopilot removed today's second actor, but the underlying
-race is still reachable if a second git actor is ever introduced. The durable fix
-is for sync to take the same cross-process lock.
+Every gbrain git operation on a source clone now takes one cross-process lock
+(`src/core/repo-lock.ts`, file `.git/gbrain-commit-page.lock` — the name is kept
+so an older build still interlocks with a newer one). Four actors take it: the
+sync pull, the sync cost-estimator's fetch, MCP page writes, and the durability
+pull/harden paths.
+
+Behaviour when the lock is contended differs by caller, deliberately:
+
+- **sync pull** waits up to 60s, and if it still cannot get it, SKIPS the pull
+  and emits a `pull_failed` warning. Skipping silently would be the very
+  stale-brain shape this whole effort exists to prevent.
+- **cost-estimator fetch** never waits — it is a preview that already falls back
+  to local HEAD, so blocking it behind a real pull would be worse than a
+  slightly stale estimate.
+- **page writes** wait up to 30s, then fail loudly.
+
+The lock also reclaims a stale holder: if the recorded pid is gone, or the entry
+is older than 15 minutes, it is taken over. The original page-write lock had no
+staleness handling at all, so one crashed `commit_page` would have blocked the
+checkout forever — a latent bug that got much worse once sync depended on the
+same lock.
+
+This only excludes *gbrain* processes. A human running `git pull` in the
+checkout is not serialised by it.
 
 ## Source `default` is permanently `unmanaged-remote`
 
