@@ -221,6 +221,28 @@ export interface SyncResult {
    * everything," the exact misdiagnosis in the #1794 recurrence report.
    */
   bankedFiles?: number;
+  /**
+   * Non-fatal conditions that make an otherwise-green result untrustworthy.
+   *
+   * The motivating incident: `git pull` failed on every run for three weeks.
+   * Each failure warned to stderr and continued (the R2 warn-and-continue
+   * invariant), sync then read HEAD from the un-updated clone, found it equal
+   * to `last_commit`, and returned `up_to_date`. `get_health` agreed — 0 stale
+   * pages, 100% embed coverage — because the brain WAS perfectly consistent
+   * with a snapshot that had stopped advancing. Nothing in the result
+   * distinguished "nothing changed upstream" from "we never reached upstream".
+   *
+   * These are advisory only: they never change control flow or exit codes, so
+   * the warn-and-continue invariant holds. They exist so a caller — a cron
+   * wrapper, a dashboard, `--json` — can tell a real no-op from a blind one.
+   */
+  warnings?: SyncWarning[];
+}
+
+export interface SyncWarning {
+  /** Machine-stable discriminator. Additive only. */
+  code: 'pull_failed' | 'noop_without_remote_contact';
+  message: string;
 }
 
 /**
@@ -1616,6 +1638,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     });
   }
 
+  // Did this run actually reach the remote? Distinguishes "nothing changed
+  // upstream" from "we never got to look" when both land on `up_to_date`.
+  const syncWarnings: SyncWarning[] = [];
+  let remoteContacted = false;
+
   if (!opts.noPull && !detachedHead && originRemotePresent) {
     const _t0 = Date.now();
     serr(`[gbrain phase] sync.git_pull start`);
@@ -1628,6 +1655,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // timeout (ETIMEDOUT / SIGTERM on err.cause) from ordinary pull
       // failure.
       pullRepo(repoPath);
+      remoteContacted = true;
       serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1657,13 +1685,65 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           reason: 'pull_timeout',
         });
       }
+      // Do NOT truncate to ~100 chars. execFileSync puts "Command failed: <the
+      // full git invocation>" at the FRONT of .message and git's own stderr —
+      // the only part that says WHY — at the back. A 100-char slice therefore
+      // logged the command and dropped the reason, every single time. Three
+      // weeks of 5-minutely failures produced 8,000+ log lines that all read
+      // "Command failed: git -C /srv/… -c ht" and not one recorded the cause,
+      // so the root cause was unrecoverable from the journal after the fact.
+      // 2000 chars covers git's stderr with room to spare.
+      const detail = msg.length > 2000 ? `${msg.slice(0, 2000)}… (truncated)` : msg;
       if (msg.includes('non-fast-forward') || msg.includes('diverged')) {
-        serr(`Warning: git pull failed (remote diverged). Syncing from local state.`);
+        serr(`Warning: git pull failed (remote diverged). Syncing from local state.\n${detail}`);
       } else {
-        serr(`Warning: git pull failed: ${msg.slice(0, 100)}`);
+        serr(`Warning: git pull failed: ${detail}`);
       }
+      serr(
+        `Warning: this sync ran against the LOCAL clone only — its result reflects ` +
+        `on-disk state, not upstream. A clean "up_to_date" here does NOT mean the ` +
+        `brain matches the remote.`,
+      );
+      syncWarnings.push({
+        code: 'pull_failed',
+        message:
+          `git pull failed; synced from local clone state only. ` +
+          `Results do not reflect upstream. ${detail}`,
+      });
     }
   }
+
+  /**
+   * Warnings to attach to a NO-OP result (`up_to_date`, fromCommit === toCommit).
+   *
+   * A no-op is only trustworthy if we actually reached the remote this run. If
+   * the repo tracks an origin but we never contacted it — pull failed, --no-pull,
+   * detached HEAD — then "nothing changed" is a statement about the local clone
+   * and nothing more. That is precisely the shape the three-week stall took, and
+   * it read as success on every surface that consumed it.
+   *
+   * A repo with NO origin at all is genuinely local-only; a no-op there is honest
+   * and gets no warning.
+   */
+  const noopWarnings = (): SyncWarning[] => {
+    if (remoteContacted) return syncWarnings;
+    if (!hasOriginRemote(repoPath)) return syncWarnings;
+    const why = opts.noPull
+      ? '--no-pull was set'
+      : detachedHead
+        ? 'the clone is on a detached HEAD'
+        : 'git pull did not succeed';
+    return [
+      ...syncWarnings,
+      {
+        code: 'noop_without_remote_contact',
+        message:
+          `Reported no changes without contacting the remote (${why}). This says the ` +
+          `brain matches the LOCAL clone — it does not confirm the clone matches ` +
+          `upstream, so a genuinely stale snapshot looks identical to a healthy one.`,
+      },
+    ];
+  };
 
   // Get current HEAD
   let headCommit: string;
@@ -1786,6 +1866,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       detachedWorkingTreeManifest.renamed.length > 0);
 
   if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasDetachedWorkingTreeChanges) {
+    // THE no-op short-circuit — the exact line the three-week stall returned
+    // from on every run. HEAD comes from a clone the failed pull never
+    // advanced, so it trivially equals last_commit. `warnings` is what makes
+    // that distinguishable from a real no-op.
+    const warnings = noopWarnings();
+    for (const w of warnings) serr(`Warning: [${w.code}] ${w.message}`);
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,
@@ -1794,6 +1880,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       chunksCreated: 0,
       embedded: 0,
       pagesAffected: [],
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
   }
 
@@ -1931,10 +2018,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     await writeChunkerVersion(engine, opts.sourceId, String(CHUNKER_VERSION));
     await clearOpCheckpoint(engine, ckpt.paths);
     await clearOpCheckpoint(engine, ckpt.target);
+    const noChangeWarnings = noopWarnings();
+    for (const w of noChangeWarnings) serr(`Warning: [${w.code}] ${w.message}`);
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,
       toCommit: pin,
+      ...(noChangeWarnings.length > 0 ? { warnings: noChangeWarnings } : {}),
       added: 0, modified: 0, deleted: 0, renamed: 0,
       chunksCreated: 0,
       embedded: 0,

@@ -1,5 +1,27 @@
 # TODOS
 
+## Pre-existing test failures (filed v0.43.0.12, PR: source clone-state drift)
+
+Surfaced by the /ship gate on `fix/source-remote-url-drift-detection` and proven
+pre-existing against a clean `origin/staging` worktree (both fail with none of that
+branch's changes applied). Filed rather than fixed inline to keep that PR scoped.
+
+- [ ] **P0 — `gbrain mirror` reports success when it fails.** `src/mirror/cli.ts:68`
+  and `:74` assign `process.exitCode` directly. `currentExitCode()` reads only
+  gbrain's owned verdict (the PGLite-Emscripten-pollution defense), so the
+  deliberate flush-exit ZEROES a raw write — `gbrain mirror` exits 0 on a failed
+  report, and any CI or cron wrapping it reads green. Route both writes through
+  `setCliExitVerdict`. Landed in PR #28 (v0.43.0.6, Source Mirror harness); pinned
+  by `test/cli-exit-verdict-pin.test.ts`, which is currently red on staging.
+  Where: `src/mirror/cli.ts`.
+- [ ] **P0 — `worker-registry.serial.test.ts` round trip returns 0 workers.**
+  `registerWorker writes under gbrainPath; readWorkers returns the live worker`
+  expects 1, receives 0 (`test/worker-registry.serial.test.ts:60`). Fails standalone
+  and in-shard, so it is not serial-ordering flake. Root cause unknown — needs a
+  look at whether `registerWorker` writes to a different `gbrainPath` than
+  `readWorkers` reads. Where: `src/core/worker-registry.ts`,
+  `test/worker-registry.serial.test.ts`.
+
 ## Life Chronicle follow-ups (filed v0.42.56.0, #2390)
 
 Deferred from the Life Chronicle wave (CEO Scope-Expansion + eng review CLEARED,

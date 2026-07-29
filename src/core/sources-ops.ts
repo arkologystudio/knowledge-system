@@ -45,6 +45,7 @@ import {
   parseRemoteUrl,
   cloneRepo,
   validateRepoState,
+  readOriginUrl,
   RemoteUrlError,
   GitOperationError,
   type RepoState,
@@ -67,7 +68,8 @@ export type SourceOpErrorCode =
   | 'protected_id'
   | 'clone_dir_outside_gbrain'
   | 'symlink_escape'
-  | 'unmanaged_path';
+  | 'unmanaged_path'
+  | 'clone_url_mismatch';
 
 export class SourceOpError extends Error {
   constructor(
@@ -121,6 +123,13 @@ export interface SourceStatus {
   name: string;
   local_path: string | null;
   remote_url: string | null;
+  /**
+   * The `origin` URL actually configured in the on-disk clone, or null if the
+   * clone has no origin (or no local_path). Reported alongside `remote_url` —
+   * the CONFIG's view — so the two can be compared directly. When they
+   * disagree, `clone_state` says how.
+   */
+  clone_remote_url: string | null;
   federated: boolean;
   page_count: number;
   last_sync_at: string | null;
@@ -130,6 +139,10 @@ export interface SourceStatus {
    * Discriminated union from validateRepoState. 'not-applicable' if the
    * source has no local_path (pure DB source). Lets a remote MCP caller
    * diagnose "is the clone OK?" without SSH access to the brain host.
+   *
+   * 'unmanaged-remote' means config.remote_url is unset but the clone tracks an
+   * origin: gbrain will never pull this source, so a green sync only proves the
+   * brain matches whatever is on disk — NOT that it matches upstream.
    */
   clone_state: RepoState | 'not-applicable';
 }
@@ -710,8 +723,20 @@ export async function getSourceStatus(
 
   const remoteUrl = getRemoteUrl(src.config);
   let cloneState: SourceStatus['clone_state'] = 'not-applicable';
+  let cloneRemoteUrl: string | null = null;
   if (src.local_path) {
-    cloneState = validateRepoState(src.local_path, remoteUrl ?? undefined);
+    // Pass remoteUrl THROUGH — including null. `null` means "config records no
+    // remote", which validateRepoState reports as `unmanaged-remote` if the
+    // clone has an origin anyway. Coercing null to undefined (as this did
+    // pre-fix) told validateRepoState "no expectation", so a source that gbrain
+    // can never pull reported `healthy` — the brain stayed perfectly consistent
+    // with a snapshot that had stopped advancing, and no diagnostic disagreed.
+    cloneState = validateRepoState(src.local_path, remoteUrl);
+    try {
+      cloneRemoteUrl = readOriginUrl(src.local_path);
+    } catch {
+      cloneRemoteUrl = null; // already reflected as `corrupted` in cloneState
+    }
   }
 
   return {
@@ -719,12 +744,104 @@ export async function getSourceStatus(
     name: src.name,
     local_path: src.local_path,
     remote_url: remoteUrl,
+    clone_remote_url: cloneRemoteUrl,
     federated: isFederated(src.config),
     page_count: await countPages(engine, id),
     last_sync_at: src.last_sync_at ? new Date(src.last_sync_at).toISOString() : null,
     last_commit: src.last_commit,
     archived,
     clone_state: cloneState,
+  };
+}
+
+export interface SetRemoteUrlResult {
+  id: string;
+  previous_remote_url: string | null;
+  remote_url: string;
+  /** The clone's actual origin at write time, for confirmation. */
+  clone_remote_url: string | null;
+  /** Whether the new config value matches what the clone already tracks. */
+  matches_clone: boolean;
+}
+
+/**
+ * Set `config.remote_url` on an EXISTING source, in place.
+ *
+ * This exists because the only prior way to change a source's remote was
+ * `sources remove` + `sources add --url`, and remove cascades to pages, chunks
+ * and embeddings. For a brain whose page RIDs (`orn:habitat.page:…`) are written
+ * back into source-repo frontmatter, that cascade destroys load-bearing external
+ * identifiers — the remove/re-add path is unusable, so in practice the field was
+ * simply unfixable.
+ *
+ * Deliberately NON-DESTRUCTIVE: touches exactly one JSON key on the `sources`
+ * row. No pages, chunks, embeddings, RIDs, `last_commit` or `last_sync_at` are
+ * read or written, and the on-disk clone is never modified — so this cannot
+ * trigger a re-index or invalidate a RID.
+ *
+ * The new URL goes through the same SSRF gate as `sources add --url`. By default
+ * it must also match the clone's existing origin: pointing config at a DIFFERENT
+ * repo than the clone is what `url-drift` means, and the next sync would refuse
+ * to run and demand a re-clone. Pass `allowMismatch` to do it anyway (the
+ * deliberate "config is right, clone is wrong, I'll re-clone next" case).
+ */
+export async function setSourceRemoteUrl(
+  engine: BrainEngine,
+  id: string,
+  url: string,
+  opts: { allowMismatch?: boolean } = {},
+): Promise<SetRemoteUrlResult> {
+  validateSourceId(id);
+  const src = await fetchSourceRow(engine, id);
+  if (!src) {
+    throw new SourceOpError('not_found', `Source "${id}" not found.`);
+  }
+
+  let parsed;
+  try {
+    parsed = parseRemoteUrl(url);
+  } catch (e) {
+    if (e instanceof RemoteUrlError) {
+      throw new SourceOpError('invalid_remote_url', e.message, e);
+    }
+    throw e;
+  }
+
+  let cloneRemoteUrl: string | null = null;
+  if (src.local_path) {
+    try {
+      cloneRemoteUrl = readOriginUrl(src.local_path);
+    } catch {
+      cloneRemoteUrl = null;
+    }
+  }
+
+  const matchesClone = cloneRemoteUrl !== null && cloneRemoteUrl === parsed.url;
+  if (cloneRemoteUrl !== null && !matchesClone && !opts.allowMismatch) {
+    throw new SourceOpError(
+      'clone_url_mismatch',
+      `Source "${id}": the clone at ${src.local_path} tracks "${cloneRemoteUrl}", ` +
+        `but you asked to record "${parsed.url}". Writing that would put the config ` +
+        `in url-drift and the next sync would refuse to run. Record ` +
+        `"${cloneRemoteUrl}" to match the clone, or pass allowMismatch/--force if ` +
+        `you intend to re-clone against the new URL.`,
+    );
+  }
+
+  const cfg = parseConfig(src.config);
+  const previous = getRemoteUrl(src.config);
+  cfg.remote_url = parsed.url;
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
+    [JSON.stringify(cfg), id],
+  );
+
+  return {
+    id,
+    previous_remote_url: previous,
+    remote_url: parsed.url,
+    clone_remote_url: cloneRemoteUrl,
+    matches_clone: matchesClone,
   };
 }
 

@@ -965,6 +965,55 @@ async function runWebhookClear(engine: BrainEngine, args: string[]): Promise<voi
   console.log(`Webhook configuration cleared for source "${id}".`);
 }
 
+/**
+ * `gbrain sources set-url <id> <https-url> [--force]`
+ *
+ * The non-destructive counterpart to remove+re-add for a source's remote_url.
+ * `sources remove` cascades to pages/chunks/embeddings, which destroys page RIDs
+ * that downstream repos may have written into their own frontmatter — so it was
+ * never a viable way to correct this one field.
+ */
+async function runSetUrl(engine: BrainEngine, args: string[]): Promise<void> {
+  const positional = args.filter((a) => !a.startsWith('--'));
+  const [id, url] = positional;
+  if (!id || !url) {
+    console.error('Usage: gbrain sources set-url <id> <https-url> [--force]');
+    console.error('');
+    console.error('Records config.remote_url on an existing source so gbrain sync can');
+    console.error('pull it. Touches only that field — never pages, chunks, embeddings');
+    console.error('or RIDs. HTTPS only (same SSRF gate as `sources add --url`); an SSH');
+    console.error('remote cannot be recorded, and such a source stays clone_state');
+    console.error('"unmanaged-remote" by design.');
+    console.error('');
+    console.error('  --force   record a URL that differs from the clone\'s origin.');
+    console.error('            Leaves the source in url-drift; sync will refuse until');
+    console.error('            the clone is re-cloned to match.');
+    process.exit(2);
+  }
+  const { setSourceRemoteUrl, SourceOpError } = await import('../core/sources-ops.ts');
+  try {
+    const res = await setSourceRemoteUrl(engine, id, url, {
+      allowMismatch: args.includes('--force'),
+    });
+    console.log(
+      `Source "${res.id}" remote_url: ${res.previous_remote_url ?? '(unset)'} → ${res.remote_url}`,
+    );
+    if (!res.matches_clone) {
+      console.error(
+        `Warning: the clone tracks ${res.clone_remote_url ?? '(no origin)'}, which does ` +
+        `not match. This source is now in url-drift and sync will refuse to run until ` +
+        `the clone is re-cloned against the recorded URL.`,
+      );
+    }
+  } catch (e) {
+    if (e instanceof SourceOpError) {
+      console.error(`${e.code}: ${e.message}`);
+      process.exit(1);
+    }
+    throw e;
+  }
+}
+
 // ── v0.40 sources tracked-branch (D20) ──────────────────────
 async function runTrackedBranch(engine: BrainEngine, args: string[]): Promise<void> {
   const id = args[0];
@@ -1331,6 +1380,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'status':     return runStatus(engine, rest);
     case 'webhook':    return runWebhook(engine, rest);
     case 'tracked-branch': return runTrackedBranch(engine, rest);
+    case 'set-url':    return runSetUrl(engine, rest);
     // v0.40.3.0 contextual retrieval (from master)
     case 'set-cr-mode': return runSetCrMode(engine, rest);
     case 'audit':      return runAudit(engine, rest);
