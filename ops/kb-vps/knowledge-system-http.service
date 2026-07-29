@@ -1,41 +1,59 @@
-# Arkology Knowledge System — HTTP MCP retrieval endpoint (KS-E).
+# Arkology Knowledge System — HTTP MCP/OAuth server (KS-E).
 #
-# The auth-bearing read path for external agents (e.g. Douglas's Claude Code):
-# `gbrain serve --http` exposes OAuth 2.1 MCP + verifies governance-minted
+# The auth-bearing read path for external agents (e.g. a guest's Claude Code):
+# `gbrain serve --http` exposes OAuth 2.1 MCP and verifies governance-minted
 # tokens (hab_at_/hab_pat_) via RFC 7662 introspection against habitat-governance.
 #
-# Mirrors the box's proven knowledge-system-sync.service pattern (same bun path,
-# same gbrain.env, Restart=always). Bound to 127.0.0.1 — public reach ONLY via
-# the Cloudflare tunnel. Install per docs/deploy/KS-E-governance-retrieval.md.
+# THIS IS THE UNIT AS DEPLOYED on kb-vps, captured verbatim from
+# /etc/systemd/system/knowledge-system-http.service on 2026-07-29. It has been
+# running since 2026-07-15. Install/compare with:
 #
-# Placeholders to fill before install:
-#   <KS_PUBLIC_URL>  the public issuer, e.g. https://kb.arkology.studio
-#                    (must match the CF tunnel hostname you point at :3131)
+#     diff <(cat ops/kb-vps/knowledge-system-http.service) \
+#          /etc/systemd/system/knowledge-system-http.service
+#
+# See docs/deploy/KS-E-governance-retrieval.md.
+#
+# THREE THINGS THAT LOOK WRONG AND ARE NOT:
+#
+#  1. `--bind 172.18.0.1`, NOT 127.0.0.1. That address is the `knowledge-base_habitat`
+#     docker bridge gateway — i.e. the host as seen from inside a container. The
+#     nginx reverse proxy that fronts kb.arkology.studio runs in a container, so a
+#     loopback bind would be unreachable to it and the public retrieval path would
+#     404. Still not public: 172.18.0.1 is not routable from outside the box.
+#  2. `/usr/local/bin/gbrain` is a symlink chain to the bun-linked source checkout
+#     (/root/.bun/bin/gbrain → …/node_modules/gbrain/src/cli.ts, which resolves to
+#     /root/knowledge-system). There is no build step — deploy is `git pull` +
+#     `systemctl restart`. WorkingDirectory must therefore be the checkout.
+#  3. The governance EnvironmentFile is prefixed `-` (optional). Introspection is
+#     opt-in and fails closed; without that file the service still starts and
+#     serves local-token traffic, which is what you want during a restore.
 
 [Unit]
-Description=Arkology Knowledge System - HTTP MCP retrieval endpoint (OAuth 2.1 + governance introspection)
+Description=Arkology Knowledge System - HTTP MCP/OAuth server
 After=network-online.target docker.service
 Wants=network-online.target
-# Postgres (KS brain) runs as a docker container; don't start before it.
-Requires=docker.service
 
 [Service]
 Type=simple
-# Brain/DB/embedding config (shared with sync + dream units).
-EnvironmentFile=/etc/gbrain/gbrain.env
-# Governance introspection creds (KS-E). Separate file → least privilege; the
-# sync/dream units never load the governance client secret. See
-# ops/kb-vps/governance.env.example.
-EnvironmentFile=/etc/gbrain/governance.env
+User=root
+WorkingDirectory=/root/knowledge-system
 Environment=PATH=/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
-# --bind 127.0.0.1 (serve-http default; explicit here): loopback only, fronted
-# by the Cloudflare tunnel. Never bind 0.0.0.0 on this shared box.
-# NB: `serve --http` serves the WHOLE brain with per-token source scoping — it
-# takes no --source (unlike the sync/dream units); access is decided per token.
-ExecStart=/root/.bun/bin/gbrain serve --http --port 3131 --bind 127.0.0.1 --public-url <KS_PUBLIC_URL>
+# Brain/DB/embedding config, shared with the sync + dream units.
+EnvironmentFile=/etc/gbrain/gbrain.env
+# HTTP-surface config: GBRAIN_ADMIN_BOOTSTRAP_TOKEN, GBRAIN_HTTP_CORS_ORIGIN,
+# GBRAIN_HTTP_TRUST_PROXY (set because requests arrive via nginx + the tunnel).
+EnvironmentFile=/etc/gbrain/http.env
+# Governance introspection creds (KS-E). A separate file keeps least privilege:
+# the sync/dream units never load the governance client secret. Optional (`-`)
+# so the service starts without it. See ops/kb-vps/governance.env.example.
+EnvironmentFile=-/etc/gbrain/governance.env
+# `serve --http` serves the WHOLE brain with per-token source scoping — it takes
+# no --source (unlike the sync/dream units); access is decided per token.
+# --suppress-bootstrap-token keeps the local admin token out of the journal.
+ExecStart=/usr/local/bin/gbrain serve --http --port 3131 --bind 172.18.0.1 --public-url https://kb.arkology.studio --suppress-bootstrap-token
 Restart=always
 RestartSec=10
-User=root
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target
