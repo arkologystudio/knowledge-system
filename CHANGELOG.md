@@ -2,6 +2,52 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.12] - 2026-07-29
+
+**A sync that never reached the remote no longer reports success.** If a source's
+config recorded no `remote_url` but its clone tracked an origin anyway, `sources_status`
+called that clone `healthy` — even though gbrain will never pull such a source. Pair that
+with a `git pull` that fails and warns-but-continues, and sync reads HEAD from the
+un-advanced clone, finds it equal to `last_commit`, and returns `up_to_date`. Health checks
+agree, because the brain genuinely is consistent with a snapshot that stopped moving. Every
+surface reads green while content silently freezes.
+
+Three changes make that state visible:
+
+### Fixed
+- `sources_status` reports the new `clone_state` value `unmanaged-remote` when the config
+  records no remote but the clone has an origin. Previously `getSourceStatus` coerced a null
+  `remote_url` to "no expectation", which is the same branch as "caller doesn't care" — so
+  the disagreement could never be detected. `validateRepoState`'s expectation is now
+  three-valued: `undefined` (no expectation, unchanged), a string (must match, else
+  `url-drift`), and `null` (config records none). `unmanaged-remote` is deliberately not
+  `url-drift`, because sync throws on `url-drift` and pointing a source at a working tree
+  you pull yourself stays supported and safe.
+- A repo with no `origin` at all is no longer misreported as `corrupted`. Reading the URL now
+  issues a bare `git remote` first, which exits 0 with an empty list and so separates "no
+  origin" from "git is broken".
+- Pull failures keep git's stderr. The log truncated to ~100 characters, which cut off just
+  after the git invocation and discarded the reason every time — leaving thousands of log
+  lines that recorded the command and never the cause.
+
+### Added
+- `sources_status` returns `clone_remote_url`, the origin actually configured in the clone,
+  alongside `remote_url`, the config's view. The two can now be compared without shell access
+  to the brain host.
+- `SyncResult.warnings` marks an otherwise-green result untrustworthy: `pull_failed` and
+  `noop_without_remote_contact` (an `up_to_date` reached without contacting a remote the clone
+  does track — pull failed, `--no-pull`, or detached HEAD). Advisory only; status and exit
+  codes are unchanged, so warn-and-continue still holds. A repo with no origin is genuinely
+  local and gets no warning.
+- `gbrain sources set-url <id> <https-url> [--force]`, plus the `sources_set_url` operation,
+  set `config.remote_url` on an existing source in place. The only prior route was
+  `sources remove` + `sources add --url`, and remove cascades to pages, chunks and embeddings —
+  destroying page RIDs that other repos may have written into their own frontmatter, which
+  made this field unfixable in practice. The new path writes exactly one JSON key and touches
+  no pages, chunks, embeddings, RIDs or sync bookmarks. HTTPS-only through the existing SSRF
+  gate, and it refuses a URL that differs from the clone's origin unless forced, since that
+  combination is `url-drift` and would make the next sync refuse to run.
+
 ## [0.43.0.11] - 2026-07-22
 
 **Source Mirror — onboarding for a non-technical operator.** A single browser-only setup guide that connects Google Drive, Notion, and an Obsidian vault to a brain in about 30 minutes, written for someone who has never opened a terminal. It walks through creating the brain repo, the rclone browser sign-in for Drive, the Notion integration and per-page sharing (which doubles as the privacy control), the Obsidian plugin, turning on the scheduled workflow, and pointing the brain at the repo — and it names exactly which credentials the operator creates, with the standing rule that no assistant ever mints or pastes a token on their behalf. Completes the Source Mirror phase.
