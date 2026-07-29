@@ -18,6 +18,7 @@ import {
   type DurabilityReport,
 } from '../core/brain-repo-durability.ts';
 import { divergenceSafePull, detectDefaultBranch } from '../core/git-remote.ts';
+import { acquireRepoLock } from '../core/repo-lock.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { existsSync } from 'fs';
 import { join } from 'path';
@@ -143,7 +144,20 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
     process.exit(1);
   }
   const branch = branchFlag || detectDefaultBranch(repoPath);
-  const outcome = divergenceSafePull(repoPath, branch);
+  // Serialise against the sync loop / commit_page writes: overlapping git
+  // operations on one clone interleave FETCH_HEAD and break `pull --ff-only`
+  // with "Cannot fast-forward to multiple branches".
+  const lock = await acquireRepoLock(repoPath, { timeoutMs: 60_000 });
+  if (!lock) {
+    console.error(`[gbrain] another gbrain process is operating ${repoPath}; try again shortly.`);
+    process.exit(3);
+  }
+  let outcome;
+  try {
+    outcome = divergenceSafePull(repoPath, branch);
+  } finally {
+    lock.release();
+  }
   switch (outcome.status) {
     case 'up_to_date': console.log(`up to date (${branch})`); break;
     case 'advanced': console.log(`advanced ${outcome.from.slice(0, 7)}→${outcome.to.slice(0, 7)} (${branch})`); break;

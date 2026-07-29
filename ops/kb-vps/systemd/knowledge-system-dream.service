@@ -1,0 +1,9 @@
+[Unit]
+Description=Arkology Knowledge System - nightly dream maintenance cycle
+After=network-online.target docker.service
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/gbrain/gbrain.env
+Environment=PATH=/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/.bun/bin/gbrain dream --source default
+User=root

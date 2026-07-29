@@ -1,0 +1,11 @@
+[Unit]
+Description=Check every 15 min that knowledge-system-sync is still pulling
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Unit=gbrain-pull-watch.service
+
+[Install]
+WantedBy=timers.target

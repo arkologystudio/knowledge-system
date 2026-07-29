@@ -2,6 +2,42 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.13] - 2026-07-29
+
+**One lock for every git operation on a source clone.** v0.43.0.12 made a blind
+sync visible; this removes the thing that was blinding it.
+
+`git pull`'s internal fetch and an explicit `git fetch origin <branch>` each write
+FETCH_HEAD marking the branch FOR-MERGE. When two overlap, the interleaved file
+leaves `--ff-only` with two merge candidates and git refuses:
+`fatal: Cannot fast-forward to multiple branches`. Two independent 5-minute sync
+loops did this on a production brain for three weeks — invisibly, because a failed
+pull warns-and-continues and the resulting `up_to_date` is indistinguishable from a
+real no-op.
+
+### Fixed
+- All four gbrain git actors on a clone now share one cross-process lock: the sync
+  pull, the sync cost-estimator's fetch, MCP page writes, and the durability
+  pull/harden paths. Previously only page writes locked, and only against each
+  other.
+- Contention behaviour differs per caller, deliberately. The sync pull waits, and
+  if it still cannot acquire, SKIPS the pull **and emits a `pull_failed` warning** —
+  skipping silently would be the exact stale-brain shape. The cost-estimator's fetch
+  never waits, since it is a preview that already falls back to local HEAD. Page
+  writes wait, then fail loudly.
+- Stale locks are now reclaimed — a holder whose process is gone, or whose entry is
+  older than 15 minutes, is taken over. The page-write lock had no staleness
+  handling, so a single crashed `commit_page` would have wedged the checkout
+  indefinitely; that latent bug got far more serious once sync depended on the same
+  lock. Reclamation fails SAFE: an entry that cannot be parsed counts as held,
+  because wrongly stealing a live lock reintroduces the very race this prevents.
+- The lock is re-entrant per process. The sync path can hold it across the pull and
+  reach the estimator, which acquires again; without re-entrancy that self-deadlocks
+  for the whole timeout and then skips its own pull.
+
+Only gbrain processes are serialised — a human running `git pull` in the checkout is
+not. Lock file keeps its original name so a rolling upgrade still interlocks.
+
 ## [0.43.0.12] - 2026-07-29
 
 **A sync that never reached the remote no longer reports success.** If a source's

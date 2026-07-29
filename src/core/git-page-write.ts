@@ -8,10 +8,8 @@
  */
 
 import {
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -20,7 +18,7 @@ import {
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import type { BrainEngine } from './engine.ts';
 import { parseMarkdown } from './markdown.ts';
 import { validateSlug } from './utils.ts';
@@ -34,10 +32,12 @@ import {
   isWorkingTreeDirty,
 } from './git-remote.ts';
 import { unifiedDiff } from './skillpack/diff-text.ts';
+import { acquireRepoLock } from './repo-lock.ts';
 
 const MAX_CONTENT_BYTES = 5_000_000;
 const MAX_DIFF_CHARS = 40_000;
-const LOCK_NAME = 'gbrain-commit-page.lock';
+/** How long a page write waits for a concurrent git operation (e.g. the 5-minutely sync pull) to finish. */
+const PAGE_WRITE_LOCK_WAIT_MS = 30_000;
 const PROTECTED_FRONTMATTER = [QUARANTINE_KEY, CONTENT_FLAG_KEY, EMBED_SKIP_KEY] as const;
 
 // Strips userinfo (user:pass@ or user@) from any scheme://host URL found in
@@ -191,22 +191,6 @@ async function resolveRepoPath(engine: BrainEngine, sourceId: string): Promise<s
   return repoPath;
 }
 
-function acquireLock(repoPath: string): () => void {
-  const gitDir = git(repoPath, ['rev-parse', '--git-dir'], 10_000);
-  const lockPath = join(isAbsolute(gitDir) ? gitDir : join(repoPath, gitDir), LOCK_NAME);
-  let fd: number;
-  try {
-    fd = openSync(lockPath, 'wx', 0o600);
-    writeFileSync(fd, `${process.pid} ${new Date().toISOString()}\n`);
-  } catch {
-    throw new GitPageWriteError('repo_dirty', 'another commit_page write is in progress');
-  }
-  return () => {
-    try { closeSync(fd); } catch { /* best effort */ }
-    try { rmSync(lockPath, { force: true }); } catch { /* best effort */ }
-  };
-}
-
 function atomicWrite(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
@@ -240,7 +224,16 @@ export async function gitFirstPageWrite(
   }
 
   return serializeForRepo(repoPath, async () => {
-    const releaseLock = acquireLock(repoPath);
+    // Cross-process lock. `serializeForRepo` only orders callers inside THIS
+    // process; the sync loop and the durability cron are separate processes
+    // operating the same checkout. Waiting briefly (rather than the previous
+    // instant failure) means a write that merely overlaps a 5-minutely sync
+    // pull now succeeds instead of surfacing a spurious "write in progress".
+    const lock = await acquireRepoLock(repoPath, { timeoutMs: PAGE_WRITE_LOCK_WAIT_MS });
+    if (!lock) {
+      throw new GitPageWriteError('repo_dirty', 'another git operation is in progress on this checkout');
+    }
+    const releaseLock = () => lock.release();
     try {
       if (isWorkingTreeDirty(repoPath)) {
         throw new GitPageWriteError('repo_dirty', 'source checkout has uncommitted changes');

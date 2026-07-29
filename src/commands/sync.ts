@@ -5,6 +5,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { importFile } from '../core/import-file.ts';
 import { collectSyncableFiles } from './import.ts';
+import { acquireRepoLock, tryAcquireRepoLock } from '../core/repo-lock.ts';
 import { createInterface } from 'readline';
 import {
   isSyncable,
@@ -156,6 +157,14 @@ function resolveSyncMaxCheckpointFailures(): number {
 }
 
 const SYNC_YIELD_EVERY_DEFAULT = 64;
+
+/**
+ * How long a sync waits for another gbrain process to finish its git work
+ * before giving up on the pull. Generous enough to cover a commit_page write
+ * (pull + commit + push) or a sibling sync's pull, short enough that a wedged
+ * holder can't stall the watch loop past its own 300s interval.
+ */
+const PULL_LOCK_WAIT_MS = 60_000;
 
 /**
  * v0.42.x (#1794): how many imported files between event-loop yields. The import
@@ -336,13 +345,27 @@ function resolveEstimateTarget(localPath: string): { target: string; detached: b
     branch = null;
   }
   if (branch && branch !== 'HEAD' && hasOriginRemote(localPath)) {
-    try {
-      // v0.42.42.0 (#2139): route through the SSRF-hardened fetch (same flags +
-      // no-prompt env as pullRepo) — a cost preview / dry-run must NOT hit a
-      // remote through a less-protected path than real sync.
-      fetchRemote(localPath, branch, { timeoutMs: 30_000 });
-    } catch {
-      // fail-open: offline, auth failure, no upstream — fall through to local HEAD.
+    // This fetch writes FETCH_HEAD with `branch` marked FOR-MERGE. A `git pull`
+    // running concurrently in the same clone writes its own for-merge line, and
+    // the interleaved file leaves `--ff-only` with two merge candidates:
+    // "fatal: Cannot fast-forward to multiple branches". Take the repo lock so
+    // an estimate can never corrupt a real sync's pull.
+    //
+    // try-only, never wait: this is a cost PREVIEW that already falls back to
+    // local HEAD on any failure. Blocking a preview behind someone else's pull
+    // would be worse than a slightly stale estimate.
+    const estimateLock = tryAcquireRepoLock(localPath);
+    if (estimateLock) {
+      try {
+        // v0.42.42.0 (#2139): route through the SSRF-hardened fetch (same flags +
+        // no-prompt env as pullRepo) — a cost preview / dry-run must NOT hit a
+        // remote through a less-protected path than real sync.
+        fetchRemote(localPath, branch, { timeoutMs: 30_000 });
+      } catch {
+        // fail-open: offline, auth failure, no upstream — fall through to local HEAD.
+      } finally {
+        estimateLock.release();
+      }
     }
     try {
       const remoteSha = git(localPath, ['rev-parse', `origin/${branch}`]);
@@ -1646,70 +1669,97 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   if (!opts.noPull && !detachedHead && originRemotePresent) {
     const _t0 = Date.now();
     serr(`[gbrain phase] sync.git_pull start`);
-    try {
-      const { pullRepo } = await import('../core/git-remote.ts');
-      // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,
-      // bound the pull subprocess to a fraction of the remaining budget.
-      // We pass a safe default (the operator's full --timeout if set, else
-      // pullRepo's own 300s default). The catch below distinguishes
-      // timeout (ETIMEDOUT / SIGTERM on err.cause) from ordinary pull
-      // failure.
-      pullRepo(repoPath);
-      remoteContacted = true;
-      serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      serr(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 80)})`);
-      // v0.41.13.0 (T3 / D-V4-mech-7): pullRepo wraps execFileSync errors
-      // in GitOperationError, so `error.code === 'ETIMEDOUT'` and
-      // `error.signal === 'SIGTERM'` live on `.cause`, NOT on the top-
-      // level error. Inspect `.cause` to distinguish a real timeout
-      // (return partial reason='pull_timeout') from ordinary failure
-      // (keep the existing warn-and-continue R2 invariant).
-      const cause: unknown = e instanceof Error && 'cause' in e ? (e as { cause?: unknown }).cause : undefined;
-      const causeCode = (cause && typeof cause === 'object' && 'code' in cause)
-        ? (cause as { code?: unknown }).code
-        : undefined;
-      const causeSignal = (cause && typeof cause === 'object' && 'signal' in cause)
-        ? (cause as { signal?: unknown }).signal
-        : undefined;
-      const isTimeout = causeCode === 'ETIMEDOUT' || causeSignal === 'SIGTERM';
-      if (isTimeout) {
-        return buildPartialResult({
-          fromCommit: lastCommit,
-          toCommit: lastCommit ?? '',
-          filesImported: 0,
-          pagesAffected: [],
-          chunksCreated: 0,
-          added: 0, modified: 0, deleted: 0, renamed: 0,
-          reason: 'pull_timeout',
+    // Cross-process lock (#FETCH_HEAD race). Another gbrain process operating
+    // this same checkout — a second sync loop, a commit_page write, the
+    // durability cron — writes FETCH_HEAD too, and an interleaved write leaves
+    // `--ff-only` with two merge candidates: "fatal: Cannot fast-forward to
+    // multiple branches". Two 5-minutely sync loops did exactly this on a
+    // production brain for three weeks.
+    //
+    // Wait rather than skip: the holder is doing a bounded git operation, and a
+    // pull deferred by seconds is strictly better than a sync that silently
+    // runs against a clone it never refreshed.
+    const pullLock = await acquireRepoLock(repoPath, { timeoutMs: PULL_LOCK_WAIT_MS });
+    if (!pullLock) {
+      // Deliberately NOT silent. Skipping the pull is the exact shape of the
+      // stale-brain incident, so it produces the same warnings a failed pull
+      // does — the run continues (warn-and-continue invariant) but no caller
+      // can mistake its `up_to_date` for a confirmed-fresh result.
+      const detail =
+        `could not acquire the repo lock for ${repoPath} within ${PULL_LOCK_WAIT_MS}ms — ` +
+        `another gbrain process is operating this checkout. Skipped the pull; ` +
+        `this run reflects local clone state only.`;
+      serr(`[gbrain phase] sync.git_pull skipped ${Date.now() - _t0}ms (lock unavailable)`);
+      serr(`Warning: ${detail}`);
+      syncWarnings.push({ code: 'pull_failed', message: detail });
+    } else {
+      try {
+        const { pullRepo } = await import('../core/git-remote.ts');
+        // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,
+        // bound the pull subprocess to a fraction of the remaining budget.
+        // We pass a safe default (the operator's full --timeout if set, else
+        // pullRepo's own 300s default). The catch below distinguishes
+        // timeout (ETIMEDOUT / SIGTERM on err.cause) from ordinary pull
+        // failure.
+        pullRepo(repoPath);
+        remoteContacted = true;
+        serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        serr(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 80)})`);
+        // v0.41.13.0 (T3 / D-V4-mech-7): pullRepo wraps execFileSync errors
+        // in GitOperationError, so `error.code === 'ETIMEDOUT'` and
+        // `error.signal === 'SIGTERM'` live on `.cause`, NOT on the top-
+        // level error. Inspect `.cause` to distinguish a real timeout
+        // (return partial reason='pull_timeout') from ordinary failure
+        // (keep the existing warn-and-continue R2 invariant).
+        const cause: unknown = e instanceof Error && 'cause' in e ? (e as { cause?: unknown }).cause : undefined;
+        const causeCode = (cause && typeof cause === 'object' && 'code' in cause)
+          ? (cause as { code?: unknown }).code
+          : undefined;
+        const causeSignal = (cause && typeof cause === 'object' && 'signal' in cause)
+          ? (cause as { signal?: unknown }).signal
+          : undefined;
+        const isTimeout = causeCode === 'ETIMEDOUT' || causeSignal === 'SIGTERM';
+        if (isTimeout) {
+          return buildPartialResult({
+            fromCommit: lastCommit,
+            toCommit: lastCommit ?? '',
+            filesImported: 0,
+            pagesAffected: [],
+            chunksCreated: 0,
+            added: 0, modified: 0, deleted: 0, renamed: 0,
+            reason: 'pull_timeout',
+          });
+        }
+        // Do NOT truncate to ~100 chars. execFileSync puts "Command failed: <the
+        // full git invocation>" at the FRONT of .message and git's own stderr —
+        // the only part that says WHY — at the back. A 100-char slice therefore
+        // logged the command and dropped the reason, every single time. Three
+        // weeks of 5-minutely failures produced 8,000+ log lines that all read
+        // "Command failed: git -C /srv/… -c ht" and not one recorded the cause,
+        // so the root cause was unrecoverable from the journal after the fact.
+        // 2000 chars covers git's stderr with room to spare.
+        const detail = msg.length > 2000 ? `${msg.slice(0, 2000)}… (truncated)` : msg;
+        if (msg.includes('non-fast-forward') || msg.includes('diverged')) {
+          serr(`Warning: git pull failed (remote diverged). Syncing from local state.\n${detail}`);
+        } else {
+          serr(`Warning: git pull failed: ${detail}`);
+        }
+        serr(
+          `Warning: this sync ran against the LOCAL clone only — its result reflects ` +
+          `on-disk state, not upstream. A clean "up_to_date" here does NOT mean the ` +
+          `brain matches the remote.`,
+        );
+        syncWarnings.push({
+          code: 'pull_failed',
+          message:
+            `git pull failed; synced from local clone state only. ` +
+            `Results do not reflect upstream. ${detail}`,
         });
+      } finally {
+        pullLock.release();
       }
-      // Do NOT truncate to ~100 chars. execFileSync puts "Command failed: <the
-      // full git invocation>" at the FRONT of .message and git's own stderr —
-      // the only part that says WHY — at the back. A 100-char slice therefore
-      // logged the command and dropped the reason, every single time. Three
-      // weeks of 5-minutely failures produced 8,000+ log lines that all read
-      // "Command failed: git -C /srv/… -c ht" and not one recorded the cause,
-      // so the root cause was unrecoverable from the journal after the fact.
-      // 2000 chars covers git's stderr with room to spare.
-      const detail = msg.length > 2000 ? `${msg.slice(0, 2000)}… (truncated)` : msg;
-      if (msg.includes('non-fast-forward') || msg.includes('diverged')) {
-        serr(`Warning: git pull failed (remote diverged). Syncing from local state.\n${detail}`);
-      } else {
-        serr(`Warning: git pull failed: ${detail}`);
-      }
-      serr(
-        `Warning: this sync ran against the LOCAL clone only — its result reflects ` +
-        `on-disk state, not upstream. A clean "up_to_date" here does NOT mean the ` +
-        `brain matches the remote.`,
-      );
-      syncWarnings.push({
-        code: 'pull_failed',
-        message:
-          `git pull failed; synced from local clone state only. ` +
-          `Results do not reflect upstream. ${detail}`,
-      });
     }
   }
 
