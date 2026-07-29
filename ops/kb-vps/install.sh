@@ -34,8 +34,12 @@ install -m 0644 "$SYSTEMD_SRC/gbrain-pull-watch.timer" "$SYSTEMD_DST/"
 
 if [ "$ALL" -eq 1 ]; then
   echo "==> --all: syncing service units (NOT restarting them; do that deliberately)"
-  for u in knowledge-system-sync.service knowledge-system-http.service \
-           knowledge-system-dream.service knowledge-system-dream.timer; do
+  # The http unit lives at ops/kb-vps/ (not systemd/) because the KS-E governance
+  # work tracked it there first, with a long comment block explaining its
+  # non-obvious bind address and symlink chain. Referenced by
+  # docs/deploy/KS-E-governance-retrieval.md, so it is not moved here.
+  for u in knowledge-system-sync.service knowledge-system-dream.service \
+           knowledge-system-dream.timer; do
     if [ -f "$SYSTEMD_SRC/$u" ]; then
       if [ -f "$SYSTEMD_DST/$u" ] && ! diff -q "$SYSTEMD_SRC/$u" "$SYSTEMD_DST/$u" >/dev/null; then
         cp -a "$SYSTEMD_DST/$u" "$SYSTEMD_DST/$u.bak.$(date -u +%Y%m%dT%H%M%SZ)"
@@ -44,6 +48,15 @@ if [ "$ALL" -eq 1 ]; then
       install -m 0644 "$SYSTEMD_SRC/$u" "$SYSTEMD_DST/"
     fi
   done
+  if [ -f "$REPO_DIR/knowledge-system-http.service" ]; then
+    if [ -f "$SYSTEMD_DST/knowledge-system-http.service" ] \
+       && ! diff -q "$REPO_DIR/knowledge-system-http.service" "$SYSTEMD_DST/knowledge-system-http.service" >/dev/null; then
+      cp -a "$SYSTEMD_DST/knowledge-system-http.service" \
+            "$SYSTEMD_DST/knowledge-system-http.service.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+      echo "    knowledge-system-http.service changed — previous version backed up"
+    fi
+    install -m 0644 "$REPO_DIR/knowledge-system-http.service" "$SYSTEMD_DST/"
+  fi
 fi
 
 echo "==> reloading systemd"
