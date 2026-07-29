@@ -263,17 +263,64 @@ export type RepoState =
   | 'not-a-dir'
   | 'no-git'
   | 'url-drift'
+  | 'unmanaged-remote'
   | 'corrupted';
+
+/**
+ * Read `origin`'s URL from a clone. Returns null when the repo has no `origin`
+ * remote at all (a legitimate state: `git init` with no remote), and throws
+ * only when git itself fails.
+ *
+ * Split out of validateRepoState so callers that need the ACTUAL on-disk URL
+ * — not just a verdict — don't have to shell out a second time. `sources_status`
+ * reports it as `clone_remote_url` so an MCP caller can see the config-vs-clone
+ * disagreement without SSH access to the brain host.
+ */
+export function readOriginUrl(repoPath: string): string | null {
+  // `git remote` lists remotes and exits 0 even when there are none, so it
+  // separates "this repo has no origin" from "git is broken here". Going
+  // straight to `remote get-url origin` cannot: that exits non-zero for BOTH,
+  // which is why a remote-less repo used to be misreported as `corrupted`.
+  const remotes = execFileSync('git', ['-C', repoPath, 'remote'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10_000,
+    env: { ...process.env, ...GIT_ENV },
+  }).toString().split('\n').map((l) => l.trim());
+  if (!remotes.includes('origin')) return null;
+
+  const out = execFileSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10_000,
+    env: { ...process.env, ...GIT_ENV },
+  }).toString().trim();
+  return out === '' ? null : out;
+}
 
 /**
  * Classify the on-disk state of a clone. Used by performSync to decide
  * whether to run pull (healthy), re-clone (missing/no-git/not-a-dir),
  * refuse with corruption error (corrupted), or refuse with rebase-clone
  * hint (url-drift).
+ *
+ * `expectedRemoteUrl` is three-valued, and the distinction is load-bearing:
+ *   - `undefined` — caller has no expectation; never reports drift. This is the
+ *     historical behavior and what non-source callers still get.
+ *   - `string`    — config records this URL; a different one on disk is `url-drift`.
+ *   - `null`      — config records NO remote, so gbrain will never pull this
+ *     source. A clone that nonetheless has an `origin` is `unmanaged-remote`:
+ *     not corruption, not drift, but the config and the clone disagree about
+ *     whether anything upstream exists.
+ *
+ * `unmanaged-remote` is deliberately NOT `url-drift`. `url-drift` is a hard
+ * failure — performSync throws on it and tells the operator to re-clone — and
+ * pointing a source at a working tree the user pulls themselves (`sources add
+ * --path`) is a supported, safe pattern that would otherwise start failing every
+ * sync. The two states need to stay distinguishable so a diagnostic can flag the
+ * disagreement without a recovery path refusing to run.
  */
 export function validateRepoState(
   repoPath: string,
-  expectedRemoteUrl?: string,
+  expectedRemoteUrl?: string | null,
 ): RepoState {
   let stat;
   try {
@@ -285,16 +332,19 @@ export function validateRepoState(
   if (!stat.isDirectory()) return 'not-a-dir';
   if (!existsSync(join(repoPath, '.git'))) return 'no-git';
 
-  let remoteUrl: string;
+  let remoteUrl: string | null;
   try {
-    const out = execFileSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 10_000,
-      env: { ...process.env, ...GIT_ENV },
-    });
-    remoteUrl = out.toString().trim();
+    remoteUrl = readOriginUrl(repoPath);
   } catch {
     return 'corrupted';
+  }
+
+  // Config says "no remote". A clone that has one anyway is a silent
+  // disagreement: gbrain's own sync will never pull it, yet the clone looks
+  // like it tracks something. Reporting `healthy` here is what let a stale
+  // snapshot pass as a consistent brain.
+  if (expectedRemoteUrl === null) {
+    return remoteUrl === null ? 'healthy' : 'unmanaged-remote';
   }
 
   if (expectedRemoteUrl !== undefined && remoteUrl !== expectedRemoteUrl) {

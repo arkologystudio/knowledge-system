@@ -1,0 +1,99 @@
+# Source Mirror — scheduled runner (TEMPLATE).
+#
+# Copy this into the BRAIN (corpus) repository at `.github/workflows/mirror.yml`.
+# It runs the Source Mirror in an ephemeral GitHub Actions runner — extraction and
+# credentials NEVER touch the organisation's own server — and pushes the mirrored
+# markdown, which triggers the brain's existing reindex webhook.
+#
+# Secrets to provision in the brain repo (each a HUMAN step — the agent never mints
+# these):
+#   NOTION_TOKEN      internal-integration token (Notion leg)
+#   RCLONE_CONF       contents of an `rclone config` file with the Drive remote
+#   KS_REPO_TOKEN     read token for the private knowledge-system repo (mirror code)
+#   BRAIN_REPO_TOKEN  write token for THIS brain repo (to push mirrored commits)
+#
+# Pin every `uses:` to a commit SHA before adopting (the repo's GitHub-Actions SHA
+# policy). Version tags are shown here for readability only.
+
+name: source-mirror
+
+on:
+  schedule:
+    # Every 4 hours (offset off the hour to avoid top-of-hour load). Four-hourly
+    # stays comfortably inside the free-tier compute allowance; hourly does not.
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute the plan without writing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: source-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout brain repo
+        uses: actions/checkout@v4
+        with:
+          path: brain
+          fetch-depth: 0
+          token: ${{ secrets.BRAIN_REPO_TOKEN }}
+
+      - name: Checkout Source Mirror code (knowledge-system, pin the ref)
+        uses: actions/checkout@v4
+        with:
+          repository: arkologystudio/knowledge-system
+          ref: master
+          path: mirror-src
+          token: ${{ secrets.KS_REPO_TOKEN }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup rclone
+        uses: AnimMouse/setup-rclone@v1
+
+      - name: Install mirror dependencies
+        run: cd mirror-src && bun install --frozen-lockfile
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
+
+      - name: Configure git identity for mirror commits
+        run: |
+          cd brain
+          git config user.name "source-mirror[bot]"
+          git config user.email "source-mirror@users.noreply.github.com"
+
+      - name: Run the mirror
+        id: mirror
+        continue-on-error: true
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: |
+          MODE="--apply"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then MODE="--dry-run"; fi
+          cd mirror-src
+          bun run mirror run --repo "$GITHUB_WORKSPACE/brain" --config "$GITHUB_WORKSPACE/brain/mirror.config.json" $MODE
+
+      - name: Push mirrored commits
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          cd brain
+          git push origin HEAD:${{ github.event.repository.default_branch }}
+
+      - name: Surface leg failures
+        if: steps.mirror.outcome == 'failure'
+        run: |
+          echo "::error::One or more Source Mirror legs failed. Any successful legs were committed and pushed; the failed leg was isolated. See the 'Run the mirror' step for detail."
+          exit 1

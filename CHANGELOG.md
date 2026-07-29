@@ -2,6 +2,88 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.12] - 2026-07-29
+
+**A sync that never reached the remote no longer reports success.** If a source's
+config recorded no `remote_url` but its clone tracked an origin anyway, `sources_status`
+called that clone `healthy` — even though gbrain will never pull such a source. Pair that
+with a `git pull` that fails and warns-but-continues, and sync reads HEAD from the
+un-advanced clone, finds it equal to `last_commit`, and returns `up_to_date`. Health checks
+agree, because the brain genuinely is consistent with a snapshot that stopped moving. Every
+surface reads green while content silently freezes.
+
+Three changes make that state visible:
+
+### Fixed
+- `sources_status` reports the new `clone_state` value `unmanaged-remote` when the config
+  records no remote but the clone has an origin. Previously `getSourceStatus` coerced a null
+  `remote_url` to "no expectation", which is the same branch as "caller doesn't care" — so
+  the disagreement could never be detected. `validateRepoState`'s expectation is now
+  three-valued: `undefined` (no expectation, unchanged), a string (must match, else
+  `url-drift`), and `null` (config records none). `unmanaged-remote` is deliberately not
+  `url-drift`, because sync throws on `url-drift` and pointing a source at a working tree
+  you pull yourself stays supported and safe.
+- A repo with no `origin` at all is no longer misreported as `corrupted`. Reading the URL now
+  issues a bare `git remote` first, which exits 0 with an empty list and so separates "no
+  origin" from "git is broken".
+- Pull failures keep git's stderr. The log truncated to ~100 characters, which cut off just
+  after the git invocation and discarded the reason every time — leaving thousands of log
+  lines that recorded the command and never the cause.
+
+### Added
+- `sources_status` returns `clone_remote_url`, the origin actually configured in the clone,
+  alongside `remote_url`, the config's view. The two can now be compared without shell access
+  to the brain host.
+- `SyncResult.warnings` marks an otherwise-green result untrustworthy: `pull_failed` and
+  `noop_without_remote_contact` (an `up_to_date` reached without contacting a remote the clone
+  does track — pull failed, `--no-pull`, or detached HEAD). Advisory only; status and exit
+  codes are unchanged, so warn-and-continue still holds. A repo with no origin is genuinely
+  local and gets no warning.
+- `gbrain sources set-url <id> <https-url> [--force]`, plus the `sources_set_url` operation,
+  set `config.remote_url` on an existing source in place. The only prior route was
+  `sources remove` + `sources add --url`, and remove cascades to pages, chunks and embeddings —
+  destroying page RIDs that other repos may have written into their own frontmatter, which
+  made this field unfixable in practice. The new path writes exactly one JSON key and touches
+  no pages, chunks, embeddings, RIDs or sync bookmarks. HTTPS-only through the existing SSRF
+  gate, and it refuses a URL that differs from the clone's origin unless forced, since that
+  combination is `url-drift` and would make the next sync refuse to run.
+
+## [0.43.0.11] - 2026-07-22
+
+**Source Mirror — onboarding for a non-technical operator.** A single browser-only setup guide that connects Google Drive, Notion, and an Obsidian vault to a brain in about 30 minutes, written for someone who has never opened a terminal. It walks through creating the brain repo, the rclone browser sign-in for Drive, the Notion integration and per-page sharing (which doubles as the privacy control), the Obsidian plugin, turning on the scheduled workflow, and pointing the brain at the repo — and it names exactly which credentials the operator creates, with the standing rule that no assistant ever mints or pastes a token on their behalf. Completes the Source Mirror phase.
+
+To take advantage of v0.43.0.11: read `docs/guides/source-mirror-onboarding.md`.
+
+## [0.43.0.10] - 2026-07-22
+
+**Source Mirror — the scheduled runner.** The mirror runs as a scheduled GitHub Actions job on the brain (corpus) repository, not as a daemon on the organisation's own machine — so extraction and every credential only ever touch an ephemeral runner, and the organisation's server keeps running exactly one service. It syncs every four hours (inside the free-tier compute allowance) plus on-demand, reads all credentials from Actions secrets rather than files placed over SSH, and pushes the mirrored markdown — which triggers the brain's existing reindex so a refresh lands within one sync interval. Per-leg isolation holds end to end: one source failing still pushes the others and surfaces the failure as a job notification. Shipped as a template the brain repo adopts, with a structural test pinning every one of those properties.
+
+To take advantage of v0.43.0.10: copy `templates/mirror/mirror.yml` into the brain repo's `.github/workflows/`, provision the four secrets (a human step), and SHA-pin the actions. Wired at phase promotion.
+
+## [0.43.0.9] - 2026-07-22
+
+**Source Mirror — the Obsidian leg (configuration).** An Obsidian vault is already a folder of markdown, so the right mechanism is the Obsidian Git community plugin, which pushes a dedicated organisational vault into the mirror's `sources/obsidian/` on an interval — the author keeps working exactly as before, and an edit reaches the brain within one sync. There is deliberately no fetch code and no `obsidian` source kind: the vault is authored content the brain already ingests via git, and note identity is stamped in place by the existing surgical `ref_id` pass, so authored files are never rewritten. Ships with an operator setup guide, an example runner config, and a registry smoke test.
+
+To take advantage of v0.43.0.9: see `templates/mirror/obsidian-setup.md`. Connecting a vault is a one-time, shell-free plugin setup done at phase promotion.
+
+## [0.43.0.8] - 2026-07-22
+
+**Source Mirror — the Notion leg.** Points the mirror at a Notion workspace: an internal integration enumerates the pages it has been shared, and each is fetched through the block API and converted to markdown — headings, lists, to-dos, quotes, callouts, code, nested blocks, links, and inline styling all carried across. Least privilege is inherent: only pages explicitly shared with the integration are ever seen, so nothing leaks in by accident. Identity is the stable Notion page id, so renaming a page upstream moves its mirrored copy rather than breaking links into it. This is the only leg that needs real conversion code — the official markdown export is limited to public integrations, so the internal integration walks the blocks itself.
+
+To take advantage of v0.43.0.8: the leg registers as source kind `notion` and runs via `bun run mirror`; connecting a workspace needs an internal-integration token (a human step — create the integration, share the pages, set the secret) which is wired at phase promotion.
+
+## [0.43.0.7] - 2026-07-22
+
+**Source Mirror — the Google Drive leg.** Points the mirror at a curated Google Drive folder: Google Docs export natively to markdown, and born-digital binaries (PDF, DOCX, …) are downloaded, text-extracted, and stored as a markdown stub carrying the extracted text plus a link back to the retained Drive original — the binary itself never enters the repository. Images, video, and unknown types get a reference stub. Text extraction reuses the engine's existing extractor registry (the same off-box service the artefact importer uses), so there is no new dependency, and a file whose extractor is unavailable degrades to a stub rather than failing the run. Identity is the stable Drive file id, so renaming a document upstream moves its mirrored page instead of breaking links into it.
+
+To take advantage of v0.43.0.7: the leg registers as source kind `google_drive` and runs via `bun run mirror`; connecting a real Drive needs an rclone remote (a human `rclone config` step) and, for born-digital extraction, the unstructured service. Both are wired at phase promotion.
+
+## [0.43.0.6] - 2026-07-22
+
+**Foundations for the Source Mirror — the path that pulls an organisation's existing knowledge out of Google Drive, Notion and Obsidian into a git repository of markdown the brain already knows how to index.** This release lands the source-agnostic harness the source legs plug into: a `sources/`-only write allowlist enforced in code (a mirror defect can never reach authored `wiki/` content), a diffable state file keyed on stable identity (so an upstream rename moves a page instead of breaking every link into it), deterministic provenance frontmatter minted through the shipped RID layer, a mass-deletion guard that refuses to commit when an upstream returns a suspiciously empty result, per-leg isolation, and a dry-run-by-default CLI. Seed and sync are one idempotent code path — running twice with no upstream change produces no second commit. No engine, schema, or ingestion-contract change: the mirror writes markdown into git, and the brain indexes it through its existing git sync.
+
+To take advantage of v0.43.0.6: nothing to do yet — the Google Drive, Notion and Obsidian legs that feed the harness land in follow-up releases. The harness ships behind the new `bun run mirror` entry point and is exercised end-to-end by its own test suite.
+
 ## [0.43.0.5] - 2026-07-21
 
 **`gbrain rid backfill` now adds one line to each of your files and changes nothing else. It used to rewrite every file it touched — reordering frontmatter, normalising your dates, stripping your quoting and comments, and deleting fields it did not recognise.**

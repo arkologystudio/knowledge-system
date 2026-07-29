@@ -4164,9 +4164,14 @@ const sources_status: Operation = {
   name: 'sources_status',
   description:
     'Per-source diagnostic. Returns clone_state ("healthy" | "missing" | ' +
-    '"not-a-dir" | "no-git" | "url-drift" | "corrupted" | "not-applicable") ' +
-    'so a remote MCP caller can diagnose whether the on-disk clone is ' +
-    'syncable without SSH access to the brain host.',
+    '"not-a-dir" | "no-git" | "url-drift" | "unmanaged-remote" | "corrupted" | ' +
+    '"not-applicable") so a remote MCP caller can diagnose whether the on-disk ' +
+    'clone is syncable without SSH access to the brain host. Also returns ' +
+    'clone_remote_url (the origin actually set in the clone) next to remote_url ' +
+    "(the config's view) so the two can be compared directly. " +
+    '"unmanaged-remote" means the config has no remote_url but the clone tracks ' +
+    'an origin: gbrain will never pull this source, so a green sync proves only ' +
+    'that the brain matches local disk, NOT that it matches upstream.',
   params: {
     id: { type: 'string', required: true },
   },
@@ -4176,6 +4181,44 @@ const sources_status: Operation = {
     return getSourceStatus(ctx.engine, p.id as string);
   },
   cliHints: { name: 'sources_status', hidden: true },
+};
+
+const sources_set_url: Operation = {
+  name: 'sources_set_url',
+  description:
+    "Set config.remote_url on an EXISTING source, in place. The non-destructive " +
+    'alternative to sources_remove + sources_add, which cascades to pages, chunks ' +
+    'and embeddings and so destroys page RIDs that downstream repos may have ' +
+    'written into their own frontmatter. Writes exactly one JSON key on the ' +
+    'sources row: no pages, chunks, embeddings, RIDs, last_commit or last_sync_at ' +
+    'are touched, and the on-disk clone is not modified. HTTPS only (same SSRF ' +
+    'gate as sources_add) — an SSH remote cannot be recorded, and such a source ' +
+    'legitimately stays clone_state "unmanaged-remote". Refuses by default when ' +
+    "the URL differs from the clone's origin, since that combination is url-drift " +
+    'and would make the next sync refuse to run.',
+  params: {
+    id: { type: 'string', required: true, description: 'Existing source id.' },
+    url: {
+      type: 'string',
+      required: true,
+      description: 'HTTPS git URL. SSRF-guarded. Must match the clone origin unless force.',
+    },
+    force: {
+      type: 'boolean',
+      description:
+        "Record a URL that differs from the clone's origin, accepting url-drift. " +
+        'Sync will refuse to run until the clone is re-cloned to match.',
+    },
+  },
+  mutating: true,
+  scope: 'sources_admin',
+  handler: async (ctx, p) => {
+    const { setSourceRemoteUrl } = await import('./sources-ops.ts');
+    return setSourceRemoteUrl(ctx.engine, p.id as string, p.url as string, {
+      allowMismatch: p.force === true,
+    });
+  },
+  cliHints: { name: 'sources_set_url', hidden: true },
 };
 
 // ============================================================
@@ -5902,7 +5945,7 @@ export const operations: Operation[] = [
   // v0.30: calibration aggregates over takes
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
-  whoami, sources_add, sources_list, sources_remove, sources_status,
+  whoami, sources_add, sources_list, sources_remove, sources_status, sources_set_url,
   // Knowledge System KS-A: principal identity + per-space grant provisioning
   // (users_admin-scoped). Feeds mintPrincipalToken / issuePersonalAccessToken.
   principals_add, grant_add, grant_revoke, pat_issue, pat_revoke,

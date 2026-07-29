@@ -51,6 +51,13 @@ if [ "$has_remote_get_url" = "1" ]; then
   echo "$url_to_return"
   exit 0
 fi
+# Bare \`git remote\` lists remote NAMES. readOriginUrl calls this first to tell
+# "no origin" apart from "git is broken". NO_ORIGIN=1 simulates a clone with no
+# origin configured.
+if [ "\${@: -1}" = "remote" ]; then
+  if [ "\${NO_ORIGIN:-}" != "1" ]; then echo "origin"; fi
+  exit 0
+fi
 exit 0
 `;
   const path = join(FAKE_GIT_DIR, 'git');
