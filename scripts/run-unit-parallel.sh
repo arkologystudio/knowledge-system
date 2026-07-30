@@ -71,14 +71,22 @@ if [ -z "${SHARDS_OVERRIDE:-}" ] && [ -z "${SHARDS:-}" ] && [ "$N" -gt 4 ]; then
 fi
 
 INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY:-4}}"
-# v0.40.10 flake-hardening: bump per-shard cap 600 → 1500 (was 900). At
-# 4-shard default each shard runs 159 files / ~2420 tests with internal
-# wallclock 960-1020s. The 900s value (sized for 8-shard's ~80 files /
-# 1100 tests at 620-770s) false-killed shard 1 at 900s even though it
-# had completed in 968s. 1500s cap gives ~55% headroom over observed
-# 4-shard wallclock; real hangs still hit it. Override via
-# GBRAIN_TEST_SHARD_TIMEOUT=N.
-SHARD_TIMEOUT="${GBRAIN_TEST_SHARD_TIMEOUT:-1500}"
+# Per-shard wallclock cap. History: 600 → 900 → 1500 → 3600.
+#
+# 1500 was sized against a 4-shard run at the default intra-shard concurrency
+# of 4. It false-killed shards in two situations that are both ordinary rather
+# than pathological:
+#   - a fuller suite (13,696 tests as of v0.43.0.13, up from the ~9,700 the
+#     1500s figure was calibrated against), and
+#   - any run at reduced concurrency, which is exactly what a developer does
+#     when the default 16 concurrent PGLite WASM instances exhaust memory. A
+#     complete 4-shard run at --max-concurrency=2 takes 2731s observed.
+#
+# A false kill is worse than a slow run, because a killed shard's tests DO NOT
+# RUN and the pass total silently shrinks (see the wedged accounting below).
+# 3600s leaves ~30% headroom over the slowest observed complete run; a genuine
+# hang still trips it. Override via GBRAIN_TEST_SHARD_TIMEOUT=N.
+SHARD_TIMEOUT="${GBRAIN_TEST_SHARD_TIMEOUT:-3600}"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Output directories. Prefer workspace-local .context/, fall back to /tmp.
@@ -300,6 +308,7 @@ TOTAL_FAILURES=0
 TOTAL_PASS=0
 TOTAL_SKIP=0
 TOTAL_RC=0
+WEDGED_COUNT=0
 for i in $(seq 1 "$N"); do
   SHARD_LOG="$LOG_DIR/shard-$i.log"
   EXIT_FILE="$LOG_DIR/shard-$i.exit"
@@ -316,6 +325,7 @@ for i in $(seq 1 "$N"); do
 
   if [ -f "$WEDGED_FILE" ]; then
     TOTAL_RC=1
+    WEDGED_COUNT=$((WEDGED_COUNT + 1))
     {
       echo "--- shard $i: WEDGED after ${SHARD_TIMEOUT}s ---"
       [ -f "$SHARD_LOG" ] && tail -50 "$SHARD_LOG"
@@ -415,12 +425,27 @@ if [ "$TOTAL_RC" != "0" ]; then
   {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ "$WEDGED_COUNT" -gt 0 ]; then
+      # A wedged shard is NOT a test failure — it is missing coverage, and it is
+      # the more dangerous of the two because the run still prints a plausible
+      # pass total. Say so first, in the headline, before any failure counts.
+      echo "⚠️  INCOMPLETE RUN — $WEDGED_COUNT of $N shard(s) were KILLED at ${SHARD_TIMEOUT}s."
+      echo "    Their tests DID NOT RUN. pass=$TOTAL_PASS is NOT a full-suite result"
+      echo "    and this run CANNOT be read as green. Re-run with a longer cap:"
+      echo "      GBRAIN_TEST_SHARD_TIMEOUT=$((SHARD_TIMEOUT * 2)) bun run test"
+      echo "    or lower memory pressure with --max-concurrency 2."
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    fi
     echo "❌ $TOTAL_FAILURES TEST FAILURES — full details:"
     echo "   $ABS_FAIL"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     tail -30 "$FAILURES_LOG"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "[unit-parallel] elapsed=${ELAPSED}s | pass=$TOTAL_PASS fail=$TOTAL_FAILURES skip=$TOTAL_SKIP"
+    if [ "$WEDGED_COUNT" -gt 0 ]; then
+      echo "[unit-parallel] INCOMPLETE elapsed=${ELAPSED}s | pass=$TOTAL_PASS fail=$TOTAL_FAILURES skip=$TOTAL_SKIP wedged=$WEDGED_COUNT/$N"
+    else
+      echo "[unit-parallel] elapsed=${ELAPSED}s | pass=$TOTAL_PASS fail=$TOTAL_FAILURES skip=$TOTAL_SKIP"
+    fi
   } >&2
   exit 1
 fi
