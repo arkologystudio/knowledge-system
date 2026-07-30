@@ -33,7 +33,11 @@ When `bun run test` finds any failure, the wrapper:
 3. Writes a one-line-per-shard summary to `.context/test-summary.txt` (`shard N/M: pass=X fail=Y skip=Z rc=W`).
 4. Exits non-zero. Empty failure log + non-zero exit = infrastructure problem (wedged shard, killed child); the banner says so.
 
-If a shard wedges (per-shard `GBRAIN_TEST_SHARD_TIMEOUT` cap, default 600s), the wrapper writes `--- shard N: WEDGED after ${SHARD_TIMEOUT}s ---` to the failure log, includes the last 50 lines of the shard log, and proceeds with other shards' results.
+If a shard wedges (per-shard `GBRAIN_TEST_SHARD_TIMEOUT` cap, default 3600s), the wrapper writes `--- shard N: WEDGED after ${SHARD_TIMEOUT}s ---` to the failure log, includes the last 50 lines of the shard log, and proceeds with other shards' results.
+
+**A wedged shard means the run is INCOMPLETE, not merely failed.** Its tests never executed, so the reported `pass=` total silently shrinks — a truncated run can look like a smaller green run. The wrapper now leads its banner with `⚠️ INCOMPLETE RUN — N of M shard(s) were KILLED`, tags the summary line `INCOMPLETE ... wedged=N/M`, and exits non-zero. **Never read a run with `wedged=` as green**; raise the cap or lower `--max-concurrency` and re-run.
+
+The cap was 1500s until v0.43.0.14. That was calibrated against a smaller suite at the default intra-shard concurrency of 4, and false-killed shards on both a fuller suite (13,696 tests) and any run at reduced concurrency — which is exactly what you do when 16 concurrent PGLite WASM instances exhaust memory (`PGLite failed to initialize its WASM runtime — Out of memory`). A complete 4-shard run at `--max-concurrency 2` takes ~2731s.
 
 ### File taxonomy
 
