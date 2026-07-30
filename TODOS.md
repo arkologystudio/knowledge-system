@@ -1,5 +1,22 @@
 # TODOS
 
+## Test-runner honesty (filed v0.43.0.14)
+
+- [ ] **P2 — a wedged shard should be impossible to mistake for a smaller green run.**
+  Partly fixed in v0.43.0.14 (`scripts/run-unit-parallel.sh` now leads with
+  `⚠️ INCOMPLETE RUN`, tags the summary `wedged=N/M`, and raised the default cap
+  1500s → 3600s). The residual gap: the per-shard `pass=` totals still come from
+  `bun_summary_count` over a truncated log, so a wedged shard contributes 0 and the
+  aggregate silently under-reports rather than being marked unknown. Consider
+  emitting the expected test count per shard up front (the `--dry-run-list` file
+  count is already available) and asserting the executed count matches, so coverage
+  loss is detected structurally rather than inferred from a sentinel file. This
+  matters because it is the same class as the sync incident that prompted it: a
+  process that stops doing its job while still reporting success. Real cost: two
+  full-suite runs during the v0.43.0.12/.13 work were read as complete when each
+  had silently skipped thousands of tests. Where: `scripts/run-unit-parallel.sh`,
+  `docs/TESTING.md`.
+
 ## Pre-existing test failures (filed v0.43.0.12, PR: source clone-state drift)
 
 Surfaced by the /ship gate on `fix/source-remote-url-drift-detection` and proven

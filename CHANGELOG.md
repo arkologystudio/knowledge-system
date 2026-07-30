@@ -2,6 +2,39 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.14] - 2026-07-30
+
+**A truncated test run no longer looks like a green one.** Same failure class as
+the sync stall two releases ago: a process stops doing its job while still
+reporting success.
+
+When a test shard exceeded its wallclock cap it was killed, its tests never ran,
+and the reported `pass=` total silently shrank. The banner still led with a
+failure count, so a run that had skipped thousands of tests read as a smaller
+clean run. Two full-suite runs during the v0.43.0.12/.13 work were misread this
+way.
+
+### Fixed
+- `scripts/run-unit-parallel.sh` now leads its banner with
+  `⚠️ INCOMPLETE RUN — N of M shard(s) were KILLED`, states plainly that the pass
+  total is not a full-suite result, prints the exact re-run command, and tags the
+  summary line `INCOMPLETE ... wedged=N/M`. Coverage loss is reported before, and
+  distinctly from, test failures — they are different things and the quiet one is
+  more dangerous.
+- Default per-shard cap raised 1500s → 3600s. The old value was calibrated
+  against a smaller suite at the default intra-shard concurrency of 4, and
+  false-killed shards on both a fuller suite (13,696 tests) and any run at
+  reduced concurrency — which is exactly what you do when 16 concurrent PGLite
+  WASM instances exhaust memory. A complete 4-shard run at `--max-concurrency 2`
+  takes ~2731s, well past the old cap.
+- `docs/TESTING.md` corrected: it documented the cap as 600s and described
+  wedging as benignly proceeding with other shards' results.
+
+A residual gap is filed as P2 in TODOS.md: per-shard totals are still derived
+from the truncated log, so a wedged shard contributes 0 rather than being marked
+unknown. Detecting that structurally (expected vs executed count) is the durable
+fix.
+
 ## [0.43.0.13] - 2026-07-29
 
 **One lock for every git operation on a source clone.** v0.43.0.12 made a blind
