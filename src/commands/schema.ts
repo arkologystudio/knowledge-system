@@ -963,6 +963,21 @@ async function runStatsCmd(args: string[]): Promise<void> {
         console.log(`  ${dp.type.padEnd(20)} ${dp.prefix}`);
       }
     }
+    if (result.undeclared_types.length > 0) {
+      const pages = result.undeclared_types.reduce((n, u) => n + u.page_count, 0);
+      console.log(`\nUndeclared types (in use but not declared) — ${result.undeclared_types.length} type(s), ${pages} page(s):`);
+      for (const u of result.undeclared_types) {
+        console.log(`  ${u.type.padEnd(20)} ${String(u.page_count).padStart(5)}  [${u.classification}]`);
+        if (u.example_slugs.length > 0) {
+          console.log(`    e.g. ${u.example_slugs.join(', ')}`);
+        }
+      }
+      console.log(`\nThese pages store, embed and retrieve normally — this is drift, not breakage.`);
+      console.log(`To declare them: \`gbrain schema fork <active-pack> <new>\` then \`gbrain schema add-type\`.`);
+      console.log(`Use fork, NOT init — \`extends\` does not merge parent page_types yet (TODOS T20),`);
+      console.log(`so an init'd pack activates with zero declared types.`);
+      console.log(`To leave them undeclared, record that in docs/architecture/schema-packs.md.`);
+    }
   });
 }
 

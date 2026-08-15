@@ -849,9 +849,13 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   //   schema_pack_active        — active pack resolves cleanly
   //   schema_pack_consistency   — % of pages typed against active pack
   //   schema_pack_source_drift  — per-source pack divergence
+  //   schema_undeclared_types   — types in use that the pack never declared
+  //                               (the inverse of schema_pack_consistency;
+  //                               warn-only, see the function's header)
   checks.push(await checkSchemaPackActive(engine));
   checks.push(await checkSchemaPackConsistency(engine));
   checks.push(await checkSchemaPackSourceDrift(engine));
+  checks.push(await checkSchemaUndeclaredTypes(engine));
 
   // 7. v0.32.3 search-lite mode + per-key drift surface.
   checks.push(await checkSearchMode(engine));
@@ -8110,6 +8114,87 @@ async function checkSchemaPackConsistency(engine: BrainEngine): Promise<Check> {
   } catch (e) {
     return {
       name: 'schema_pack_consistency',
+      status: 'ok',
+      message: `Skipped: ${(e as Error).message}`,
+    };
+  }
+}
+
+/**
+ * schema_undeclared_types — the inverse of `schema_pack_consistency`.
+ *
+ * `schema_pack_consistency` asks "how many pages have NO type?"; this asks
+ * "how many pages carry a type the active pack never declared?". Those pages
+ * work fine — they store, chunk, embed and retrieve normally — so nothing here
+ * ever fails; the worst status is `warn`. The value is that the divergence
+ * stops being silent: a brain can run for months with a quarter of its corpus
+ * typed outside its pack and no surface says so.
+ *
+ * Warn threshold is `primitive_name` presence OR >=5% of typed pages, so a
+ * brain that has deliberately settled on a few undeclared types reports `ok`
+ * with the count rather than nagging forever (the classify-don't-just-flag
+ * requirement). `primitive_name` always warns because typing a page with a
+ * bare primitive is a filing mistake in every pack.
+ */
+async function checkSchemaUndeclaredTypes(engine: BrainEngine): Promise<Check> {
+  try {
+    const { runStatsCore } = await import('../core/schema-pack/stats.ts');
+    const ctx = { engine, config: {}, logger: console, dryRun: false, remote: false } as never;
+    const stats = await runStatsCore(ctx, {});
+    if (stats.pack_identity === null) {
+      // No pack resolved — schema_pack_active already reports that; saying it
+      // twice would double-penalize the same root cause.
+      return { name: 'schema_undeclared_types', status: 'ok', message: 'No active pack resolved — undeclared-type drift N/A.' };
+    }
+    const undeclared = stats.undeclared_types;
+    if (undeclared.length === 0) {
+      return {
+        name: 'schema_undeclared_types',
+        status: 'ok',
+        message: `Every type in use is declared by ${stats.pack_identity}.`,
+      };
+    }
+    const pages = undeclared.reduce((n, u) => n + u.page_count, 0);
+    const typed = stats.aggregate.typed_pages;
+    const pct = typed > 0 ? pages / typed : 0;
+    const primitives = undeclared.filter((u) => u.classification === 'primitive_name');
+    const top = undeclared
+      .slice(0, 5)
+      .map((u) => `${u.type} (${u.page_count})`)
+      .join(', ');
+    const details = {
+      pack_identity: stats.pack_identity,
+      undeclared_type_count: undeclared.length,
+      undeclared_page_count: pages,
+      typed_page_count: typed,
+      undeclared_types: undeclared,
+    };
+    if (primitives.length > 0 || pct >= 0.05) {
+      const primitiveNote = primitives.length > 0
+        ? ` ${primitives.map((p) => p.type).join(', ')} ${primitives.length === 1 ? 'is a pack primitive' : 'are pack primitives'}, not a page_type — likely a filing mistake.`
+        : '';
+      return {
+        name: 'schema_undeclared_types',
+        status: 'warn',
+        message:
+          `${undeclared.length} type(s) in use are not declared by ${stats.pack_identity}: ${top}` +
+          `${undeclared.length > 5 ? ', …' : ''} — ${pages} of ${typed} typed pages (${(pct * 100).toFixed(1)}%).` +
+          `${primitiveNote}` +
+          ` These pages retrieve normally; this is drift, not breakage. Run \`gbrain schema stats\` for the full list,` +
+          ` then either declare them (\`gbrain schema fork <pack> <new>\` + \`gbrain schema add-type\`) or record the` +
+          ` decision to leave them undeclared.`,
+        details,
+      };
+    }
+    return {
+      name: 'schema_undeclared_types',
+      status: 'ok',
+      message: `${undeclared.length} undeclared type(s) in use (${pages} of ${typed} typed pages, ${(pct * 100).toFixed(1)}%) — under the 5% warn threshold.`,
+      details,
+    };
+  } catch (e) {
+    return {
+      name: 'schema_undeclared_types',
       status: 'ok',
       message: `Skipped: ${(e as Error).message}`,
     };

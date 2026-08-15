@@ -354,3 +354,185 @@ describe('reload_schema_pack', () => {
     expect(result.invalidated).toContain('foo');
   });
 });
+
+// ── Pack lifecycle over MCP (read trio + fork) ────────────────────────
+//
+// The point of `schema_fork_pack` is that `schema_apply_mutations` requires
+// a NON-BUNDLED pack, and a default install (bundled pack, no user packs)
+// has no MCP path to obtain one — so the exposed write tool could never
+// succeed. These tests pin that the fork→mutate loop actually closes, and
+// that fork is a COPY (init-style empty packs would blank type resolution
+// on activation, since `extends` doesn't merge parent types — TODOS T20).
+
+describe('schema lifecycle op declarations', () => {
+  it('the read trio is read scope, NOT localOnly', () => {
+    for (const name of ['schema_validate_pack', 'schema_show_pack', 'schema_diff_packs']) {
+      expect(operationsByName[name]!.scope).toBe('read');
+      expect(operationsByName[name]!.localOnly).toBeUndefined();
+    }
+  });
+
+  it('schema_fork_pack is admin + mutating, NOT localOnly (agents must reach it)', () => {
+    const op = operationsByName.schema_fork_pack!;
+    expect(op.scope).toBe('admin');
+    expect(op.mutating).toBe(true);
+    expect(op.localOnly).toBeUndefined();
+  });
+
+  it('no schema_use_pack op exists — activation stays local-only', () => {
+    expect(operationsByName.schema_use_pack).toBeUndefined();
+  });
+});
+
+describe('schema_validate_pack', () => {
+  it('reports ok with counts for a valid pack', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      seedPack('mine');
+      const r = await operationsByName.schema_validate_pack!.handler(ctxOf(), { pack: 'mine' }) as
+        { ok: boolean; pack: string; page_types: number };
+      expect(r.ok).toBe(true);
+      expect(r.pack).toBe('mine');
+      expect(r.page_types).toBe(1);
+    });
+  });
+
+  it('returns ok:false DATA (not a throw) for an invalid manifest', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      const dir = join(tmpDir, '.gbrain', 'schema-packs', 'broken');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'pack.yaml'), 'api_version: gbrain-schema-pack-v1\nname: broken\n', 'utf-8');
+      const r = await operationsByName.schema_validate_pack!.handler(ctxOf(), { pack: 'broken' }) as
+        { ok: boolean; error: string };
+      expect(r.ok).toBe(false);
+      expect(r.error).toBe('invalid_manifest');
+    });
+  });
+
+  it('resolves bundled packs, not just user-installed ones', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      const r = await operationsByName.schema_validate_pack!.handler(ctxOf(), { pack: 'gbrain-base' }) as
+        { ok: boolean; page_types: number };
+      expect(r.ok).toBe(true);
+      expect(r.page_types).toBeGreaterThan(0);
+    });
+  });
+
+  it('reports pack_not_found for an unknown pack', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      const r = await operationsByName.schema_validate_pack!.handler(ctxOf(), { pack: 'nope' }) as
+        { ok: boolean; error: string };
+      expect(r.ok).toBe(false);
+      expect(r.error).toBe('pack_not_found');
+    });
+  });
+});
+
+describe('schema_show_pack', () => {
+  it('returns the full manifest', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      seedPack('mine');
+      const r = await operationsByName.schema_show_pack!.handler(ctxOf(), { pack: 'mine' }) as
+        { pack: string; manifest: { page_types: Array<{ name: string }> } };
+      expect(r.pack).toBe('mine');
+      expect(r.manifest.page_types.map((t) => t.name)).toEqual(['person']);
+    });
+  });
+});
+
+describe('schema_diff_packs', () => {
+  it('partitions declared types into only_in_a / only_in_b / common', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      seedPack('mine');
+      const r = await operationsByName.schema_diff_packs!.handler(ctxOf(), { a: 'gbrain-base', b: 'mine' }) as
+        { only_in_a: string[]; only_in_b: string[]; common: string[] };
+      // gbrain-base declares `person`; the seeded pack declares only that.
+      expect(r.common).toEqual(['person']);
+      expect(r.only_in_b).toEqual([]);
+      expect(r.only_in_a.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('reports pack_not_found naming the missing side', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      const r = await operationsByName.schema_diff_packs!.handler(ctxOf(), { a: 'gbrain-base', b: 'nope' }) as
+        { error: string; pack: string };
+      expect(r.error).toBe('pack_not_found');
+      expect(r.pack).toBe('nope');
+    });
+  });
+});
+
+describe('schema_fork_pack', () => {
+  it('copies every declared type from the source pack', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      const base = await operationsByName.schema_validate_pack!.handler(ctxOf(), { pack: 'gbrain-base' }) as
+        { page_types: number };
+      const r = await operationsByName.schema_fork_pack!.handler(ctxOf(), { from: 'gbrain-base', to: 'my-fork' }) as
+        { to: string; page_types: number; activated: boolean; path: string };
+      expect(r.to).toBe('my-fork');
+      // The load-bearing assertion: a fork starts equivalent to its source.
+      // An init-style empty pack would report 0 here and blank type
+      // resolution for the whole corpus on activation (TODOS T20).
+      expect(r.page_types).toBe(base.page_types);
+      expect(r.activated).toBe(false);
+    });
+  });
+
+  it('makes schema_apply_mutations reachable — the whole point', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_AUDIT_DIR: auditDir }, async () => {
+      // Before: the only pack is bundled, and mutating it is refused.
+      const refused = await operationsByName.schema_apply_mutations!.handler(ctxOf(), {
+        pack: 'gbrain-base',
+        mutations: [{ op: 'add_type', name: 'strategy', primitive: 'concept', prefix: 'wiki/strategy/' }],
+      }) as { error?: string; code?: string };
+      expect(refused.error ?? refused.code).toBeDefined();
+
+      // Fork over MCP, then the same mutation succeeds.
+      await operationsByName.schema_fork_pack!.handler(ctxOf(), { from: 'gbrain-base', to: 'my-fork' });
+      const applied = await operationsByName.schema_apply_mutations!.handler(ctxOf(), {
+        pack: 'my-fork',
+        mutations: [{ op: 'add_type', name: 'strategy', primitive: 'concept', prefix: 'wiki/strategy/' }],
+      }) as { error?: string };
+      expect(applied.error).toBeUndefined();
+
+      const shown = await operationsByName.schema_show_pack!.handler(ctxOf(), { pack: 'my-fork' }) as
+        { manifest: { page_types: Array<{ name: string }> } };
+      expect(shown.manifest.page_types.map((t) => t.name)).toContain('strategy');
+    });
+  });
+
+  it('refuses to overwrite an existing pack', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      seedPack('mine');
+      const r = await operationsByName.schema_fork_pack!.handler(ctxOf(), { from: 'gbrain-base', to: 'mine' }) as
+        { error: string };
+      expect(r.error).toBe('pack_exists');
+    });
+  });
+
+  it('refuses a bundled pack name as the fork target', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      const r = await operationsByName.schema_fork_pack!.handler(ctxOf(), { from: 'gbrain-base', to: 'gbrain-base' }) as
+        { error: string };
+      expect(r.error).toBe('name_reserved');
+    });
+  });
+
+  it('rejects path-traversal and other non-slug names', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      for (const to of ['../escape', '/abs', 'Has Spaces', '..', 'UPPER']) {
+        const r = await operationsByName.schema_fork_pack!.handler(ctxOf(), { from: 'gbrain-base', to }) as
+          { error: string };
+        expect(r.error).toBe('invalid_pack_name');
+      }
+    });
+  });
+
+  it('reports pack_not_found for an unknown source', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir }, async () => {
+      const r = await operationsByName.schema_fork_pack!.handler(ctxOf(), { from: 'nope', to: 'my-fork' }) as
+        { error: string };
+      expect(r.error).toBe('pack_not_found');
+    });
+  });
+});
