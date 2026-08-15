@@ -2,6 +2,32 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.15] - 2026-08-15
+
+**Unwedges CI.** `test/cli-exit-verdict-pin.test.ts` — the structural guard that
+every exit-code write in `src/` routes through `setCliExitVerdict` — has been red
+on master since v0.43.0.6, so every branch inherited a red shard and a real
+regression in that guard would have been indistinguishable from the standing one.
+
+### Fixed
+- `src/mirror/cli.ts` routes both exit writes through `setCliExitVerdict` instead
+  of assigning `process.exitCode` directly. Fixing the file rather than adding it
+  to the guard's exemption list — an exemption list is how that guard rots.
+
+### Corrected
+- The TODO that filed this called it a P0: "`gbrain mirror` reports success when it
+  fails." That was overstated. There is no `gbrain mirror` subcommand — mirror is a
+  standalone entrypoint (`bun run mirror`), nothing under `src/mirror/` imports the
+  exit seam, and `flushThenExit` therefore never runs in that process, so the raw
+  write survived. Verified before changing anything: a failing run already exited 1.
+  This was a red structural guard, not a lost failure signal. The fix is still
+  correct — identical at runtime today, and right if mirror ever moves under the
+  gbrain CLI — but it should not be read as recovering a broken exit code.
+
+To take advantage of v0.43.0.15: nothing to do. `bun run mirror` behaves exactly as
+before; the change is that CI can now tell a new raw-exit-write regression from the
+standing one.
+
 ## [0.43.0.14] - 2026-07-30
 
 **A truncated test run no longer looks like a green one.** Same failure class as
