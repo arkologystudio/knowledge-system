@@ -5,6 +5,21 @@
 // a "this type has no content" signal that helps agents spot
 // mis-declared paths).
 //
+// Undeclared-type detection is the MIRROR IMAGE of dead prefixes, and
+// the reason it lives here rather than behind its own verb. Dead
+// prefixes answer "what does the pack declare that the corpus doesn't
+// use?"; `undeclared_types` answers "what does the corpus use that the
+// pack doesn't declare?". Both are pack-vs-corpus divergence; reporting
+// them from one call means an agent can't read half the picture and
+// conclude the schema is clean.
+//
+// Note the asymmetry with `schema_review_orphans`, which is NOT the same
+// question: orphans are pages with NO type at all (`type IS NULL OR
+// type = ''`). An undeclared type is a page that is confidently typed
+// with a name the active pack never declared. Those pages store, chunk,
+// embed and retrieve normally — nothing is broken — so this is reported
+// as drift, never as an error.
+//
 // Multi-source aware: accepts `sourceIds` (federated read) OR
 // `sourceId` (single) OR nothing (aggregate across all sources). Uses
 // the same WHERE shape as the rest of the read-path codebase.
@@ -17,6 +32,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { loadActivePackBestEffort } from './best-effort.ts';
+import { PACK_PRIMITIVES } from './manifest-v1.ts';
 import type { OperationContext } from '../operations.ts';
 
 export interface StatsOpts {
@@ -49,6 +65,38 @@ export interface DeadPrefixHint {
   prefix: string;
 }
 
+/**
+ * How an undeclared type relates to the active pack. Classification (not
+ * a bare flag) is deliberate: undeclared types are legal and work fine at
+ * runtime, so a check that only flags them produces permanent noise on any
+ * brain that uses them on purpose. The class tells the operator WHICH kind
+ * of divergence they're looking at, and therefore whether to act.
+ *
+ *   - `primitive_name` — the type name is one of the five pack primitives
+ *     (`entity`, `media`, `temporal`, `annotation`, `concept`) but is not
+ *     declared as a page_type. Almost always a filing mistake: the page was
+ *     typed with the primitive instead of a type that extends it. Highest
+ *     signal of the three.
+ *   - `aliased` — not declared as a page_type, but some declared type lists
+ *     it in `aliases[]`, so query expansion already reaches it. Low urgency;
+ *     `schema_lint` flags the dangling alias separately.
+ *   - `undeclared` — in use, unknown to the pack in every respect. The
+ *     ordinary case: either an intentional local type the pack should
+ *     declare, or a typo.
+ */
+export type UndeclaredTypeClass = 'primitive_name' | 'aliased' | 'undeclared';
+
+export interface UndeclaredTypeHint {
+  /** Type name as it appears in the DB `pages.type` column. */
+  type: string;
+  /** Live page count for this type within the scope (soft-deletes excluded). */
+  page_count: number;
+  /** Up to 3 slugs, lexically first, so an operator can go look at one. */
+  example_slugs: string[];
+  /** Which kind of divergence this is — see UndeclaredTypeClass. */
+  classification: UndeclaredTypeClass;
+}
+
 export interface StatsResult {
   schema_version: 1;
   /** Pack identity at stats time (null when no pack loaded). */
@@ -59,6 +107,16 @@ export interface StatsResult {
   per_source: PerSourceStats[];
   /** Pack-declared prefixes that match zero pages — likely mis-declared. */
   dead_prefixes: DeadPrefixHint[];
+  /**
+   * Types in use in the corpus that the active pack does not declare — the
+   * inverse of `dead_prefixes`. Sorted by page_count desc, ties by name asc
+   * (same ordering rule as `by_type`).
+   *
+   * Empty when no pack loads: without a declared set there is nothing to be
+   * undeclared AGAINST, and reporting every type in the corpus as undeclared
+   * would be actively misleading. Same fail-quiet contract as `dead_prefixes`.
+   */
+  undeclared_types: UndeclaredTypeHint[];
 }
 
 interface RawCountRow {
@@ -214,6 +272,82 @@ async function detectDeadPrefixes(
 }
 
 /**
+ * Undeclared-type detection — the inverse of dead-prefix detection.
+ *
+ * Counts come from `aggregate.by_type`, which the caller already computed
+ * from the single GROUP BY read, so this adds NO per-type count query. The
+ * only extra read is one bounded example-slug lookup, and only when at
+ * least one undeclared type exists — a pack-clean brain pays nothing.
+ *
+ * Example slugs use ROW_NUMBER() rather than a query-per-type so a corpus
+ * with many undeclared types stays one round trip. Both engines are real
+ * Postgres, so the window function is parity-safe.
+ */
+async function detectUndeclaredTypes(
+  engine: BrainEngine,
+  pack: { manifest: { page_types: ReadonlyArray<{ name: string; aliases?: ReadonlyArray<string> }> } },
+  byType: TypeStats[],
+  opts: StatsOpts,
+): Promise<UndeclaredTypeHint[]> {
+  const declared = new Set(pack.manifest.page_types.map((t) => t.name));
+  const missing = byType.filter((t) => !declared.has(t.type));
+  if (missing.length === 0) return [];
+
+  // Alias targets across every declared type — a type reachable through the
+  // closure graph is a materially weaker finding than one nothing knows about.
+  const aliased = new Set<string>();
+  for (const t of pack.manifest.page_types) {
+    for (const a of t.aliases ?? []) aliased.add(a);
+  }
+  const primitives = new Set<string>(PACK_PRIMITIVES);
+
+  // One bounded read for example slugs across every undeclared type.
+  const names = missing.map((t) => t.type);
+  let where = `WHERE deleted_at IS NULL AND type = ANY($1::text[])`;
+  const params: unknown[] = [names];
+  if (opts.sourceIds && opts.sourceIds.length > 0) {
+    where += ` AND source_id = ANY($2::text[])`;
+    params.push(opts.sourceIds);
+  } else if (opts.sourceId) {
+    where += ` AND source_id = $2`;
+    params.push(opts.sourceId);
+  }
+  const examples = new Map<string, string[]>();
+  try {
+    const rows = await engine.executeRaw<{ type: string; slug: string }>(
+      `SELECT type, slug FROM (
+         SELECT type, slug, ROW_NUMBER() OVER (PARTITION BY type ORDER BY slug) AS rn
+         FROM pages ${where}
+       ) ranked
+       WHERE rn <= 3
+       ORDER BY type, slug`,
+      params,
+    );
+    for (const r of rows) {
+      const list = examples.get(r.type) ?? [];
+      list.push(r.slug);
+      examples.set(r.type, list);
+    }
+  } catch {
+    // Example slugs are a convenience, not the finding. A failed lookup
+    // must not suppress the drift report itself.
+  }
+
+  return missing
+    .map((t) => ({
+      type: t.type,
+      page_count: t.count,
+      example_slugs: examples.get(t.type) ?? [],
+      classification: primitives.has(t.type)
+        ? ('primitive_name' as const)
+        : aliased.has(t.type)
+          ? ('aliased' as const)
+          : ('undeclared' as const),
+    }))
+    .sort((a, b) => b.page_count - a.page_count || a.type.localeCompare(b.type));
+}
+
+/**
  * Pure core for `gbrain schema stats` (CLI) AND `schema_stats` MCP op.
  * Returns the StatsResult ready for human-formatter, JSON output, or
  * operation envelope wrapping.
@@ -226,13 +360,15 @@ export async function runStatsCore(
   const per_source = aggregateRows(rows);
   const aggregate = mergeAggregate(per_source);
 
-  // Pack identity + dead-prefix scan — best-effort.
+  // Pack identity + both divergence scans — best-effort.
   let pack_identity: string | null = null;
   let dead_prefixes: DeadPrefixHint[] = [];
+  let undeclared_types: UndeclaredTypeHint[] = [];
   const pack = await loadActivePackBestEffort(ctx);
   if (pack) {
     pack_identity = pack.identity;
     dead_prefixes = await detectDeadPrefixes(ctx.engine, pack, opts);
+    undeclared_types = await detectUndeclaredTypes(ctx.engine, pack, aggregate.by_type, opts);
   }
 
   return {
@@ -241,5 +377,6 @@ export async function runStatsCore(
     aggregate,
     per_source,
     dead_prefixes,
+    undeclared_types,
   };
 }

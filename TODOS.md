@@ -1,5 +1,41 @@
 # TODOS
 
+## Schema-pack drift + lifecycle (filed v0.43.0.16)
+
+- [ ] **P1 — extends-chain merging is the blocker for the rest of the schema
+  lifecycle surface.** Upstream files this as T20; restating it here because
+  v0.43.0.16 hit it as a live trap, not a nicety. `resolvePack()`
+  (`src/core/schema-pack/registry.ts`) walks the `extends` chain only to enforce
+  the depth cap and build the cache-invalidation snapshot, then resolves the CHILD
+  manifest verbatim. So `gbrain schema init` — which writes `page_types: []` plus
+  `extends: gbrain-base` — produces a pack that resolves with **zero** declared
+  page types, and `gbrain schema use` on it would make an entire corpus undeclared
+  in one step. Two things are blocked on this: exposing `schema_init_pack` over MCP
+  (v0.43.0.16 deliberately shipped `schema_fork_pack` instead, since fork copies the
+  manifest wholesale), and exposing `schema_use_pack` at all — a preview/apply
+  blast-radius token computed against a possibly-empty declared set is a footgun
+  with a confirmation dialog on it. Until this lands, `fork` is the only safe way to
+  author a pack. Where: `src/core/schema-pack/registry.ts`,
+  `src/commands/schema.ts:runInitCmd`, `docs/architecture/schema-packs.md`.
+
+- [ ] **P2 — pages typed with a bare pack primitive should be retyped, not
+  declared.** The new `undeclared_types` check classifies these as
+  `primitive_name`, and the doctor check warns on them regardless of share, because
+  they are a filing mistake under any pack policy: `entity`, `media`, `temporal`,
+  `annotation` and `concept` are the primitives that page_types *extend*, so a page
+  typed with one directly has no page type at all. On the brain that surfaced this,
+  65 pages carry `type: entity`. The fix is a retype pass
+  (`src/core/schema-pack/retype.ts` already has the machinery), not a pack change.
+  Not blocking — those pages store and retrieve normally.
+
+- [ ] **P3 — decide whether undeclared-type drift belongs in `gbrain advisor`.**
+  v0.43.0.16 surfaced it in `schema_stats` + `run_doctor` and deliberately did NOT
+  add an advisor collector. Rationale: the advisor runs at session start and ranks
+  "high-leverage actions", but an undeclared type needs a one-time policy decision,
+  not a recurring action — and the doctor check already carries the signal with a
+  threshold. Revisit if operators report they never run `gbrain doctor`. Where:
+  `src/core/advisor/collect-schema-pack.ts`.
+
 ## Test-runner honesty (filed v0.43.0.14)
 
 - [ ] **P2 — a wedged shard should be impossible to mistake for a smaller green run.**

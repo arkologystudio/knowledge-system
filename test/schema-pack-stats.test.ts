@@ -69,13 +69,16 @@ async function seedPage(slug: string, opts: { type?: string; sourceId?: string; 
   );
 }
 
-function seedTinyPack(packName: string, types: Array<{ name: string; prefix: string }>): void {
+function seedTinyPack(packName: string, types: Array<{ name: string; prefix: string; aliases?: string[] }>): void {
   const dir = join(tmpDir, packName);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, 'pack.yaml');
   let body = `api_version: gbrain-schema-pack-v1\nname: ${packName}\nversion: 1.0.0\ndescription: ""\ngbrain_min_version: 0.38.0\nextends: null\nborrow_from: []\npage_types:\n`;
   for (const t of types) {
-    body += `  - name: ${t.name}\n    primitive: entity\n    path_prefixes:\n      - ${t.prefix}\n    aliases: []\n    extractable: false\n    expert_routing: false\n`;
+    const aliases = (t.aliases ?? []).length > 0
+      ? `\n${(t.aliases ?? []).map((a) => `      - ${a}`).join('\n')}`
+      : ' []';
+    body += `  - name: ${t.name}\n    primitive: entity\n    path_prefixes:\n      - ${t.prefix}\n    aliases:${aliases}\n    extractable: false\n    expert_routing: false\n`;
   }
   body += `link_types: []\nfrontmatter_links: []\ntakes_kinds:\n  - fact\n  - take\n  - bet\n  - hunch\nenrichable_types: []\nfiling_rules: []\n`;
   writeFileSync(path, body, 'utf-8');
@@ -187,6 +190,140 @@ describe('runStatsCore — dead-prefix detection', () => {
       const result = await runStatsCore(ctxOf());
       expect(result.pack_identity).toBeNull();
       expect(result.dead_prefixes).toEqual([]);
+    });
+  });
+});
+
+describe('runStatsCore — undeclared-type detection', () => {
+  it('reports types in use that the pack does not declare, with counts + examples', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/' }]);
+      await seedPage('people/alice', { type: 'person', sourcePath: 'people/alice.md' });
+      await seedPage('strategy/wedges', { type: 'strategy', sourcePath: 'strategy/wedges.md' });
+      await seedPage('strategy/moat', { type: 'strategy', sourcePath: 'strategy/moat.md' });
+      const result = await runStatsCore(ctxOf());
+      expect(result.undeclared_types).toEqual([
+        {
+          type: 'strategy',
+          page_count: 2,
+          example_slugs: ['strategy/moat', 'strategy/wedges'],
+          classification: 'undeclared',
+        },
+      ]);
+    });
+  });
+
+  it('is the exact inverse of the declared set — declared-and-used types never appear', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [
+        { name: 'person', prefix: 'people/' },
+        { name: 'company', prefix: 'companies/' },
+      ]);
+      await seedPage('people/alice', { type: 'person', sourcePath: 'people/alice.md' });
+      await seedPage('companies/acme', { type: 'company', sourcePath: 'companies/acme.md' });
+      const result = await runStatsCore(ctxOf());
+      expect(result.undeclared_types).toEqual([]);
+      // Arithmetic reconciliation: in-use == declared-in-use + undeclared.
+      const inUse = result.aggregate.by_type.length;
+      expect(inUse).toBe(2 + result.undeclared_types.length);
+    });
+  });
+
+  it('classifies a bare pack primitive as primitive_name', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/' }]);
+      await seedPage('x', { type: 'entity' });
+      const result = await runStatsCore(ctxOf());
+      expect(result.undeclared_types.map((u) => [u.type, u.classification])).toEqual([
+        ['entity', 'primitive_name'],
+      ]);
+    });
+  });
+
+  it('classifies an alias target of a declared type as aliased', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/', aliases: ['researcher'] }]);
+      await seedPage('x', { type: 'researcher' });
+      const result = await runStatsCore(ctxOf());
+      expect(result.undeclared_types.map((u) => [u.type, u.classification])).toEqual([
+        ['researcher', 'aliased'],
+      ]);
+    });
+  });
+
+  it('sorts by page_count desc, ties by name asc', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/' }]);
+      await seedPage('a', { type: 'zeta' });
+      await seedPage('b', { type: 'alpha' });
+      await seedPage('c', { type: 'beta' });
+      await seedPage('d', { type: 'beta' });
+      const result = await runStatsCore(ctxOf());
+      expect(result.undeclared_types.map((u) => u.type)).toEqual(['beta', 'alpha', 'zeta']);
+    });
+  });
+
+  it('excludes soft-deleted pages from counts and examples', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/' }]);
+      await seedPage('live', { type: 'strategy' });
+      await seedPage('aaa-gone', { type: 'strategy', deleted: true });
+      const result = await runStatsCore(ctxOf());
+      expect(result.undeclared_types[0]!.page_count).toBe(1);
+      expect(result.undeclared_types[0]!.example_slugs).toEqual(['live']);
+    });
+  });
+
+  it('respects sourceId scoping', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/' }]);
+      await seedPage('a', { type: 'strategy', sourceId: 'src-a' });
+      await seedPage('b', { type: 'strategy', sourceId: 'src-b' });
+      const result = await runStatsCore(ctxOf(), { sourceId: 'src-a' });
+      expect(result.undeclared_types[0]!.page_count).toBe(1);
+      expect(result.undeclared_types[0]!.example_slugs).toEqual(['a']);
+    });
+  });
+
+  it('respects federated sourceIds scoping', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/' }]);
+      await seedPage('a', { type: 'strategy', sourceId: 'src-a' });
+      await seedPage('b', { type: 'strategy', sourceId: 'src-b' });
+      await seedPage('c', { type: 'strategy', sourceId: 'src-c' });
+      const result = await runStatsCore(ctxOf(), { sourceIds: ['src-a', 'src-b'] });
+      expect(result.undeclared_types[0]!.page_count).toBe(2);
+      expect(result.undeclared_types[0]!.example_slugs).toEqual(['a', 'b']);
+    });
+  });
+
+  it('caps example_slugs at 3', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/' }]);
+      for (const s of ['s1', 's2', 's3', 's4', 's5']) await seedPage(s, { type: 'strategy' });
+      const result = await runStatsCore(ctxOf());
+      expect(result.undeclared_types[0]!.page_count).toBe(5);
+      expect(result.undeclared_types[0]!.example_slugs).toEqual(['s1', 's2', 's3']);
+    });
+  });
+
+  it('returns empty undeclared_types when pack load fails (no declared set to diff against)', async () => {
+    await withEnv({ GBRAIN_SCHEMA_PACK: 'never-installed' }, async () => {
+      __setPackLocatorForTests(() => null);
+      await seedPage('a', { type: 'strategy' });
+      const result = await runStatsCore(ctxOf());
+      expect(result.pack_identity).toBeNull();
+      expect(result.undeclared_types).toEqual([]);
+    });
+  });
+
+  it('does not count untyped pages as an undeclared type', async () => {
+    await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_SCHEMA_PACK: 'tiny' }, async () => {
+      seedTinyPack('tiny', [{ name: 'person', prefix: 'people/' }]);
+      await seedPage('a');  // untyped
+      const result = await runStatsCore(ctxOf());
+      expect(result.aggregate.untyped_pages).toBe(1);
+      expect(result.undeclared_types).toEqual([]);
     });
   });
 });

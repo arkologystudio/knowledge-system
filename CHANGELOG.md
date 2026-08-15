@@ -2,6 +2,65 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.16] - 2026-08-15
+
+**The schema pack could disagree with the corpus indefinitely and every surface
+read clean.** `schema_stats` already answered "what does the pack declare that
+nothing uses?" (`dead_prefixes`). Nothing answered the inverse — "what does the
+corpus use that the pack never declared?" — and `schema_review_orphans` doesn't
+cover it, because orphans are pages with *no* type. A page confidently typed
+outside the pack is invisible to both.
+
+On the brain that surfaced this, 9 of the 17 types in use were undeclared: 128 of
+445 pages, 28.8% of the corpus. Everything worked — undeclared types store, chunk,
+embed, query and retrieve normally — which is exactly why it went unnoticed.
+
+The related trap: `extends:` is recorded and depth-checked but does **not** merge
+the parent's `page_types`. A pack scaffolded by `gbrain schema init`
+(`page_types: []`, `extends: gbrain-base`) therefore resolves with *zero* declared
+types, and activating one would make an entire corpus undeclared at a stroke. The
+docs claimed inheritance worked. They no longer do.
+
+### Added
+- `schema_stats` returns `undeclared_types` — the mirror of `dead_prefixes` —
+  with `{type, page_count, example_slugs, classification}` per entry. Counts reuse
+  the existing grouped read; the only added query is one bounded example-slug
+  lookup, skipped entirely when nothing is undeclared. Surfaced in
+  `gbrain schema stats`.
+- `classification` distinguishes `primitive_name` (typed with a bare pack
+  primitive — a filing mistake in any pack), `aliased` (reachable through a
+  declared type's alias closure) and `undeclared`. Undeclared types are legal, so
+  a check that only flagged them would be permanent noise; the class is what makes
+  the finding actionable.
+- `schema_undeclared_types` doctor check. Warns on any `primitive_name`, or above
+  5% of typed pages; otherwise `ok` with the full list still in `details`, so a
+  brain that has deliberately settled on a few local types is not nagged forever.
+  Never fails — this is drift, not breakage.
+- Four schema-pack lifecycle MCP ops: `schema_validate_pack`, `schema_show_pack`,
+  `schema_diff_packs` (read) and `schema_fork_pack` (admin). This closes a
+  reachability gap: `schema_apply_mutations` requires a non-bundled pack, and a
+  default install has none, so the exposed write tool could never succeed. Fork —
+  not init — is what closes it, because a fork copies the source manifest wholesale
+  while an init-scaffolded pack declares nothing. Activation stays local-only:
+  there is no `schema_use_pack`, by design.
+
+### Fixed
+- `docs/architecture/schema-packs.md` claimed `extends: gbrain-base` "inherits
+  everything from base". It does not. The authoring guide now leads with `fork`
+  and explains why `init` is the wrong primitive until extends-merging lands.
+
+### Documented
+- A new "Undeclared types: frontmatter is authoritative, the pack is advisory"
+  section states the policy plainly: `gbrain schema explain <type>` exiting 1 means
+  *not declared*, not *invalid*. Declaring is an opt-in you make when you want
+  inference, extractability, expert routing or alias expansion — not housekeeping
+  owed to the pack.
+
+To take advantage of v0.43.0.16: run `gbrain schema stats` (or `gbrain doctor`) and
+read the new `undeclared_types` section. Anything classed `primitive_name` is worth
+retyping regardless of policy; for the rest, decide whether to declare them and
+record the decision — the ambiguity is the actual cost, not the drift.
+
 ## [0.43.0.15] - 2026-08-15
 
 **Unwedges CI.** `test/cli-exit-verdict-pin.test.ts` — the structural guard that

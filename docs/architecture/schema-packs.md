@@ -130,13 +130,28 @@ the agent maintains, not a hardcoded ceremony the user authors.
 
 ## Authoring your own pack
 
+**Use `fork`, not `init`.** `extends:` is parsed and depth-capped, but the
+parent's `page_types` are NOT merged into the child — `resolvePack()` resolves
+the child manifest verbatim (`registry.ts`, "Full extends-merging (child-wins)
+is the v0.41+ T20 follow-up"; tracked as T20 in `TODOS.md`). So a pack scaffolded
+by `gbrain schema init` — which writes `page_types: []` and `extends:
+gbrain-base` — activates with **zero declared page types**, not with base's 27.
+Every page in the brain becomes an undeclared type the moment you `use` it.
+
+`fork` copies the source manifest wholesale, so the fork really does start with
+everything the parent declared:
+
 ```bash
-gbrain schema init my-pack            # scaffolds ~/.gbrain/schema-packs/my-pack/pack.yaml
-$EDITOR ~/.gbrain/schema-packs/my-pack/pack.yaml
-gbrain schema validate my-pack        # check shape
-gbrain schema use my-pack             # activate
-gbrain schema active                  # confirm
+gbrain schema fork gbrain-base my-pack   # copies all of base into ~/.gbrain/schema-packs/my-pack/pack.json
+gbrain schema add-type my-pack strategy --primitive concept --prefix wiki/strategy/
+gbrain schema validate my-pack           # check shape
+gbrain schema diff gbrain-base my-pack   # confirm you only added what you meant to
+gbrain schema use my-pack                # activate
+gbrain schema active                     # confirm
 ```
+
+Reach for `init` only when you genuinely want to declare a type universe from
+scratch — and until T20 lands, expect to restate every type you still want.
 
 A minimal pack:
 
@@ -145,7 +160,8 @@ api_version: gbrain-schema-pack-v1
 name: my-pack
 version: 0.0.1
 gbrain_min_version: 0.39.0
-extends: gbrain-base   # inherits everything from base; add overrides below
+extends: gbrain-base   # recorded + depth-checked, but does NOT merge base's
+                       # page_types yet (T20) — see the fork note above
 description: |
   My personal pack.
 
@@ -169,6 +185,90 @@ frontmatter_links: []
 enrichable_types: []
 filing_rules: []
 ```
+
+## Undeclared types: frontmatter is authoritative, the pack is advisory
+
+**A page may carry a `type` the active pack does not declare, and that is
+supported, not a bug.** Undeclared types store, chunk, embed, query and
+retrieve normally. Nothing downstream requires a type to be declared.
+
+What the pack buys a type is *inference and opt-in behavior*, not permission
+to exist:
+
+| Declared in the pack | Undeclared |
+|---|---|
+| Path-prefix → type inference on import | `type:` must come from frontmatter |
+| `extractable` / `expert_routing` opt-ins available | Both effectively off |
+| Alias-closure query expansion | No expansion |
+| Appears in `schema_explain_type`, `schema_graph` | `schema explain <type>` exits 1 |
+| Counted by `dead_prefixes` when unused | Counted by `undeclared_types` when used |
+
+So the rule is: **frontmatter `type` is authoritative; the pack is advisory,
+and exists to infer types you did not write down and to switch on per-type
+features.** `gbrain schema explain <type>` exiting 1 means "this type is not
+declared", NOT "this type is invalid".
+
+### Seeing the drift
+
+Divergence runs in both directions, and `gbrain schema stats` reports both:
+
+- `dead_prefixes` — declared, but zero matching pages. *The pack claims
+  something the corpus doesn't have.*
+- `undeclared_types` — in use, but never declared. *The corpus has something
+  the pack doesn't claim.*
+
+`schema_review_orphans` answers neither: orphans are pages with **no type at
+all**. A page typed `strategy` is confidently typed — it is simply typed
+outside the pack — so it never appears there. That gap is why a brain can run
+for months at ~29% undeclared with every existing surface reporting clean.
+
+Each `undeclared_types` entry carries a `classification`, because "undeclared"
+alone is not actionable when undeclared types are legal:
+
+- `primitive_name` — the type is one of the five primitives (`entity`,
+  `media`, `temporal`, `annotation`, `concept`) rather than a page_type that
+  *extends* one. A filing mistake in any pack. Always worth fixing.
+- `aliased` — some declared type lists it in `aliases[]`, so query expansion
+  already reaches it. Low urgency; `schema lint` flags the dangling alias.
+- `undeclared` — unknown to the pack in every respect. Either a type worth
+  declaring, or a typo. Read `page_count` and `example_slugs` to tell which.
+
+The `schema_undeclared_types` doctor check warns when any `primitive_name`
+class is present, or when undeclared pages exceed 5% of typed pages. Below
+that it reports `ok` and still returns the full list in `details` — a brain
+that has deliberately settled on a couple of local types should not be nagged
+forever.
+
+### Choosing to declare, or not
+
+Both are defensible. What is NOT defensible is leaving it undecided — that
+ambiguity is what makes an agent stall mid-filing.
+
+**Declare it** when the type needs extractability, expert routing, alias
+expansion, or path-prefix inference; or when enough pages carry it that
+`schema stats` no longer reads as clean. Cost: `fork` + `add-type` + `use`
+(an activation event), plus ongoing pack maintenance, plus — until T20 — a
+fork that no longer tracks upstream `gbrain-base` changes.
+
+**Leave it** when the type is a filing convention only and every page already
+declares it in frontmatter. Cost: `schema explain` exits 1 for it, and it
+shows up in `undeclared_types` forever (as `ok`, under threshold).
+
+**gbrain's default is "leave it".** An undeclared type is not an error, and a
+brain is not expected to declare every type it uses. Declaring is an opt-in you
+make when you want one of the four behaviors in the table above — not
+housekeeping you owe the pack. A brain running at a steady share of undeclared
+types is in a supported state, which is why the doctor check thresholds instead
+of flagging.
+
+Record your brain's own choice as a page in the brain (a `decision` page is the
+natural home) so the next session reads it instead of re-deriving it.
+
+One case is not a policy choice: a type whose `classification` is
+`primitive_name` is a filing mistake under either policy. `entity`, `media`,
+`temporal`, `annotation` and `concept` are the primitives that page_types
+*extend*; a page typed with one directly has no page_type at all. Retype those
+pages rather than declaring the primitive.
 
 ## Recovery + revert
 

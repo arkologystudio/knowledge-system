@@ -136,6 +136,23 @@ function defaultPackLocator(name: string): string | null {
 }
 
 /**
+ * Resolve a pack name to its on-disk path through the SAME locator the
+ * extends-chain walk uses — bundled packs included, and honoring the test
+ * override.
+ *
+ * Exported because the MCP schema ops need pack-path resolution without
+ * loading + resolving the pack (validate must be able to report on a pack
+ * that does NOT parse). Open-coding the `~/.gbrain/schema-packs/<name>/pack.*`
+ * candidate loop at each call site silently misses every bundled pack except
+ * whichever one that site special-cased.
+ *
+ * Returns null when the pack is not on disk.
+ */
+export function resolvePackPathByName(name: string): string | null {
+  return _packLocator(name);
+}
+
+/**
  * Load + parse + validate a pack by name. Used by `resolvePack` to walk
  * the extends chain. Throws UnknownPackError when the pack isn't on disk.
  */

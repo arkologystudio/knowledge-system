@@ -4892,7 +4892,7 @@ const list_schema_packs: Operation = {
 
 const schema_stats: Operation = {
   name: 'schema_stats',
-  description: 'v0.40.6.0: per-type page counts + typed-coverage from the DB. Returns {schema_version:1, pack_identity, aggregate, per_source, dead_prefixes}. Multi-source aware via ctx.sourceId/allowedSources.',
+  description: 'v0.40.6.0: per-type page counts + typed-coverage from the DB. Returns {schema_version:1, pack_identity, aggregate, per_source, dead_prefixes, undeclared_types}. `dead_prefixes` = declared but unused; `undeclared_types` = used but undeclared (each {type, page_count, example_slugs, classification}) — the two halves of pack-vs-corpus drift. Multi-source aware via ctx.sourceId/allowedSources.',
   params: {},
   scope: 'read',
   handler: async (ctx) => {
@@ -5021,6 +5021,196 @@ const schema_review_orphans: Operation = {
     } catch {
       return { schema_version: 1, orphan_count: 0, orphans: [] };
     }
+  },
+};
+
+// ===================================================================
+// Pack lifecycle over MCP (read trio + fork).
+// ===================================================================
+// Closes the unreachable-write path: `schema_apply_mutations` requires a
+// NON-BUNDLED pack, but until now the only ways to obtain one — `gbrain
+// schema init` and `gbrain schema fork` — were CLI-only. In a default
+// install (bundled pack, `installed: []`) the exposed schema write tool
+// could therefore never succeed: an agent could read the schema surface
+// exhaustively and mutate nothing.
+//
+// `schema_fork_pack` — NOT an init equivalent — is the op that closes it,
+// and the choice is load-bearing. `extends:` is recorded and depth-checked
+// but does NOT merge the parent's page_types (`resolvePack`; TODOS T20),
+// so an init-scaffolded pack (`page_types: []`, `extends: gbrain-base`)
+// resolves with ZERO declared types. Exposing init over MCP would hand
+// agents a one-call path to a pack that blanks type resolution for the
+// whole corpus the moment someone activates it. Fork copies the source
+// manifest wholesale, so a fork of the active pack starts out equivalent
+// to it.
+//
+// Activation stays human-only by design. `gbrain schema use` rewrites
+// ~/.gbrain/config.json and re-resolves types across every page; it has
+// no MCP counterpart here and should not get one until T20 lands, because
+// a blast-radius preview computed against a possibly-empty declared set
+// is a footgun with a confirmation dialog on it.
+
+const schema_validate_pack: Operation = {
+  name: 'schema_validate_pack',
+  description: 'Validate a schema pack manifest on disk. Returns {ok:true, pack, version, path, page_types, link_types, takes_kinds} or {ok:false, error, code, message}. Read-only, no side effects. Reports on packs that do NOT parse (that is the point) — an invalid manifest is a normal result here, not a tool error.',
+  params: {
+    pack: { type: 'string', description: 'Pack name (default: the active pack)' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    const { resolvePackPathByName, resolveActivePackNameOnly } = await import('./schema-pack/load-active.ts');
+    const { loadPackFromFile } = await import('./schema-pack/loader.ts');
+    const { loadConfig } = await import('./config.ts');
+    const cfg = loadConfig();
+    const name = (p.pack as string | undefined)
+      ?? resolveActivePackNameOnly({ cfg, remote: ctx.remote ?? true, sourceId: ctx.sourceId }).pack_name;
+    const path = resolvePackPathByName(name);
+    if (!path) return { ok: false, error: 'pack_not_found', pack: name };
+    try {
+      const manifest = loadPackFromFile(path);
+      return {
+        schema_version: 1,
+        ok: true,
+        pack: manifest.name,
+        version: manifest.version,
+        path,
+        page_types: manifest.page_types.length,
+        link_types: manifest.link_types.length,
+        takes_kinds: manifest.takes_kinds.length,
+      };
+    } catch (e) {
+      // Invalid manifests are DATA here, not exceptions — an agent asking
+      // "is this pack valid?" must get an answer, not a tool failure.
+      const err = e as { code?: string; message?: string };
+      return {
+        schema_version: 1,
+        ok: false,
+        pack: name,
+        path,
+        error: 'invalid_manifest',
+        code: err.code ?? null,
+        message: err.message ?? String(e),
+      };
+    }
+  },
+};
+
+const schema_show_pack: Operation = {
+  name: 'schema_show_pack',
+  description: 'Full manifest of a schema pack as JSON. Returns {schema_version:1, pack, path, manifest}. Read-only. Differs from get_active_schema_pack (identity packet only) and schema_explain_type (one type) — this is the whole declared surface, for a named pack that need not be the active one.',
+  params: {
+    pack: { type: 'string', description: 'Pack name (default: the active pack)' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    const { resolvePackPathByName, resolveActivePackNameOnly } = await import('./schema-pack/load-active.ts');
+    const { loadPackFromFile } = await import('./schema-pack/loader.ts');
+    const { loadConfig } = await import('./config.ts');
+    const cfg = loadConfig();
+    const name = (p.pack as string | undefined)
+      ?? resolveActivePackNameOnly({ cfg, remote: ctx.remote ?? true, sourceId: ctx.sourceId }).pack_name;
+    const path = resolvePackPathByName(name);
+    if (!path) return { error: 'pack_not_found', pack: name };
+    try {
+      const manifest = loadPackFromFile(path);
+      return { schema_version: 1, pack: manifest.name, path, manifest };
+    } catch (e) {
+      return { error: 'invalid_manifest', pack: name, path, message: (e as Error).message };
+    }
+  },
+};
+
+const schema_diff_packs: Operation = {
+  name: 'schema_diff_packs',
+  description: 'Compare the declared page_types of two schema packs. Returns {schema_version:1, a, b, only_in_a, only_in_b, common}. Read-only. Use this BEFORE activating a fork to see exactly what the switch would add or drop — `extends` does not merge parent types (TODOS T20), so `only_in_a` on a base-vs-child diff is what activating the child would stop declaring.',
+  params: {
+    a: { type: 'string', required: true, description: 'First pack name' },
+    b: { type: 'string', required: true, description: 'Second pack name' },
+  },
+  scope: 'read',
+  handler: async (_ctx, p) => {
+    const { resolvePackPathByName } = await import('./schema-pack/load-active.ts');
+    const { loadPackFromFile } = await import('./schema-pack/loader.ts');
+    const aName = p.a as string;
+    const bName = p.b as string;
+    const aPath = resolvePackPathByName(aName);
+    const bPath = resolvePackPathByName(bName);
+    if (!aPath) return { error: 'pack_not_found', pack: aName };
+    if (!bPath) return { error: 'pack_not_found', pack: bName };
+    try {
+      const aPack = loadPackFromFile(aPath);
+      const bPack = loadPackFromFile(bPath);
+      const aTypes = new Set(aPack.page_types.map((t) => t.name));
+      const bTypes = new Set(bPack.page_types.map((t) => t.name));
+      return {
+        schema_version: 1,
+        a: aName,
+        b: bName,
+        only_in_a: [...aTypes].filter((t) => !bTypes.has(t)).sort(),
+        only_in_b: [...bTypes].filter((t) => !aTypes.has(t)).sort(),
+        common: [...aTypes].filter((t) => bTypes.has(t)).sort(),
+      };
+    } catch (e) {
+      return { error: 'invalid_manifest', message: (e as Error).message };
+    }
+  },
+};
+
+const schema_fork_pack: Operation = {
+  name: 'schema_fork_pack',
+  description: 'Fork a schema pack into a new writable pack under ~/.gbrain/schema-packs/<to>/pack.json. Returns {schema_version:1, from, to, path, page_types}. This is the op that makes schema_apply_mutations reachable: that op requires a non-bundled pack, and a default install has none. Copies the source manifest wholesale (all declared types come along) — deliberately NOT an `init` equivalent, since `extends` does not merge parent page_types yet (TODOS T20) and an init-style empty pack would blank type resolution on activation. Does NOT activate: the fork affects no page until a human runs `gbrain schema use <to>` locally.',
+  params: {
+    from: { type: 'string', required: true, description: 'Source pack to copy (bundled packs are valid sources)' },
+    to: { type: 'string', required: true, description: 'New pack name — lowercase slug shape [a-z0-9._-]' },
+  },
+  scope: 'admin',
+  mutating: true,
+  handler: async (_ctx, p) => {
+    const { resolvePackPathByName } = await import('./schema-pack/load-active.ts');
+    const { loadPackFromFile } = await import('./schema-pack/loader.ts');
+    const { BUNDLED_PACK_NAMES } = await import('./schema-pack/mutate.ts');
+    const { gbrainPath } = await import('./config.ts');
+    const { existsSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const from = p.from as string;
+    const to = p.to as string;
+    // Name shape gate: `to` becomes a directory name under ~/.gbrain.
+    // Rejecting anything but the manifest's own slug shape keeps path
+    // traversal (`../`, absolute paths) out of the join below.
+    if (!/^[a-z0-9._-]+$/.test(to) || to === '.' || to === '..') {
+      return { error: 'invalid_pack_name', to, message: 'pack name must match [a-z0-9._-]+' };
+    }
+    if (BUNDLED_PACK_NAMES.has(to)) {
+      return { error: 'name_reserved', to, message: `'${to}' is a bundled pack name` };
+    }
+    const fromPath = resolvePackPathByName(from);
+    if (!fromPath) return { error: 'pack_not_found', pack: from };
+    const toDir = gbrainPath('schema-packs', to);
+    if (existsSync(toDir)) {
+      return { error: 'pack_exists', to, path: toDir };
+    }
+    let manifest;
+    try {
+      manifest = loadPackFromFile(fromPath);
+    } catch (e) {
+      return { error: 'invalid_manifest', pack: from, message: (e as Error).message };
+    }
+    // Same shape as `gbrain schema fork`: copy wholesale, rename, reset
+    // version. pack.json (not YAML) because the emitter does not preserve
+    // comments (T21) and JSON is the format the mutation ops round-trip.
+    const forked = { ...manifest, name: to, version: '0.0.1' };
+    mkdirSync(toDir, { recursive: true });
+    const outPath = join(toDir, 'pack.json');
+    writeFileSync(outPath, JSON.stringify(forked, null, 2));
+    return {
+      schema_version: 1,
+      from,
+      to,
+      path: outPath,
+      page_types: forked.page_types.length,
+      activated: false,
+      next: `Pack is writable via schema_apply_mutations. Activation is local-only: run \`gbrain schema use ${to}\`.`,
+    };
   },
 };
 
@@ -5978,6 +6168,10 @@ export const operations: Operation[] = [
   get_active_schema_pack, list_schema_packs,
   schema_stats, schema_lint, schema_graph, schema_explain_type,
   schema_review_orphans,
+  // Pack lifecycle: read trio + fork. Fork (not init) is what makes
+  // schema_apply_mutations reachable in a default install; activation
+  // (`schema use`) stays local-only. See the block comment above.
+  schema_validate_pack, schema_show_pack, schema_diff_packs, schema_fork_pack,
   schema_apply_mutations, reload_schema_pack,
   // v0.41.18.0 (T16, A7, codex #5)
   run_onboard,
