@@ -7,10 +7,21 @@
  * Dry-run is the DEFAULT — application must be explicit (`--apply`). The config
  * file lists the legs to run; each leg is built from the registry by its `kind`.
  * Legs land in their own tasks; with none registered this is a well-behaved no-op.
+ *
+ * Exit codes route through `setCliExitVerdict` (#2084), like every other exit
+ * write in `src/`. This entrypoint is standalone — `bun run mirror`, not a
+ * `gbrain` subcommand — so the flush-exit seam that zeroes raw writes is not
+ * installed here, and a raw `process.exitCode` DOES currently survive. The
+ * setter is still the right call: it mirrors into `process.exitCode` (identical
+ * behavior today) while keeping this file correct-by-construction if mirror ever
+ * moves under the gbrain CLI, and it keeps the structural guard in
+ * `test/cli-exit-verdict-pin.test.ts` free of per-file exemptions — an
+ * exemption list is how that guard would rot.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import './legs'; // trigger leg self-registration
+import { setCliExitVerdict } from '../core/cli-force-exit';
 import { buildLeg, type LegConfig } from './registry';
 import { summarisePlan } from './reconcile';
 import { runMirror } from './run';
@@ -65,11 +76,11 @@ async function main(): Promise<void> {
       process.stdout.write(`${leg.legId}: FAILED - ${leg.error}\n`);
     }
   }
-  process.exitCode = report.ok ? 0 : 1;
+  setCliExitVerdict(report.ok ? 0 : 1);
 }
 
 main().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
   process.stderr.write(`source-mirror: ${message}\n`);
-  process.exitCode = 1;
+  setCliExitVerdict(1);
 });

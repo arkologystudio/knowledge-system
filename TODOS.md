@@ -23,14 +23,20 @@ Surfaced by the /ship gate on `fix/source-remote-url-drift-detection` and proven
 pre-existing against a clean `origin/staging` worktree (both fail with none of that
 branch's changes applied). Filed rather than fixed inline to keep that PR scoped.
 
-- [ ] **P0 — `gbrain mirror` reports success when it fails.** `src/mirror/cli.ts:68`
-  and `:74` assign `process.exitCode` directly. `currentExitCode()` reads only
-  gbrain's owned verdict (the PGLite-Emscripten-pollution defense), so the
-  deliberate flush-exit ZEROES a raw write — `gbrain mirror` exits 0 on a failed
-  report, and any CI or cron wrapping it reads green. Route both writes through
-  `setCliExitVerdict`. Landed in PR #28 (v0.43.0.6, Source Mirror harness); pinned
-  by `test/cli-exit-verdict-pin.test.ts`, which is currently red on staging.
-  Where: `src/mirror/cli.ts`.
+- [x] **P1 (was filed P0 — impact was overstated) — mirror's raw `process.exitCode`
+  writes.** DONE in v0.43.0.15: `src/mirror/cli.ts` routes both writes through
+  `setCliExitVerdict`, and `test/cli-exit-verdict-pin.test.ts` is green again.
+  **Correction to the original filing:** it claimed `gbrain mirror` exits 0 on a
+  failed report. It does not, and there is no `gbrain mirror` subcommand — mirror
+  is a STANDALONE entrypoint (`bun run mirror` → `bun src/mirror/cli.ts`), nothing
+  under `src/mirror/` imports the exit seam, so `flushThenExit` never runs in that
+  process and a raw write survives. Verified empirically before the fix:
+  `bun src/mirror/cli.ts run --config /nonexistent.json` exited 1. So this was a
+  structural-guard violation (CI red for every branch), not a live
+  reports-success-on-failure bug. The fix is still right — it is identical at
+  runtime today and keeps the file correct if mirror ever moves under the gbrain
+  CLI — but it bought a green guard, not a recovered failure signal. Where:
+  `src/mirror/cli.ts`.
 - [ ] **P0 — `worker-registry.serial.test.ts` round trip returns 0 workers.**
   `registerWorker writes under gbrainPath; readWorkers returns the live worker`
   expects 1, receives 0 (`test/worker-registry.serial.test.ts:60`). Fails standalone
