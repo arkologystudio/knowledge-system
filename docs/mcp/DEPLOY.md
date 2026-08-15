@@ -149,6 +149,27 @@ await oauthProvider.registerClientManual(
 For self-service client registration (Dynamic Client Registration, RFC 7591),
 start the server with `--enable-dcr`. DCR is off by default.
 
+> **Two traps when a governance issuer fronts OAuth.** If `/authorize`, `/token`,
+> and `/register` are served by a separate governance service rather than by
+> gbrain itself (see
+> [KS-E governance retrieval](../deploy/KS-E-governance-retrieval.md)):
+>
+> 1. **`gbrain auth register-client` writes to the wrong store.** It creates the
+>    client in gbrain's own `oauth_clients` table, which that issuer never
+>    consults. Registration reports success, and the client then fails at
+>    `/authorize` with `{"error":"access_denied","error_description":"Invalid
+>    client or grant type"}`. Register against the governance service instead.
+> 2. **A DCR-registered client may be inert until bound to a principal.**
+>    `POST /register` returns `201` with a `client_id`, but the row can land with
+>    a null principal, and `/authorize` rejects it with the same generic message.
+>    Binding it to a principal is an access-control decision — the client
+>    inherits that principal's grants — so it is deliberately a separate,
+>    operator-driven step rather than something registration does implicitly.
+>
+> Both failures surface as the *same* error string as a malformed request, so
+> when a freshly registered client cannot authorize, check which store holds it
+> and whether it has a principal before debugging the request itself.
+
 ### 3. Expose the server
 
 **v0.34 — bind explicitly.** `gbrain serve --http` defaults to `127.0.0.1`.
