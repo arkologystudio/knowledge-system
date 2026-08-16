@@ -44,8 +44,13 @@ ssh keepalives neither end notices.
 
 ### Filed
 - P2: `gbrain serve` should defend itself rather than trusting every operator to
-  configure ssh correctly — an idle timeout, or parent-death detection. Client
-  and deploy fixes ship here; the engine-side hardening does not.
+  configure ssh correctly. The TODO records that an **idle timeout is the only
+  mechanism that works** — parent-death detection is the obvious candidate and is
+  useless here, because the orphans' parent was alive the whole time. It also
+  records why the default must be off or very long: MCP stdio clients generally do
+  not respawn, so a naive timeout trades a leak that affects misconfigured clients
+  for a dead-server symptom that would affect everyone. Client and deploy fixes
+  ship here; the engine-side hardening does not.
 
 To take advantage of v0.43.0.18: add the `pkill` line to your deploy, and move
 your MCP client's ssh options into `~/.ssh/config` as a dedicated non-multiplexed

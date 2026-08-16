@@ -12,11 +12,29 @@
   single `sshd-session: root@notty`. v0.43.0.18 fixes this at the CLIENT (dedicated
   non-multiplexed ssh alias) and in the DEPLOY (reap step), both documented in
   `ops/kb-vps/README.md` — but the engine could defend itself rather than trusting
-  every operator to configure ssh correctly. Options: an idle timeout (no JSON-RPC
-  traffic for N minutes and no in-flight work → exit), or parent-death detection
-  (`prctl(PR_SET_PDEATHSIG)` on Linux, or poll `getppid()`). Prefer idle-timeout —
-  it is portable and also covers a wedged client that holds the pipe open. Must not
-  fire during a long-running tool call. Where: `src/mcp/server.ts`.
+  every operator to configure ssh correctly.
+
+  **Idle timeout is the only mechanism that works here.** Parent-death detection
+  (`prctl(PR_SET_PDEATHSIG)`, or polling `getppid()`) is the obvious candidate and
+  is USELESS for this failure: the orphans' parent was alive the whole time
+  (`sshd-session: root@notty`, 2319s and counting). The parent surviving IS the
+  failure mode, so PDEATHSIG never fires. Don't reach for it.
+
+  Design constraints for the idle timeout, in priority order:
+  1. Track last JSON-RPC activity AND in-flight request count; exit only when idle
+     AND quiescent. A timeout that fires mid-tool-call is worse than the leak.
+  2. **Default OFF, or very long.** A naive default trades a leak for a worse bug:
+     MCP stdio clients generally spawn the server once at startup and do not
+     transparently respawn, so killing a healthy-but-idle session can surface as a
+     dead MCP server to a user who simply hadn't asked anything in a while. The
+     leak only affects misconfigured (multiplexed) clients; the timeout would
+     affect everyone.
+  3. Env-gated (`GBRAIN_MCP_IDLE_TIMEOUT_SECONDS`), documented as a hardening knob
+     for ssh-exposed / multi-tenant deployments rather than a default behaviour.
+
+  Priority is defense-in-depth, NOT urgent: the client-side fix in v0.43.0.18
+  addresses the observed incident, and this only matters for operators who
+  misconfigure ssh. Where: `src/mcp/server.ts`.
 
 - [ ] **P3 — deploys break live stdio sessions by design; consider making that
   explicit.** bun runs the TypeScript directly and op handlers use lazy
