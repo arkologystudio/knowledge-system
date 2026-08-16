@@ -34,7 +34,7 @@ cd /root/knowledge-system
 git pull --ff-only
 bun install --frozen-lockfile
 systemctl restart knowledge-system-sync knowledge-system-http
-pkill -f '/root/.bun/bin/gbrain serve' || true   # reap per-connection MCP stdio sessions
+pkill -f '[/]root/.bun/bin/gbrain serve' || true   # reap per-connection MCP stdio sessions
 ```
 
 There is no build step — bun runs the TypeScript directly. But
@@ -115,6 +115,36 @@ ps -eo pid,ppid,etimes,rss,args | grep '[b]un /root/.bun/bin/gbrain serve'
 The systemd HTTP server (`/usr/local/bin/gbrain serve --http`, parented to PID 1)
 is a different process and must NOT be reaped by the `pkill` above — the path
 differs, which is what makes that pattern safe.
+
+### Why the reap pattern is bracketed
+
+`[/]root/...` is not decoration. `pkill -f` matches against the FULL command line of
+every process, including the shell that invoked it — and `|| true` is what makes that
+bite. Without it, `bash -c "pkill -f 'PATTERN'"` exec-optimises: bash replaces itself
+with `pkill`, which excludes its own pid, and nothing self-matches. Add `|| true` and
+the command becomes compound, so bash survives as a parent whose command line contains
+the pattern. `pkill` then signals its own shell.
+
+The failure is worse than it looks. The shell dies mid-scan, so `pkill` may not finish
+signalling every match — the reap **half-completes** — and `|| true` reports success
+anyway. `ssh` surfaces it only as a bare exit 255. Observed 2026-08-16 running the
+documented line over ssh.
+
+The bracket fixes it without changing what is matched: the regex `[/]root/...` still
+matches the literal `/root/...` on the target processes, but the invoking shell's own
+command line contains the brackets and therefore no longer matches. Same idiom as the
+`grep "[b]un ..."` used in the orphan check above.
+
+Safe single-line form, for when you want the whole deploy as one command:
+
+```bash
+ssh kb-vps 'set -e; cd /root/knowledge-system && git pull --ff-only && bun install --frozen-lockfile && systemctl restart knowledge-system-sync knowledge-system-http; pkill -f "[/]root/.bun/bin/gbrain serve" || true'
+```
+
+`set -e` plus `;` before the reap is deliberate: every step before it must abort the run
+on failure, while a no-match reap (exit 1) must not. Chaining the whole sequence with
+`&&` and a trailing `|| true` does the opposite — it swallows a failed `git pull` and
+exits 0.
 
 ## The failure mode this guards against
 
