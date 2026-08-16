@@ -2,6 +2,61 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.18] - 2026-08-16
+
+**A brain that looks connected and answers nothing.** An MCP client went silent
+for four minutes against a perfectly healthy brain. The runbook could not explain
+it, because the runbook did not know the process class existed.
+
+Alongside the two systemd units, this host runs a **third** kind of long-lived
+gbrain process: `ssh → /usr/local/bin/knowledge-system-serve → exec gbrain serve`,
+one per MCP connection, parented to the sshd session. `systemctl status` cannot
+see it and `systemctl restart` does not touch it.
+
+Two things follow, both measured in production rather than reasoned about:
+
+- **Every deploy breaks live sessions.** bun runs the TypeScript directly and op
+  handlers use lazy `await import()` throughout, so `git pull` swaps source under
+  a running `gbrain serve` and it dies at its next op that imports. This happens
+  with or without a restart — the restart was never the cause.
+- **Orphans accumulate at ~94MB each.** The server *does* exit on stdin EOF. But
+  EOF never arrives when the client's ssh connection is multiplexed: a shared
+  `ControlMaster` holds the sshd session, and therefore the child's stdin pipe,
+  open after the MCP channel dies. Observed 2026-08-16: 8 orphaned processes,
+  756MB RSS, one Postgres connection each, all under a single 39-minute-old
+  `sshd-session: root@notty`.
+
+The silent-hang symptom is the two compounding: the session is dead, and with no
+ssh keepalives neither end notices.
+
+### Fixed
+- `ops/kb-vps/README.md` deploy sequence reaps per-connection stdio sessions.
+  The pattern targets `/root/.bun/bin/gbrain serve` and therefore cannot hit the
+  systemd HTTP server, which runs from a different path.
+
+### Documented
+- New "Per-connection MCP stdio sessions" section: the topology, both failure
+  modes, the required client-side ssh configuration (`ControlMaster no` plus
+  keepalives, in `~/.ssh/config` rather than the client's arg list — Claude
+  Desktop rewrites its own config while running and silently drops hand-added
+  args), and a one-liner to check for orphans.
+- The layout table now names the wrapper and says why it is absent from it.
+
+### Filed
+- P2: `gbrain serve` should defend itself rather than trusting every operator to
+  configure ssh correctly. The TODO records that an **idle timeout is the only
+  mechanism that works** — parent-death detection is the obvious candidate and is
+  useless here, because the orphans' parent was alive the whole time. It also
+  records why the default must be off or very long: MCP stdio clients generally do
+  not respawn, so a naive timeout trades a leak that affects misconfigured clients
+  for a dead-server symptom that would affect everyone. Client and deploy fixes
+  ship here; the engine-side hardening does not.
+
+To take advantage of v0.43.0.18: add the `pkill` line to your deploy, and move
+your MCP client's ssh options into `~/.ssh/config` as a dedicated non-multiplexed
+alias. If an MCP server has ever gone quiet on you without erroring, check for
+orphans first: `ps -eo pid,etimes,rss,args | grep '[b]un .*gbrain serve'`.
+
 ## [0.43.0.17] - 2026-08-15
 
 **Docs pass after v0.43.0.16 — and one skill was teaching the trap.**

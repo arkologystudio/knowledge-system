@@ -20,6 +20,10 @@ have survived a rebuild.
 | `systemd/knowledge-system-dream.{service,timer}` | Nightly 02:30 maintenance cycle |
 | `install.sh` | Idempotent installer |
 
+Not in this table, because it is not a systemd unit: `/usr/local/bin/knowledge-system-serve`,
+the per-connection MCP stdio wrapper. See "Per-connection MCP stdio sessions" below —
+it is the process class deploys silently break.
+
 Secrets are **not** here. They stay in `/etc/gbrain/*.env` (mode 0600) on the
 host and are referenced by `EnvironmentFile=`.
 
@@ -30,11 +34,15 @@ cd /root/knowledge-system
 git pull --ff-only
 bun install --frozen-lockfile
 systemctl restart knowledge-system-sync knowledge-system-http
+pkill -f '/root/.bun/bin/gbrain serve' || true   # reap per-connection MCP stdio sessions
 ```
 
 There is no build step — bun runs the TypeScript directly. But
 `knowledge-system-sync` is a long-running `--watch` process and will **not** pick
 up code changes without that restart.
+
+That last line is not optional, and it is not covered by the `systemctl restart`
+above — see the next section for why.
 
 If anything under `ops/kb-vps/` changed, also run:
 
@@ -42,6 +50,71 @@ If anything under `ops/kb-vps/` changed, also run:
 ops/kb-vps/install.sh          # guard only (default)
 ops/kb-vps/install.sh --all    # also sync the service units
 ```
+
+## Per-connection MCP stdio sessions (not systemd, and deploys break them)
+
+There is a **third** long-running gbrain process class on this host, and until
+v0.43.0.18 nothing here mentioned it. It is not a systemd unit, so `systemctl
+status` will never show it and `systemctl restart` will never touch it:
+
+```
+Claude Desktop → ssh kb-vps-mcp → /usr/local/bin/knowledge-system-serve → exec gbrain serve
+```
+
+`knowledge-system-serve` is a five-line wrapper that sources `/etc/gbrain/*.env`
+and execs `gbrain serve` on **stdio**. One process is spawned per MCP connection,
+parented to the sshd session, living for as long as that session does.
+
+Two consequences, both observed in production:
+
+**1. `git pull` breaks every live session.** bun runs the TypeScript directly and
+gbrain's op handlers use lazy `await import()` throughout, so swapping the source
+under a running `gbrain serve` kills it at its next op that imports something.
+This happens on *every* deploy, with or without a restart — the restart was never
+the culprit. Reaping the sessions deliberately (the `pkill` line above) turns a
+half-dead session into a clean disconnect the client can retry.
+
+**2. Orphans accumulate at ~94MB each.** `src/mcp/server.ts` does shut down on
+stdin EOF — that part is correct. The problem is that EOF never arrives when the
+client's ssh connection is **multiplexed**: a shared `ControlMaster` keeps the
+sshd session (and therefore the child's stdin pipe) open after the MCP channel
+dies, so `gbrain serve` blocks forever on a pipe nobody will ever close. Measured
+on 2026-08-16: **8 orphaned processes, 756MB RSS, all sharing one 39-minute-old
+`sshd-session: root@notty`**, each holding a Postgres connection.
+
+### Client-side configuration (required)
+
+The MCP client must use a **dedicated, non-multiplexed** ssh alias. Put the
+options in `~/.ssh/config`, not in the client's arg list — Claude Desktop rewrites
+its own config file while running and will silently drop args added by hand:
+
+```
+Host kb-vps-mcp
+    HostName <host>
+    User root
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    ControlMaster no        # one session per connection => channel close == stdin EOF
+    ControlPath none
+    ServerAliveInterval 15  # notice a dead session in ~45s instead of hanging
+    ServerAliveCountMax 3
+    TCPKeepAlive yes
+```
+
+Without `ControlMaster no` the orphans accumulate. Without the keepalives the
+client hangs indefinitely against a dead session instead of reconnecting — the
+symptom is an MCP server that is "connected" but silently answers nothing, which
+reads as a brain outage when the brain is perfectly healthy.
+
+To check for orphans at any time:
+
+```bash
+ps -eo pid,ppid,etimes,rss,args | grep '[b]un /root/.bun/bin/gbrain serve'
+```
+
+The systemd HTTP server (`/usr/local/bin/gbrain serve --http`, parented to PID 1)
+is a different process and must NOT be reaped by the `pkill` above — the path
+differs, which is what makes that pattern safe.
 
 ## The failure mode this guards against
 
