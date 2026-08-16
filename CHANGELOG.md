@@ -2,6 +2,37 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.19] - 2026-08-16
+
+**The reap step shipped in v0.43.0.18 could kill its own shell and half-finish.**
+Same class as the test-runner bug fixed in v0.43.0.14, introduced four releases later,
+in a line whose entire purpose was cleanup.
+
+`pkill -f` matches the full command line of every process, including the shell invoking
+it. Without `|| true`, `bash -c "pkill -f 'PATTERN'"` exec-optimises — bash replaces
+itself with `pkill`, which excludes its own pid, and nothing self-matches. With
+`|| true` the command is compound, bash survives as a parent whose command line contains
+the pattern, and `pkill` signals its own shell. It dies mid-scan, so the reap may not
+signal every match, and `|| true` reports success regardless. `ssh` shows only a bare
+exit 255.
+
+### Fixed
+- `ops/kb-vps/README.md` bracket-guards the reap pattern: `[/]root/.bun/bin/gbrain serve`.
+  The regex still matches the literal path on the target processes, but the invoking
+  shell's command line now contains the brackets and no longer matches itself. Same idiom
+  as the `grep "[b]un ..."` orphan check alongside it.
+
+### Documented
+- Why the bracket is load-bearing, so nobody helpfully removes it.
+- A safe single-line deploy form using `set -e` and a `;` before the reap, so every
+  earlier step aborts on failure while a no-match reap does not. The obvious one-liner —
+  everything chained with `&&` and a trailing `|| true` — does the opposite and swallows
+  a failed `git pull`.
+
+To take advantage of v0.43.0.19: if you copied the v0.43.0.18 reap line into a script or
+a shell history, re-copy it. The old form exits 255 and may leave orphans behind while
+reporting success.
+
 ## [0.43.0.18] - 2026-08-16
 
 **A brain that looks connected and answers nothing.** An MCP client went silent
