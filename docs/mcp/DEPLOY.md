@@ -159,16 +159,18 @@ start the server with `--enable-dcr`. DCR is off by default.
 >    consults. Registration reports success, and the client then fails at
 >    `/authorize` with `{"error":"access_denied","error_description":"Invalid
 >    client or grant type"}`. Register against the governance service instead.
-> 2. **A DCR-registered client may be inert until bound to a principal.**
->    `POST /register` returns `201` with a `client_id`, but the row can land with
->    a null principal, and `/authorize` rejects it with the same generic message.
->    Binding it to a principal is an access-control decision — the client
->    inherits that principal's grants — so it is deliberately a separate,
->    operator-driven step rather than something registration does implicitly.
+> 2. **A DCR-registered client is inert until bound to a principal.**
+>    `POST /register` returns `201` with a `client_id`, but the row lands with a
+>    null principal, and `/authorize` then fails with
+>    `{"error":"access_denied","error_description":"Client is not bound to an
+>    approved principal"}`. Binding it is an access-control decision — the client
+>    inherits that principal's grants, and the issued token is scoped to them —
+>    so it is deliberately a separate, operator-driven step rather than something
+>    registration does implicitly.
 >
-> Both failures surface as the *same* error string as a malformed request, so
-> when a freshly registered client cannot authorize, check which store holds it
-> and whether it has a principal before debugging the request itself.
+> The two cases are distinguishable by their `error_description`: trap 1 reports
+> an unknown client, trap 2 names the missing principal binding. Both arrive as
+> HTTP 400 `access_denied`, so read the description rather than the status.
 
 ### 3. Expose the server
 
