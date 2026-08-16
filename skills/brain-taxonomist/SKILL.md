@@ -44,8 +44,11 @@ driven by `gbrain schema show --json`. This means:
   recommended directory set (deal, meeting, concept, project, source,
   daily, personal, civic, original, place, trip, conversation, writing,
   plus all gbrain-base types).
-- A user who authored a custom pack via `gbrain schema init` + edit gets
-  filing recommendations based on THEIR taxonomy, not gbrain's defaults.
+- A user who authored a custom pack via `gbrain schema fork <pack> <new>`
+  + edit gets filing recommendations based on THEIR taxonomy, not gbrain's
+  defaults. (`fork`, not `init` — `extends:` does not merge the parent's
+  `page_types` yet, so an `init`-scaffolded pack resolves with zero
+  declared types. See `docs/architecture/schema-packs.md`.)
 - Per-source overrides (tier 3 in the 7-tier resolution chain) are honored
   when `--source <id>` is passed to brain-taxonomist.
 

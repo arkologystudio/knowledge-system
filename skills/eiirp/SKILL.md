@@ -284,6 +284,12 @@ Confirm:
 - [ ] No MECE violations (no ambiguous routing between skills)
 - [ ] Active schema pack updated if new content types emerged
 - [ ] `gbrain doctor` reports `schema_pack_consistency: ok`
+- [ ] `gbrain doctor` reports `schema_undeclared_types: ok` — or the warn is
+      explained. This is the INVERSE signal: `schema_pack_consistency` counts
+      pages with no type, `schema_undeclared_types` counts pages typed OUTSIDE
+      the pack. A phase that introduces a new content type without declaring it
+      moves this one, not the other. A warn is not automatically a defect —
+      undeclared types are legal — but it must be a decision, not a surprise.
 
 ## Phase 7: REPORT — Summary
 
@@ -310,6 +316,7 @@ Confirm:
 - MECE audit: [clean]
 - Active pack: [name] v[version]
 - schema_pack_consistency: [ok / warn — pct untyped]
+- schema_undeclared_types: [ok / warn — N types, M pages undeclared]
 ```
 
 ## Output Format
@@ -336,6 +343,7 @@ EIIRP produces a single Phase 7 report block. Plain markdown:
 - MECE audit: [clean|N overlaps]
 - Active pack: [name] v[version]
 - schema_pack_consistency: [ok|warn — N% untyped]
+- schema_undeclared_types: [ok|warn — N types, M pages undeclared]
 ```
 
 Always machine-readable: stable section headers + bullet-per-item. The

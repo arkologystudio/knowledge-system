@@ -34,6 +34,10 @@ tools:
   - mcp:schema_explain_type
   - mcp:schema_review_orphans
   - mcp:schema_apply_mutations
+  - mcp:schema_validate_pack
+  - mcp:schema_show_pack
+  - mcp:schema_diff_packs
+  - mcp:schema_fork_pack
   - mcp:reload_schema_pack
 triggers:
   - "add a page type"
@@ -115,9 +119,33 @@ mutation will need a fork first (Phase 4).
 gbrain schema stats --json
 ```
 
-Returns per-type page counts, untyped count, and `dead_prefixes` (pack-
-declared prefixes with zero matching pages — probable mis-declarations).
+Returns per-type page counts, untyped count, and BOTH directions of
+pack-vs-corpus drift:
+
+- `dead_prefixes` — pack-declared prefixes with zero matching pages
+  (the pack claims what the corpus lacks; probable mis-declarations).
+- `undeclared_types` — types in USE that the pack never declares (the
+  corpus has what the pack doesn't claim). Each entry carries
+  `{type, page_count, example_slugs, classification}`.
+
 If coverage < 90%, there's untyped content worth typing.
+
+Read `undeclared_types` before proposing anything. Undeclared types are
+LEGAL — they store, chunk, embed and retrieve normally — so their presence
+is not a defect to fix reflexively. Use `classification` to decide:
+
+- `primitive_name` — the page is typed with one of the five primitives
+  (`entity`, `media`, `temporal`, `annotation`, `concept`) instead of a
+  type that EXTENDS one. A filing mistake under any pack policy. The fix
+  is retyping the pages, NOT declaring the primitive.
+- `aliased` — already reachable through a declared type's alias closure.
+  Low urgency; `schema lint` flags the dangling alias separately.
+- `undeclared` — unknown to the pack. Either worth declaring, or a typo.
+  `page_count` + `example_slugs` tell you which.
+
+A brain may have decided on purpose that frontmatter `type` is
+authoritative and the pack is advisory. Check for a recorded decision
+before proposing to declare a type that has been in steady use.
 
 ```
 gbrain schema review-orphans --limit 50 --json
@@ -151,6 +179,21 @@ fork it first:
 gbrain schema fork gbrain-base mine
 gbrain schema use mine
 ```
+
+**Use `fork`, never `init`.** `extends:` is recorded and depth-checked but
+does NOT merge the parent's `page_types` — `resolvePack()` resolves the
+child manifest verbatim. An `init`-scaffolded pack writes `page_types: []`
+with `extends: gbrain-base` and therefore activates with **zero** declared
+types, making the entire corpus undeclared in one step. `fork` copies the
+source manifest wholesale, so the fork really does start with everything
+the parent declared. (Tracked as T20 / P1 in `TODOS.md`; revisit when
+extends-merging lands.)
+
+Over MCP the same applies: `schema_fork_pack` exists, `schema_init_pack`
+deliberately does not. `schema_fork_pack` is also what makes
+`schema_apply_mutations` reachable at all — that op requires a non-bundled
+pack, and a default install has none. Activation (`gbrain schema use`)
+stays local-only by design; there is no `schema_use_pack`.
 
 Then add the types one at a time:
 
@@ -275,7 +318,7 @@ When invoked, this skill produces structured output suitable for both human + JS
 
 **Stats JSON (per-source + aggregate + dead-prefix hints):**
 ```json
-{"schema_version": 1, "pack_identity": "mine@1.0.0+abc12345", "aggregate": {"total_pages": 4823, "typed_pages": 4710, "untyped_pages": 113, "coverage": 0.9766, "by_type": [{"type": "person", "count": 2104}, ...]}, "per_source": [...], "dead_prefixes": [{"type": "researcher", "prefix": "people/researchers/"}]}
+{"schema_version": 1, "pack_identity": "mine@1.0.0+abc12345", "aggregate": {"total_pages": 4823, "typed_pages": 4710, "untyped_pages": 113, "coverage": 0.9766, "by_type": [{"type": "person", "count": 2104}, ...]}, "per_source": [...], "dead_prefixes": [{"type": "researcher", "prefix": "people/researchers/"}], "undeclared_types": [{"type": "entity", "page_count": 65, "example_slugs": ["wiki/entities/acme-example"], "classification": "primitive_name"}, {"type": "strategy", "page_count": 20, "example_slugs": ["wiki/strategy/a-wedge"], "classification": "undeclared"}]}
 ```
 
 **Sync dry-run JSON:**

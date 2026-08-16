@@ -121,10 +121,12 @@ The sync imports the new files. They'll be stored in the database but their `typ
 ## Step 6: See the gap with `stats`
 
 ```bash
-gbrain schema stats --json | jq '.aggregate, .dead_prefixes'
+gbrain schema stats --json | jq '.aggregate, .dead_prefixes, .undeclared_types'
 ```
 
 You'll see `untyped_pages: 3` (or however many you just imported) and `dead_prefixes: []` — your new prefix has 3 matching pages, so it's not dead.
+
+`undeclared_types` is the mirror of `dead_prefixes`: types in USE that the pack does not declare. Expect `[]` here, since these pages have no type yet — they're untyped, not mistyped. The two answer opposite questions, and neither is the same as `schema review-orphans` (which finds pages with no type at all). See [Undeclared types](architecture/schema-packs.md#undeclared-types-frontmatter-is-authoritative-the-pack-is-advisory) for what to do when it isn't empty.
 
 The 3 researcher pages are "orphaned" by type even though they live in the right directory. The next step backfills them.
 

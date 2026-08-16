@@ -2,6 +2,44 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.17] - 2026-08-15
+
+**Docs pass after v0.43.0.16 — and one skill was teaching the trap.**
+`skills/brain-taxonomist/SKILL.md` told agents that a custom pack is authored
+with `gbrain schema init` + edit. Under the open extends-merging gap that
+produces a pack declaring ZERO types, so an agent following the skill and then
+activating would make an entire corpus undeclared. Corrected to `fork`, with the
+reason inline, in every place the advice appears.
+
+Also caught two counts that had drifted long before this wave and were simply
+wrong: the README advertised 22 page types (`gbrain-base` declares 27) and 14
+`gbrain schema` CLI verbs (there are 33), and CLAUDE.md put the operation
+contract at ~90 (it is ~115).
+
+### Fixed
+- `skills/brain-taxonomist/SKILL.md` — `init` → `fork` for custom-pack authoring.
+- `README.md` — 22 → 27 types, 14 → 33 schema verbs, and the schema-over-MCP
+  sentence now names the read + fork ops rather than implying
+  `schema_apply_mutations` is the whole surface.
+- `CLAUDE.md` — operation count ~90 → ~115.
+
+### Documented
+- `skills/schema-author/SKILL.md` — registers the four new MCP ops; teaches
+  `undeclared_types` and what each `classification` means; states plainly that
+  undeclared types are legal and that a brain may have recorded a decision to
+  keep them, so they are not a defect to fix reflexively; explains why `fork` is
+  the only safe authoring path and why there is no `schema_use_pack`.
+- `skills/eiirp/SKILL.md` — Phase 6 now verifies `schema_undeclared_types`
+  alongside `schema_pack_consistency`. They are inverse signals: a phase that
+  introduces a new content type without declaring it moves the former, not the
+  latter, so checking only consistency misses exactly the case EIIRP exists to
+  catch.
+- `docs/schema-author-tutorial.md` — Step 6 reads `undeclared_types` too, and
+  says why it is empty at that point in the tutorial.
+
+To take advantage of v0.43.0.17: nothing to run. If you have an agent that
+authors schema packs, it will now be told to `fork` rather than `init`.
+
 ## [0.43.0.16] - 2026-08-15
 
 **The schema pack could disagree with the corpus indefinitely and every surface
