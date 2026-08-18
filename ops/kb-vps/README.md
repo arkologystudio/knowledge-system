@@ -167,7 +167,7 @@ Three statuses, and only one of them means "verified fresh":
 
 | `status` | Exit | Meaning |
 |---|---|---|
-| `ok` | 0 | Measured, and the brain is a fresh cache of `origin/main` |
+| `ok` | 0 | Measured. Either fresh, or lagging inside the grace window (normal after a push) |
 | `degraded` | 0 | **Could not measure.** Freshness is unverified, not verified-good |
 | `alarm` | 1 | Sync not pulling, index not advancing, or blind past grace |
 
@@ -260,8 +260,9 @@ upgrade machinery fetches releases from **upstream**:
 upstream and revert every fork patch.
 
 **What is disabled, and what is not.** `resolveSelfUpgradeMode`
-(`src/core/self-upgrade.ts`) gates exactly two callers — the invocation-riding
-nag (`src/cli.ts`) and the autopilot channel (`src/commands/autopilot.ts`). Both
+(`src/core/self-upgrade.ts`) has exactly two *enforcing* callers — the
+invocation-riding nag (`src/cli.ts`) and the autopilot channel
+(`src/commands/autopilot.ts`); `doctor.ts` reads it to report, not to gate. Both
 are off on this host:
 
 - `/root/.gbrain/config.json` → `"self_upgrade": { "mode": "off" }`
@@ -281,8 +282,11 @@ Two related traps:
 - `gbrain config set self_upgrade.mode off` — which the product itself suggests
   (`upgrade.ts`, `doctor.ts`) — writes the **DB** plane while the resolver reads
   the **file** plane. It is a silent no-op. Hand-edit `config.json`, as above.
-- The resolver falls back to the permissive `notify` on any unrecognized value,
-  so a typo in either setting silently re-enables the nag channel.
+- The resolver falls back to the permissive `notify` on any unrecognized value.
+  A typo in `config.json` therefore silently re-enables the nag channel. A
+  typo in the env var alone is safe — an unrecognized env value is discarded
+  and the file plane still answers `off` — so the config file is the one that
+  must be right.
 
 Upgrades happen only via the fork's own deploy path (git pull in
 `/root/knowledge-system`, per "Deploying" above). If the `UPGRADE_AVAILABLE` nag

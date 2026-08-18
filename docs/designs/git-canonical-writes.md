@@ -75,8 +75,8 @@ The mirror directory itself gets aggressive hygiene: mode `0700`, and an ops-REA
 
 | `writer.mode` | Truth | `put_page` behaviour | Use |
 |---|---|---|---|
-| `git-first` (**default when the source has a remote**) | `origin/main` | commit+push then index; push failure = write failure | Org brains (kb-vps, octopi) |
-| `local-tree` | The working tree; a human commits | write file into tree, index; **never commits** | Ross's personal brain (the refresh daemon imports the tree; git is the human's act) |
+| `git-first` (**forced for machine-managed sources** — see derivation below) | `origin/main` | commit+push then index; push failure = write failure | Org brains (kb-vps, octopi) |
+| `local-tree` (default when not machine-managed) | The working tree; a human commits | write file into tree, index; **never commits** | Ross's personal brain (the refresh daemon imports the tree; git is the human's act) |
 | `db-only` | The DB, explicitly ephemeral | index only; no file | Scratch/test brains, no repo configured |
 
 **Mode derivation, and the one legitimate opt-out.** Remote presence alone cannot be the discriminator: Ross's personal wiki has an origin *and* is correctly `local-tree` (a human commits from Obsidian; no daemon should). The discriminating property is not "has a remote" but **"is this working tree machine-managed?"** — i.e. does something automatically pull and reset it?

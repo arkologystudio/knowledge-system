@@ -92,17 +92,28 @@ mkdir -p "$STATE_DIR"
 # output in particular is multi-line and contains quoted command lines, which
 # silently produced invalid JSON in the first cut.
 json_str() {
-  printf '%s' "${1-}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r\t' '   '
+  # JSON forbids ALL raw C0 controls, not just the three whitespace ones — an
+  # ESC in a captured command line is enough to make the state file unparseable.
+  printf '%s' "${1-}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '[:cntrl:]' ' '
 }
 
 read_epoch() {
-  # Echoes a valid epoch from $1, or nothing. A truncated/garbage state file
-  # must not become arithmetic input: an empty file read as 0 yields a ~55-year
-  # lag and an instant false alarm, and a non-numeric one aborts the run under
-  # `set -u` BEFORE the state file is written, freezing the operator's view.
+  # Echoes a *plausible* epoch from $1, or nothing. A truncated/garbage state
+  # file must not become arithmetic input: an empty file read as 0 yields a ~55
+  # year lag and an instant false alarm, and a non-numeric one aborts the run
+  # under `set -u` BEFORE the state file is written, freezing the operator's
+  # view. The length bound matters as much as the digit check: a huge digit
+  # string is "numeric" but overflows $(( )) to a NEGATIVE lag, which would
+  # make the stale alarm permanently unreachable — precisely the failure this
+  # helper exists to prevent, wearing a different hat.
   local v
-  v=$(cat "$1" 2>/dev/null | awk '{print $1}')
-  [[ "$v" =~ ^[0-9]+$ ]] && printf '%s' "$v"
+  v=$(awk '{print $1; exit}' "$1" 2>/dev/null)
+  [[ "$v" =~ ^[0-9]{1,11}$ ]] && printf '%s' "$v"
+}
+
+sane_epoch() {
+  # $1 = candidate, $2 = now. Rejects the future (clock skew, hand-edited file).
+  [ -n "${1:-}" ] && [ "$1" -le "$2" ] 2>/dev/null
 }
 
 read_field2() {
@@ -175,8 +186,9 @@ case "$lag_state" in
     rm -f "$BLIND_STATE_FILE"
     prev_epoch=$(read_epoch "$LAG_STATE_FILE")
     prev_commit=$(read_field2 "$LAG_STATE_FILE")
-    if [ -z "$prev_epoch" ] || [ "$prev_commit" != "$indexed_commit" ]; then
-      # First observation, or the index ADVANCED to a new commit — re-anchor.
+    if ! sane_epoch "$prev_epoch" "$now_epoch" || [ "$prev_commit" != "$indexed_commit" ]; then
+      # First observation, unusable/future anchor, or the index ADVANCED to a
+      # new commit — re-anchor.
       lag_since=$now_epoch
     else
       lag_since=$prev_epoch
@@ -197,9 +209,17 @@ case "$lag_state" in
     # accruing and can still alarm on a later successful measurement.
     probe_blind=1
     prev_epoch=$(read_epoch "$LAG_STATE_FILE")
-    [ -n "$prev_epoch" ] && lag_secs=$(( now_epoch - prev_epoch ))
+    if sane_epoch "$prev_epoch" "$now_epoch"; then
+      lag_secs=$(( now_epoch - prev_epoch ))
+      # A blind run must not RETRACT a stale verdict the last real measurement
+      # already reached. Without this, one docker hiccup turns a confirmed
+      # alarm (exit 1, latched in `systemctl --failed`) into exit 0 while
+      # index_lag_seconds sits in the same file saying "still stale". The last
+      # measurement stands until a measurement contradicts it.
+      [ "$lag_secs" -ge "$LAG_GRACE_SECS" ] && lag_alarm=1 && lag_state="stale_unverified"
+    fi
     blind_since=$(read_epoch "$BLIND_STATE_FILE")
-    if [ -z "$blind_since" ]; then
+    if ! sane_epoch "$blind_since" "$now_epoch"; then
       blind_since=$now_epoch
       printf '%s\n' "$blind_since" > "$BLIND_STATE_FILE"
     fi
@@ -223,7 +243,7 @@ if [ "$pull_alarm" -eq 1 ] || [ "$lag_alarm" -eq 1 ] || [ "$blind_alarm" -eq 1 ]
   last_ok=$(journalctl -u "$UNIT" --since "30 days ago" --no-pager 2>/dev/null \
     | grep 'sync\.git_pull done' | tail -1 | awk '{print $1, $2, $3}')
   last_ok_j=$(json_str "${last_ok:-unknown}")
-  cat > "$STATE_FILE" <<EOF
+  cat > "$STATE_FILE.tmp" <<EOF
 {
   "status": "alarm",
   "checked_at": "$now",
@@ -249,9 +269,15 @@ if [ "$pull_alarm" -eq 1 ] || [ "$lag_alarm" -eq 1 ] || [ "$blind_alarm" -eq 1 ]
   ]
 }
 EOF
+  # Atomic publish: operators and tooling read this file on a timer, and a
+  # truncate-then-write can be caught mid-flight. Same .tmp+rename convention
+  # the engine's write-through uses.
+  mv -f "$STATE_FILE.tmp" "$STATE_FILE"
   [ "$pull_alarm" -eq 1 ] && logger -t gbrain-pull-alert -p user.err \
     "ALARM: no successful git pull for $UNIT in $WINDOW (failures: $fail_count, stalls: $stall_count; last good: ${last_ok:-unknown}). Brain content is frozen while sync still reports up_to_date."
-  [ "$lag_alarm" -eq 1 ] && logger -t gbrain-pull-alert -p user.err \
+  [ "$lag_alarm" -eq 1 ] && [ "$lag_state" = "stale_unverified" ] && logger -t gbrain-pull-alert -p user.err \
+    "ALARM: brain index was STALE at the last successful measurement (${lag_secs}s and counting) and this run could not re-measure (probe blind). Verdict retained until a measurement contradicts it."
+  [ "$lag_alarm" -eq 1 ] && [ "$lag_state" != "stale_unverified" ] && logger -t gbrain-pull-alert -p user.err \
     "ALARM: brain index is STALE — origin/main is ${origin_head:0:12} but the brain indexed ${indexed_commit:0:12}, not advancing for ${lag_secs}s (> ${LAG_GRACE_SECS}s). Content on origin/main is not reaching the brain."
   [ "$blind_alarm" -eq 1 ] && logger -t gbrain-pull-alert -p user.err \
     "ALARM: freshness check has been BLIND for ${blind_secs}s (> ${BLIND_GRACE_SECS}s), state=$lag_state. The brain may be stale and this guard cannot tell. Fix the probe before trusting any green reading."
@@ -272,7 +298,7 @@ fi
 overall="ok"
 [ "$probe_blind" -eq 1 ] && overall="degraded"
 
-cat > "$STATE_FILE" <<EOF
+cat > "$STATE_FILE.tmp" <<EOF
 {
   "status": "$overall",
   "checked_at": "$now",
@@ -285,9 +311,11 @@ cat > "$STATE_FILE" <<EOF
   "origin_head": "$origin_head_j",
   "indexed_commit": "$indexed_commit_j",
   "index_lag_seconds": $lag_secs,
-  "probe_blind_seconds": $blind_secs
+  "probe_blind_seconds": $blind_secs,
+  "alarms": { "pull": 0, "stale_index": 0, "probe_blind": 0 }
 }
 EOF
+mv -f "$STATE_FILE.tmp" "$STATE_FILE"
 
 # Failures alongside successes = flapping, which is what a partially-in-phase
 # second sync loop looks like before it becomes a full blackout. Warn, don't alarm.
