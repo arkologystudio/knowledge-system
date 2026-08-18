@@ -12,30 +12,68 @@ it from origin/main: every `--ff-only` pull and every `commit_page` push then
 failed until an operator reset the clone. Found via a user report (a blocked
 push), not an alarm.
 
+The lesson generalises past the specific bug: **a monitor that cannot take its
+own measurement must never report health.** The first cut of the freshness check
+in this release did exactly that and was caught in review — see Fixed.
+
 ### Added
 - `docs/designs/git-canonical-writes.md` — design for structurally enforcing
   that the wiki repo's `origin/main` is the single source of truth: mirror vs.
-  workspace split (sync becomes fetch + quarantine + `reset --hard`, divergence
-  becomes impossible rather than detected), `put_page` routed through the same
-  commit-and-push pipeline as `commit_page` with a derived `writer.mode` enum
-  (no reachable half-write state), provenance moved out of frontmatter into the
-  DB with a round-trip-stable serializer, and health capped whenever
+  workspace split (sync becomes fetch + quarantine + `reset --hard`, so
+  divergence is impossible rather than merely detected), `put_page` routed
+  through the same commit-and-push pipeline as `commit_page` behind a
+  `writer.mode` derived from whether a source is machine-managed, batched bulk
+  writes, provenance moved out of frontmatter into the DB with a
+  round-trip-stable serializer, and health capped whenever
   `indexed_commit != origin_head`. Includes a Tier-1 cherry-pick list from
-  upstream 0.43.0.0 → 0.46.19.0 and a phased migration plan.
-- `ops/kb-vps/gbrain-pull-watch.sh` (Phase 0 of that design): a second,
-  end-to-end check — `sources.last_commit` from the brain DB vs.
-  `git ls-remote origin main` asked of the remote directly. A mismatch
-  persisting past a 25-minute grace window alarms no matter what every other
-  surface reports. A blind probe (unreadable DB) warns instead of reading as
-  green. State file gains `freshness`, `origin_head`, `indexed_commit`,
-  `index_lag_seconds`.
+  upstream 0.43.0.0 → 0.46.19.0, eight test invariants, and a phased migration
+  plan with its ordering hazard called out.
+- **Phase 0 — end-to-end freshness check** in `ops/kb-vps/gbrain-pull-watch.sh`:
+  `sources.last_commit` from the brain DB vs. `git ls-remote --heads origin
+  refs/heads/main`, asked of the remote directly so a wedged clone cannot vouch
+  for itself. Alarms on a mismatch that persists *without the index advancing* —
+  the clock re-anchors when `last_commit` moves, so a brain working through a
+  backlog does not false-alarm. Three statuses now: `ok` (measured and fresh),
+  `degraded` (could not measure — freshness unverified), `alarm` (exit 1).
+  State file gains `freshness`, `origin_head`, `indexed_commit`,
+  `index_lag_seconds`, `probe_blind_seconds`, `stalled_pulls_in_window` and a
+  per-condition `alarms` object.
 
 ### Fixed
-- `ops/kb-vps/README.md` documents the third incident variant, the freshness
-  check, and the `self-upgrade` footgun: this deployment is the fork, but
-  `binary-self-update.ts` fetches releases from upstream `garrytan/gbrain`, so
-  running `gbrain self-upgrade` would silently replace the fork. The channel is
-  disabled on kb-vps (`self_upgrade.mode=off` + `GBRAIN_SELF_UPGRADE_MODE=off`).
+- **A failed freshness probe no longer resets the staleness clock.** It did in
+  the first cut, which meant an intermittently-failing probe (postgres restart,
+  `docker exec` timeout, GitHub blip) made real staleness permanently
+  un-alarmable — the clock never survived long enough to reach grace.
+  Regression-tested by alternating good and failed probes against a stale index.
+- **A blind freshness check reports `degraded`, not `ok`.** Previously it warned
+  and fell through to a green state file with exit 0, so both documented
+  operator surfaces (`systemctl --failed` and the state file's `status`) read
+  healthy while the guard was measuring nothing. Blindness now degrades from the
+  first affected run and escalates to a hard alarm once it persists past grace.
+- **State file is valid JSON when a concurrent sync actor exists.** `pgrep -af`
+  output is multi-line and contains quoted command lines, which produced
+  unparseable JSON in exactly the incident shape the field exists to report.
+  All interpolated values now go through an escaper.
+- Pull stalls are counted and reported. A pull that times out logs
+  `sync.git_pull error` without ever printing `git pull failed`, and a
+  lock-contended one logs `skipped`; both previously showed as "failures: 0"
+  alongside a total blackout.
+- `ls-remote` uses an exact refspec (a tag named `main` would otherwise return a
+  second SHA), distinguishes an unreachable remote from a missing branch, and a
+  corrupt lag-state file can no longer produce a 55-year lag or abort the run
+  before the state file is written.
+
+### Documentation
+- `ops/kb-vps/README.md`: third incident variant, the freshness signal and its
+  real alarm latency (≥30 min, up to ~45), the three-status contract, and the
+  **self-upgrade footgun**. This deployment is the fork, but the upgrade
+  machinery targets upstream `garrytan/gbrain`, hardcoded. Correcting an earlier
+  overstatement: setting `self_upgrade.mode=off` gates only the invocation nag
+  and the autopilot channel — `gbrain self-upgrade`, `gbrain upgrade` and
+  `gbrain check-update` never consult it and remain fully functional. It is a
+  human rule, not an enforced one, until Phase 1. Also notes that
+  `gbrain config set self_upgrade.mode off` writes the DB plane while the
+  resolver reads the file plane, making the CLI form a silent no-op.
 
 ## [0.43.0.18] - 2026-08-16
 

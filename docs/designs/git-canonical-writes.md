@@ -51,7 +51,13 @@ git worktree add --detach <tmp> origin/main   # cheap: shares object DB
 git worktree remove
 ```
 
-`commit_page` already implements preview/apply, SHA-pinning, protected slugs, repo locking, and `divergenceSafePull` — the change is *where* it operates (worktree, not mirror) and pushing before index update stays as-is. Contention between writes and the 5-minute sync disappears: they no longer share a checkout, only the object store, and a push simply makes the mirror's next fetch pick the commit up. After a successful push, trigger an immediate sync tick so recall reflects the write in seconds, not minutes.
+`commit_page` already implements preview/apply, SHA-pinning, protected slugs, repo locking, and `divergenceSafePull` — the change is *where* it operates (worktree, not mirror) and pushing before index update stays as-is. **Checkout** contention with the 5-minute sync disappears: writes no longer touch the mirror's working tree, and a push simply makes the mirror's next fetch pick the commit up. After a successful push, trigger an immediate sync tick so recall reflects the write in seconds, not minutes.
+
+**Worktrees do not eliminate git-level contention, and the design must not pretend they do.** `git worktree add` writes into the mirror's `.git` (`.git/worktrees/<id>`, ref locks), and obtaining an up-to-date `origin/main` to branch from requires a fetch into that same `.git` — i.e. the shared ref and `FETCH_HEAD` surface that caused the July 2026 incident. Three requirements follow, and they are part of Phase 2's contract rather than incidental detail:
+
+1. **Never fetch into `FETCH_HEAD` from a write path.** Use an explicit private refspec (`+refs/heads/main:refs/gbrain/write/<id>`) so write fetches and the sync pull can never nominate competing merge candidates.
+2. **Writes continue to take the existing cross-process repo lock** (`src/core/repo-lock.ts`) around the fetch + worktree add/remove, exactly as page writes do today (30s wait, then fail loudly). The lock's scope shrinks — it no longer has to cover the commit itself — but it does not go away.
+3. **Prefer a separate git dir over a worktree if measurement shows ref-lock contention** at the write rates we actually see. A second bare clone costs disk and a fetch; it shares nothing. Decide with a measurement in Phase 2, not by assertion here.
 
 The mirror directory itself gets aggressive hygiene: mode `0700`, and an ops-README breadcrumb *inside* it (`/srv/brain-repos/arkology/DO-NOT-EDIT.md`, git-ignored) saying "this tree is bulldozed every 5 minutes; write via MCP or push to origin". The 09:10 root commit that triggered this incident was a well-intentioned human tidying a dirty tree — make the tree self-describing so the tidy impulse routes correctly.
 
@@ -73,7 +79,15 @@ The mirror directory itself gets aggressive hygiene: mode `0700`, and an ops-REA
 | `local-tree` | The working tree; a human commits | write file into tree, index; **never commits** | Ross's personal brain (the refresh daemon imports the tree; git is the human's act) |
 | `db-only` | The DB, explicitly ephemeral | index only; no file | Scratch/test brains, no repo configured |
 
-Mode is derived, not chosen freely: a source with `remote_url`/tracked origin **must** be `git-first` — configuring `db-only` on a remote-backed source is a refused config write. The dangerous middle ground the incident exploited — *DB + uncommitted file inside a pulled clone* — corresponds to no mode and ceases to be a reachable state. `src/core/write-through.ts` (the uncommitted-file drop) is **deleted** for `git-first` sources; its stated purpose ("a committable .md artifact") is subsumed by actually committing it.
+**Mode derivation, and the one legitimate opt-out.** Remote presence alone cannot be the discriminator: Ross's personal wiki has an origin *and* is correctly `local-tree` (a human commits from Obsidian; no daemon should). The discriminating property is not "has a remote" but **"is this working tree machine-managed?"** — i.e. does something automatically pull and reset it?
+
+So the rule is: a source is `git-first` **iff it is a machine-managed clone**, recorded as an explicit `source.managed: true` set at registration time (any source gbrain itself clones/pulls, which is every org brain). Given `managed: true`, `git-first` is forced — `db-only` and `local-tree` are refused config writes. Given `managed: false` (a path the operator points at and tends by hand), `local-tree` is the default and `git-first` is available opt-in. `db-only` requires no repo at all.
+
+The dangerous middle ground the incident exploited — *DB + uncommitted file inside a machine-pulled clone* — corresponds to no mode and ceases to be a reachable state. `src/core/write-through.ts` (the uncommitted-file drop) is **deleted** for `git-first` sources; its stated purpose ("a committable .md artifact") is subsumed by actually committing it. It is retained, unchanged and correct, for `local-tree`.
+
+**B1a — Bulk writes commit in batches, not per page.** Routing `put_page` through commit+push makes every caller pay a network round trip, and the bulk callers (`submit_ingest`, `ingest-bulk`, `brainstorm/lsd --save`, dream-cycle synthesis) write tens to hundreds of pages per operation. N pages must not become N commits and N pushes contending with each other and with every other writer — with fail-loud semantics and a bounded rebase retry, that turns ordinary contention into partial-import failure.
+
+Bulk paths therefore open **one** worktree, write all pages, make **one** commit, and push once; the DB index updates for all pages after that push lands. Partial failure is then all-or-nothing per batch, which is both easier to reason about and closer to what a human contributor does. Single-page `put_page` keeps the simple path. The per-write latency budget (worktree add + commit + push, realistically 1–3s against GitHub) is acceptable for interactive writes and is the explicit price of the invariant; if it ever isn't, the answer is batching or a coalescing window, never a silent DB-only fallback.
 
 **B2 — Push failure = write failure (fail-loud), with a visible ledger.** In `git-first` mode, if the push cannot complete after the bounded rebase-retry, the `put_page`/`commit_page` call **returns an error** — the agent is told, this turn, that the write did not happen, with the git error attached (already redacted by `redactGitError`). No silent DB-only fallback: a fallback would recreate F2 with extra steps.
 
@@ -85,6 +99,8 @@ Rejected alternative — a durable outbox (queue unpushed commits, retry in back
 
 1. **Provenance lives in the DB, not the file.** The committed markdown carries only author-meaningful frontmatter. Machine provenance (`ingested_via`, `anchored_commit`, timestamps of ingestion) is DB metadata, queryable via MCP, never serialized into the repo. Git already *is* the provenance layer for files — committer, message, history. Duplicating it into frontmatter created the diff that created the conflict.
 2. **Round-trip stability:** `parse(serialize(parse(md))) ≡ parse(md)` and, for already-canonical files, `serialize(parse(md)) ≡ md` byte-identical. One serializer (`serializePageToMarkdown`) used by sync, lint --fix, and both write ops. A hand-authored page and a machine-written page of the same content converge to the same bytes → git merges become trivial or empty.
+
+Migration cost is small but not zero: only 3 of 456 committed files in the arkology wiki currently carry these keys, and nothing reads them back out of frontmatter (they are passed *into* `putPage` as options, never parsed from disk). But `ingested_via`/`source_kind` are **not** in `HASH_EPHEMERAL_FRONTMATTER_KEYS` (`src/core/content-hash.ts`), so removing them changes those pages' content hash and triggers a re-chunk and re-embed. Trivial at 3 files; worth knowing before running it on a brain where a bulk import stamped thousands. Either add the keys to the ephemeral set in the same change, or accept the one-off re-embed.
 
 ### Mechanism C — Observability keyed to the invariant (kills F3)
 
@@ -105,7 +121,7 @@ indexed_commit    (the ingest checkpoint)         + lag = origin_head..indexed_c
 - **Humans and bots push straight to `origin/main`.** Git is the concurrency arbiter; occasional non-FF rejections answered by `git pull --rebase` are normal multi-writer traffic, not a defect. No branch protection or PR gate is imposed by this design (an org can add one; the system must not require it).
 - **`commit_page`'s preview/apply + SHA-pinning contract** — unchanged, now shared by `put_page`.
 - **Protected slugs** (`north-star`, `voice/*`) — unchanged, now *also* guarding `put_page` (a strict improvement: they were bypassable via the half-write).
-- **Ross's personal brain** — declared `local-tree`; its behaviour today (daemon imports the working tree, human commits) was always correct, but by accident. Now it's correct by declaration.
+- **Ross's personal brain** — `managed: false` → `local-tree`; its behaviour today (daemon imports the working tree, human commits) was always correct, but by accident. Now it's correct by declaration. Note this brain *has* a git origin, which is exactly why the mode discriminator is machine-management rather than remote presence (§B1).
 
 ## 3. Upstream integration (0.43.0.0 → 0.46.19.0)
 
@@ -137,13 +153,15 @@ Tier 2 (valuable, independent): structural write accounting for subagent jobs; d
 
 | Phase | Content | Size | Risk |
 |---|---|---|---|
-| **0 — today** | `gbrain-freshness-watch`: extend the existing guard to alarm on indexed-commit lag vs `origin_head`. Pure ops script + timer; no engine change. Disable the self-upgrade footgun on kb-vps. | S | none |
-| **1** | Mechanism A: sync's git step → fetch + quarantine + reset; mirror dir hygiene. Contained in the sync git module (`git-remote.ts` + sync step). | M | low — behaviour only changes in states that are today's failure states |
-| **2** | Mechanism B: worktree write path (refactor `git-page-write.ts` to operate in ephemeral worktrees); route `put_page` through it; `writer.mode` enum + derivation rule; delete `write-through.ts` for `git-first`; B3 canonical serializer + provenance-out-of-frontmatter. | L | main risk = serializer round-trip regressions; gate with a corpus round-trip test over the whole arkology wiki |
+| **0 — today** | Extend the existing guard to alarm on indexed-commit lag vs `origin_head`, degrade (never `ok`) when it cannot measure, and never let a failed probe reset the staleness clock. Pure ops script + timer; no engine change. Document the self-upgrade footgun and disable its two gated channels on kb-vps. | S | none |
+| **1** | Mechanism A: sync's git step → fetch + quarantine + reset; mirror dir hygiene. **Must also disable write-through for machine-managed sources in the same change** — see the ordering hazard below. A real block on the ungated manual upgrade commands rides here. | M | medium — see hazard |
+| **2** | Mechanism B: worktree write path (refactor `git-page-write.ts` onto ephemeral worktrees + private refspec); route `put_page` through it; bulk batching (§B1a); `writer.mode` + `managed` derivation; delete `write-through.ts` for `git-first`; B3 canonical serializer + provenance-out-of-frontmatter. | L | main risk = serializer round-trip regressions; gate with a corpus round-trip test over the whole arkology wiki |
 | **3** | Mechanism C in-engine: three-commit model in `get_health`/`sources_status`, score cap. Retire the phase-0 script's overlap. | M | low |
 | Interleaved | Tier-1 cherry-picks, each with its upstream tests. | M | per-pick |
 
-Phase 0 alone would have converted this incident from "found by a user report weeks later" to "alarmed within 25 minutes, twice over."
+**Ordering hazard — Phase 1 without part of Phase 2 destroys data.** Today `put_page` drops an *uncommitted* file into the machine-managed clone and it survives there until someone commits it (which is how the incident's two pages reached git at all). Phase 1's `reset --hard` bulldozes exactly that file within 5 minutes — quarantined rather than lost, but no longer landing in git by the accidental route people currently rely on. Write-through droppings are a **normal, everyday state**, not a failure state, so Phase 1 is not the low-risk change it first appears. Therefore Phase 1 must ship with write-through disabled for machine-managed sources (making `put_page` DB-only and *loudly* so, until Phase 2 makes it git-first), or Phases 1 and 2 must merge. Shipping Phase 1 alone is not an option.
+
+Phase 0 alone would have converted this incident from "found by a user report weeks later" to "alarmed within ~30–45 minutes, twice over" (three consecutive 15-minute observations against a 1500s grace).
 
 ## 5. Test invariants (the pins that keep this true)
 
@@ -152,6 +170,9 @@ Phase 0 alone would have converted this incident from "found by a user report we
 3. **Round-trip pin:** for every `.md` in the test corpus (import the real wiki as a fixture), `serialize(parse(f)) == f` byte-identical once canonicalized, and `put_page(content)` followed by `git show` returns the canonical bytes with **no provenance keys**.
 4. **Fail-loud pin:** push refused (simulated non-FF beyond retry budget / auth failure) → `put_page` returns error, **DB row unchanged**, no file left anywhere.
 5. **Green-impossible pin:** `indexed_commit ≠ origin_head` past grace → `brain_score ≤ cap`, regardless of every internal metric being perfect.
+6. **Cannot-measure-is-not-green pin:** every freshness surface (the Phase 0 guard, and `get_health`/`sources_status` from Phase 3) must report a distinct *unverified* state — never its healthy value — when the measurement itself fails: DB unreadable, remote unreachable, branch/source misconfigured. A monitor that cannot measure and says "fine" is the original bug wearing a different hat; the first cut of the Phase 0 guard shipped exactly that and was caught in review.
+7. **Probe-flap pin:** an intermittently-failing freshness probe must not extend time-to-alarm without bound. Alternating success/failure runs against a genuinely stale index must still alarm — i.e. a failed measurement never resets the staleness clock. (Regression-tested; this was the review's blocking finding B1.)
+8. **Git-ahead-is-benign pin:** a push that succeeds followed by a failed DB index update leaves git ahead of the brain. This is the *safe* direction — the next sync tick reconciles it — and must be asserted as such: no retry storm, no rollback of the pushed commit, and the page appears in the index within one tick. Only DB-ahead-of-git (pin 1) is a violation.
 
 ## 6. Decisions taken in this design (each reversible, flagged per triage protocol)
 
@@ -162,4 +183,6 @@ Phase 0 alone would have converted this incident from "found by a user report we
 | `reset --hard` mirror + quarantine | Keep `--ff-only` + better alarms | Alarms detect; reset *prevents*. Unattended convergence is the point |
 | Provenance in DB, not frontmatter | Frontmatter stamps (status quo) | The stamps *were* the conflict; git is already the file-level provenance layer |
 | Cherry-pick upstream, defer wholesale merge | Merge 0.46 now | 44 releases of unrelated surface; don't couple the safety fix to a mega-merge |
-| Modes derived from remote presence, not free config | Free choice of mode | A remote-backed source configured `db-only` is the incident again by config |
+| Modes derived from **machine-management** (`managed`), not free config | Derive from remote presence; or free choice of mode | A managed source configured `db-only` is the incident again by config. Remote presence is the wrong discriminator — the personal brain has an origin and is legitimately hand-committed |
+| Bulk writes = one commit + one push per batch | One commit per page | N pushes contending under fail-loud semantics turns ordinary contention into partial-import failure |
+| Phase 1 ships with write-through disabled (or merges into Phase 2) | Ship Phase 1 standalone as planned | `reset --hard` would bulldoze `put_page` droppings that are a normal state today, not a failure state |
