@@ -2,6 +2,41 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.19] - 2026-08-18
+
+**Three weeks of staleness behind a green guard.** The ingest checkpoint wedged
+at a 28 July commit while `git pull` kept succeeding — so the pull-success guard
+(built for the July incidents) read green throughout. Separately, an uncommitted
+`put_page` write-through file was hand-committed inside the sync clone, diverging
+it from origin/main: every `--ff-only` pull and every `commit_page` push then
+failed until an operator reset the clone. Found via a user report (a blocked
+push), not an alarm.
+
+### Added
+- `docs/designs/git-canonical-writes.md` — design for structurally enforcing
+  that the wiki repo's `origin/main` is the single source of truth: mirror vs.
+  workspace split (sync becomes fetch + quarantine + `reset --hard`, divergence
+  becomes impossible rather than detected), `put_page` routed through the same
+  commit-and-push pipeline as `commit_page` with a derived `writer.mode` enum
+  (no reachable half-write state), provenance moved out of frontmatter into the
+  DB with a round-trip-stable serializer, and health capped whenever
+  `indexed_commit != origin_head`. Includes a Tier-1 cherry-pick list from
+  upstream 0.43.0.0 → 0.46.19.0 and a phased migration plan.
+- `ops/kb-vps/gbrain-pull-watch.sh` (Phase 0 of that design): a second,
+  end-to-end check — `sources.last_commit` from the brain DB vs.
+  `git ls-remote origin main` asked of the remote directly. A mismatch
+  persisting past a 25-minute grace window alarms no matter what every other
+  surface reports. A blind probe (unreadable DB) warns instead of reading as
+  green. State file gains `freshness`, `origin_head`, `indexed_commit`,
+  `index_lag_seconds`.
+
+### Fixed
+- `ops/kb-vps/README.md` documents the third incident variant, the freshness
+  check, and the `self-upgrade` footgun: this deployment is the fork, but
+  `binary-self-update.ts` fetches releases from upstream `garrytan/gbrain`, so
+  running `gbrain self-upgrade` would silently replace the fork. The channel is
+  disabled on kb-vps (`self_upgrade.mode=off` + `GBRAIN_SELF_UPGRADE_MODE=off`).
+
 ## [0.43.0.18] - 2026-08-16
 
 **A brain that looks connected and answers nothing.** An MCP client went silent

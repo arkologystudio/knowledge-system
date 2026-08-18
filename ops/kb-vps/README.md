@@ -129,15 +129,29 @@ It happened twice in July 2026 — 09–14 Jul, and again 23–27 Jul, the secon
 unnoticed for five days. It surfaced only indirectly, as `/note/...` links 404ing
 on the dashboard.
 
-**The signal that matters is the absence of a successful pull, not the presence
-of failures.** A stall can take shapes that never log the word "failed". That is
-what the guard watches.
+Then a **third variant, 28 Jul – 18 Aug 2026**, walked past the pull check
+entirely: the ingest checkpoint wedged at a 28 July commit while pulls kept
+*succeeding*, so the brain served three-week-old content behind a green guard.
+Separately, an uncommitted `put_page` write-through file was hand-committed in
+the clone on 18 Aug, diverging it from origin — every `--ff-only` pull and every
+`commit_page` push then failed until an operator reset the clone. Post-mortem
+and the structural fix: `docs/designs/git-canonical-writes.md` (this guard is
+its Phase 0).
+
+**Two signals, both watched since Phase 0:**
+
+1. **Absence of a successful pull, not the presence of failures.** A stall can
+   take shapes that never log the word "failed".
+2. **Indexed-commit freshness** — `sources.last_commit` in the brain DB vs.
+   what `git ls-remote origin main` reports, asked of the remote directly so a
+   wedged clone cannot vouch for itself. A mismatch persisting past a 25-minute
+   grace window alarms regardless of what every other surface says.
 
 ```bash
 # Is content actually reaching the brain?
 journalctl -u knowledge-system-sync.service --since "1 hour ago" | grep -c 'git_pull done'
 
-# Current guard verdict
+# Current guard verdict (includes freshness, origin_head, indexed_commit)
 cat /var/lib/gbrain/sync-pull-alert.json
 ```
 
@@ -207,6 +221,23 @@ same lock.
 
 This only excludes *gbrain* processes. A human running `git pull` in the
 checkout is not serialised by it.
+
+## Never run `gbrain self-upgrade` on this host
+
+This deployment runs the **fork** (`arkologystudio/knowledge-system`), but
+`self-upgrade` / the invocation-riding upgrade nag fetch releases from
+**upstream** (`garrytan/gbrain` — see `src/core/binary-self-update.ts`).
+Running it would silently replace the fork with upstream, reverting every fork
+patch. The channel is disabled on this host, belt and braces:
+
+- `/root/.gbrain/config.json` → `"self_upgrade": { "mode": "off" }`
+- `/etc/gbrain/gbrain.env` → `GBRAIN_SELF_UPGRADE_MODE=off` (covers the systemd
+  units even if the config file is regenerated)
+
+Upgrades happen only via the fork's own deploy path (git pull in
+`/root/knowledge-system`, per "Deploying" above). If the `UPGRADE_AVAILABLE`
+nag ever reappears, the disable has been lost — restore both lines before
+anything else.
 
 ## Source `default` is permanently `unmanaged-remote`
 
