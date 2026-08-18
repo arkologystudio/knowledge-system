@@ -13,7 +13,7 @@ have survived a rebuild.
 
 | Path | What |
 |---|---|
-| `gbrain-pull-watch.sh` | Guard: alarms when the wiki sync stops reaching the remote |
+| `gbrain-pull-watch.sh` | Guard: alarms when the wiki stops reaching the brain — sync not pulling, **or** the brain index not advancing toward `origin/main` |
 | `systemd/gbrain-pull-watch.{service,timer}` | Runs the guard every 15 minutes |
 | `systemd/knowledge-system-sync.service` | The 5-minute wiki sync (`gbrain sync --watch`) |
 | `knowledge-system-http.service` | HTTP MCP / OAuth server on :3131 (top level, not `systemd/` — tracked there first by the KS-E governance work, with a comment block explaining its non-obvious bind address; referenced by `docs/deploy/KS-E-governance-retrieval.md`) |
@@ -129,16 +129,58 @@ It happened twice in July 2026 — 09–14 Jul, and again 23–27 Jul, the secon
 unnoticed for five days. It surfaced only indirectly, as `/note/...` links 404ing
 on the dashboard.
 
-**The signal that matters is the absence of a successful pull, not the presence
-of failures.** A stall can take shapes that never log the word "failed". That is
-what the guard watches.
+Then a **third variant, 28 Jul – 18 Aug 2026**, walked past the pull check
+entirely: the ingest checkpoint wedged at a 28 July commit while pulls kept
+*succeeding*, so the brain served three-week-old content behind a green guard.
+Separately, an uncommitted `put_page` write-through file was hand-committed in
+the clone on 18 Aug, diverging it from origin — every `--ff-only` pull and every
+`commit_page` push then failed until an operator reset the clone. Post-mortem
+and the structural fix: `docs/designs/git-canonical-writes.md` (this guard is
+its Phase 0).
+
+**Two signals, both watched since Phase 0:**
+
+1. **Absence of a successful pull, not the presence of failures.** A stall can
+   take shapes that never log the word "failed".
+2. **Indexed-commit freshness** — `sources.last_commit` in the brain DB vs.
+   what `git ls-remote --heads origin refs/heads/main` reports, asked of the
+   remote directly so a wedged clone cannot vouch for itself. The alarm fires
+   on a mismatch **that persists without the index advancing**: the clock
+   re-anchors whenever `last_commit` moves, so a brain chewing through a
+   backlog does not alarm, and normal transient mismatches do not either
+   (`commit_page` pushes to origin without touching `last_commit`, so every
+   agent write lags until the next 5-minute tick).
+
+   With a 15-minute timer and a 1500s grace, an alarm needs three consecutive
+   non-advancing observations: **≥30 min after the first observation, up to
+   ~45 min after the mismatch began.**
+
+**The guard must never go quietly blind.** If it cannot take a measurement —
+`docker exec`/psql unreachable, `ls-remote` failing, `REPO`/`BRANCH`
+misconfigured — it reports `"status": "degraded"` (never `ok`), warns, and
+escalates to a hard alarm once blindness itself persists past grace. A failed
+probe also **never resets the staleness clock**; the first cut of this check
+did, which made an intermittently-failing probe able to mask indefinite
+staleness — it never survived long enough to reach grace.
+
+Three statuses, and only one of them means "verified fresh":
+
+| `status` | Exit | Meaning |
+|---|---|---|
+| `ok` | 0 | Measured. Either fresh, or lagging inside the grace window (normal after a push) |
+| `degraded` | 0 | **Could not measure.** Freshness is unverified, not verified-good |
+| `alarm` | 1 | Sync not pulling, index not advancing, or blind past grace |
 
 ```bash
 # Is content actually reaching the brain?
 journalctl -u knowledge-system-sync.service --since "1 hour ago" | grep -c 'git_pull done'
 
-# Current guard verdict
+# Current guard verdict (status, freshness, origin_head, indexed_commit, alarms)
 cat /var/lib/gbrain/sync-pull-alert.json
+
+# Take the end-to-end measurement by hand
+docker exec gbrain-pg psql -U gbrain -d gbrain -tAc "SELECT last_commit FROM sources WHERE id='default'"
+git -C /srv/brain-repos/arkology ls-remote --heads origin refs/heads/main
 ```
 
 The guard is detection-only: it never restarts services or touches the brain. It
@@ -207,6 +249,49 @@ same lock.
 
 This only excludes *gbrain* processes. A human running `git pull` in the
 checkout is not serialised by it.
+
+## Never run `gbrain self-upgrade` on this host — and it is NOT enforced
+
+This deployment runs the **fork** (`arkologystudio/knowledge-system`), but the
+upgrade machinery fetches releases from **upstream**:
+`https://api.github.com/repos/garrytan/gbrain/releases/latest`, hardcoded at
+`src/core/binary-self-update.ts:85` with no env or config override (same in
+`check-update.ts`, `upgrade.ts`). Upgrading would silently replace the fork with
+upstream and revert every fork patch.
+
+**What is disabled, and what is not.** `resolveSelfUpgradeMode`
+(`src/core/self-upgrade.ts`) has exactly two *enforcing* callers — the
+invocation-riding nag (`src/cli.ts`) and the autopilot channel
+(`src/commands/autopilot.ts`); `doctor.ts` reads it to report, not to gate. Both
+are off on this host:
+
+- `/root/.gbrain/config.json` → `"self_upgrade": { "mode": "off" }`
+- `/etc/gbrain/gbrain.env` → `GBRAIN_SELF_UPGRADE_MODE=off` (env wins over
+  config, and covers the systemd units if the config file is regenerated)
+
+**The manual commands are NOT gated by either setting.**
+`src/commands/self-upgrade.ts` never calls `resolveSelfUpgradeMode` — it goes
+straight to `fetchLatestRelease()` → `runUpgrade()`, and `--force` skips even
+the "am I actually behind" check. `gbrain upgrade` and `gbrain check-update` are
+ungated too. So typing the command in this heading still fetches upstream and
+installs it. **Treat this as a human rule, not an enforced one.** A real block
+lands with Phase 1 of `docs/designs/git-canonical-writes.md`.
+
+Two related traps:
+
+- `gbrain config set self_upgrade.mode off` — which the product itself suggests
+  (`upgrade.ts`, `doctor.ts`) — writes the **DB** plane while the resolver reads
+  the **file** plane. It is a silent no-op. Hand-edit `config.json`, as above.
+- The resolver falls back to the permissive `notify` on any unrecognized value.
+  A typo in `config.json` therefore silently re-enables the nag channel. A
+  typo in the env var alone is safe — an unrecognized env value is discarded
+  and the file plane still answers `off` — so the config file is the one that
+  must be right.
+
+Upgrades happen only via the fork's own deploy path (git pull in
+`/root/knowledge-system`, per "Deploying" above). If the `UPGRADE_AVAILABLE` nag
+ever reappears, a disable has been lost — restore both lines before anything
+else.
 
 ## Source `default` is permanently `unmanaged-remote`
 
