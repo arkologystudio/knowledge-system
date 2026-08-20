@@ -1023,7 +1023,11 @@ const put_page: Operation = {
       // here would overwrite that file with the re-serialised row — reintroducing
       // the provenance-stamp diff that collided add/add in the incident.
       writeThrough = { written: false, skipped: 'git_first' };
-    } else if (writerMode?.mode === 'db-only') {
+    } else if (writerMode?.mode === 'db-only' && writerMode.repoPath) {
+      // Only short-circuit when db-only was CHOSEN despite a checkout existing.
+      // When there simply is no repo, fall through: `writePageThrough` already
+      // reports that precisely (`no_repo_configured`), and relabelling it here
+      // would change a long-standing contract for no gain.
       writeThrough = { written: false, skipped: 'db_only' };
     } else if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
       const sourceId = ctx.sourceId ?? 'default';
