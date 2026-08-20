@@ -954,7 +954,12 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'mcp.',               // mcp.publish_skills, mcp.skills_dir (PR1 skill catalog)
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
-  'writer.',            // writer.mode.<sourceId>, writer.managed_sources, commit_page.*
+  // NOT a blanket 'writer.' prefix: `writer.managed_sources` is the declaration
+  // that decides whether a source is protected at all, so a typo
+  // (`writer.managed_source`) must be REJECTED as an unknown key rather than
+  // silently accepted and silently leaving the source unmanaged. Only the
+  // genuinely open-ended per-source namespace is prefixed.
+  'writer.mode.',       // writer.mode.<sourceId>
 ];
 
 export function saveConfig(config: GBrainConfig): void {

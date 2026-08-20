@@ -114,6 +114,43 @@ export class GitPageWriteError extends Error {
   }
 }
 
+/**
+ * Map a git-write failure onto an operation error code an AGENT can act on.
+ *
+ * This distinction is not cosmetic. `invalid_params` tells an agent its content
+ * was malformed, so it rewrites the page; `git_conflict` / `git_push_failed` tell
+ * it the content was fine and the repository was momentarily unavailable, so it
+ * retries. Collapsing the second class into the first makes an agent respond to a
+ * 30-second lock contention with the 5-minutely sync by rewriting a perfectly
+ * good page — and lock contention is routine, not exceptional.
+ */
+export function gitFailureCode(e: unknown): string {
+  if (!(e instanceof GitPageWriteError)) return 'storage_error';
+  switch (e.code) {
+    case 'protected_path':
+      return 'permission_denied';           // deliberate policy; never retry
+    case 'invalid_content':
+      return 'invalid_params';              // the content really is the problem
+    case 'repo_dirty':
+    case 'repo_conflict':
+    case 'stale_preview':
+      return 'git_conflict';                // transient; retry is correct
+    case 'push_failed':
+    case 'commit_failed':
+      return 'git_push_failed';             // transient; retry is correct
+    case 'repo_unavailable':
+    case 'disabled':
+    default:
+      return 'storage_error';               // operator/configuration problem
+  }
+}
+
+/** True when the failure is worth retrying rather than rewriting the content. */
+export function isRetryableGitFailure(e: unknown): boolean {
+  const code = gitFailureCode(e);
+  return code === 'git_conflict' || code === 'git_push_failed';
+}
+
 const repoQueues = new Map<string, Promise<void>>();
 
 async function serializeForRepo<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
@@ -311,9 +348,29 @@ export async function gitFirstPageWrite(
           'push', ...GIT_SSRF_SUBCOMMAND_FLAGS, 'origin', `HEAD:${branch}`,
         ], 180_000);
       } catch (e) {
+        // Roll the commit back. Leaving it behind was the pre-existing behaviour
+        // and it is worse than it looks: the checkout is left CLEAN but one commit
+        // ahead of origin — the exact divergent state this whole design exists to
+        // prevent — and because `divergenceSafePull` rebases, the NEXT successful
+        // write replays and pushes this commit. The caller was told its write
+        // failed and no index row was created, yet the content reaches
+        // `origin/main` later, unindexed and unattributed.
+        //
+        // Reset to the pre-write commit so a failed write leaves nothing at all.
+        // `--hard` is safe here and nowhere else: we are inside the repo lock, we
+        // verified the tree was clean before writing, and the only change since is
+        // the one file we just wrote.
+        let rollback = 'rolled back';
+        try {
+          git(repoPath, ['reset', '--hard', head], 30_000);
+        } catch (resetErr) {
+          // Report the failure to roll back rather than hiding it — a mirror left
+          // ahead of origin is something an operator needs to know about.
+          rollback = `ROLLBACK FAILED (${redactGitError(resetErr instanceof Error ? resetErr.message : String(resetErr))}); commit ${committedHead.slice(0, 12)} is local-only and will be replayed by the next write`;
+        }
         throw new GitPageWriteError(
           'push_failed',
-          `commit ${committedHead.slice(0, 12)} is local-only; push failed: ${redactGitError(e instanceof Error ? e.message : String(e))}`,
+          `push failed (${rollback}): ${redactGitError(e instanceof Error ? e.message : String(e))}`,
         );
       }
 

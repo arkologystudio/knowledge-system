@@ -48,8 +48,12 @@ export interface WriteThroughResult {
    *     DB write failed or targeted a different source).
    *   - path_escapes_source_root: the computed file path resolves outside the
    *     source's working tree (hostile slug row / symlinked subtree) — refused.
+   *   - git_first_source: the source is machine-managed, so an uncommitted file
+   *     here would be a dropping in a tree a machine resets. Refused centrally
+   *     (see the guard in writePageThrough) so EVERY caller is covered, not just
+   *     the ones that remembered to check.
    */
-  skipped?: 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root';
+  skipped?: 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'git_first_source';
   /** Set when the render/write/rename itself threw (EACCES, ENOTDIR, disk full). */
   error?: string;
 }
@@ -73,6 +77,31 @@ export async function writePageThrough(
   opts: WritePageThroughOpts = {},
 ): Promise<WriteThroughResult> {
   const sourceId = opts.sourceId ?? 'default';
+
+  // Central refusal for machine-managed sources.
+  //
+  // This guard lives HERE rather than at each call site on purpose. `put_page`
+  // already skips write-through on a git-first source, but it is not the only
+  // caller — `gbrain brainstorm/lsd --save` calls this helper directly. A guard
+  // that each caller has to remember is the same prose-shaped protection that
+  // failed on 2026-08-18; one central refusal covers callers that do not exist
+  // yet. An uncommitted file in a machine-managed tree is a dropping, and once
+  // mirrors converge (v0.43.0.22) it is a dropping that gets bulldozed within
+  // five minutes.
+  try {
+    const { resolveWriterMode } = await import('./writer-mode.ts');
+    const writer = await resolveWriterMode(engine, sourceId);
+    if (writer.mode === 'git-first') {
+      opts.logger?.warn(
+        `[write-through] refused for '${slug}': source '${sourceId}' is machine-managed (git-first). ` +
+        `The page is in the database but NOT in git — write it via put_page or commit_page to anchor it.`,
+      );
+      return { written: false, skipped: 'git_first_source' };
+    }
+  } catch {
+    // A writer-mode misconfiguration must not break the legacy write-through
+    // path; fall through to the pre-existing behaviour.
+  }
   try {
     // #2018: pick the disk target so a page is NEVER written into a different
     // source's working tree. Two legitimate topologies, plus the leak guard:

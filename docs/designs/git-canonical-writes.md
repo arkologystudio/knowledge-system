@@ -11,6 +11,12 @@ Today this invariant is prose — encoded in CLAUDE.md instructions, skill text,
 
 This design makes the invariant **structural**: after it lands, there is *no reachable code path* on a remote-backed brain that leaves the DB ahead of git, and *no state* the sync clone can reach from which it cannot recover unattended.
 
+**Status against that bar, as of v0.43.0.22** — stated plainly, because a design doc that overstates its own completion is how the next incident gets missed:
+
+- ✅ No `put_page` write leaves the DB ahead of git on a managed source, and no write path leaves an *uncommitted file* in a managed tree (the write-through refusal is central, not per-caller).
+- ⚠️ Two paths are still DB-only on a managed source: `submit_ingest` and sandbox subagents (Phase 2b). They cannot wedge a mirror, but they are not anchored.
+- ⚠️ The mirror recovers unattended from divergence, dirt, and local commits — but **not** from a detached HEAD or a missing `origin/<branch>`, both of which still require a human. Those are refusals rather than wedges, but the "no state" claim is not yet literal.
+
 ## 1. Root-cause taxonomy (why prose failed)
 
 The incident decomposes into three independent structural flaws. Each mechanism below kills one of them.
@@ -157,7 +163,8 @@ Tier 2 (valuable, independent): structural write accounting for subagent jobs; d
 |---|---|---|---|
 | **0 — today** | Extend the existing guard to alarm on indexed-commit lag vs `origin_head`, degrade (never `ok`) when it cannot measure, and never let a failed probe reset the staleness clock. Pure ops script + timer; no engine change. Document the self-upgrade footgun and disable its two gated channels on kb-vps. **Done** (v0.43.0.19). | S | none |
 | **0b — done** | Close the self-upgrade footgun structurally: build identity as a compile-time constant (`src/core/distribution.ts`), foreign releases refused on every apply path, passive checks report fork status. Config could not do this — `self_upgrade.mode` is not on the path the dangerous commands take. **Done** (v0.43.0.20). | S | none — inert on upstream builds |
-| **2a — done** | Mechanism B core: `writer.mode` derived from a `writer.managed_sources` declaration; `put_page` routed through the git-first commit+push path on managed sources; write-through skipped there; provenance kept out of the committed bytes as a consequence of committing the caller's content. **Done** (v0.43.0.21). | M | landed |
+| **2a — done** | Mechanism B core: `writer.mode` derived from a `writer.managed_sources` declaration; `put_page` routed through the git-first commit+push path on managed sources; write-through refused centrally for managed sources; provenance kept out of the committed bytes as a consequence of committing the caller's content. **Done** (v0.43.0.21). | M | landed |
+| **2b — open** | Anchor the two remaining database-only paths on managed sources: `submit_ingest` (ingest-capture minion → `importFromContent` with no git) and sandbox subagents (`viaSubagent` without `allowedSlugPrefixes`). Neither leaves a dropping, so neither can wedge a mirror — but neither is reachable from `origin/main` either, so §0's invariant is not yet literally true. Also owed: §B1a bulk batching. | M | — |
 | **1** | Mechanism A: sync's git step → fetch + quarantine + reset; mirror dir hygiene. **Ordering hazard is now RESOLVED by 2a** — see below. | M | low, now that 2a has landed |
 | **2** | Mechanism B: worktree write path (refactor `git-page-write.ts` onto ephemeral worktrees + private refspec); route `put_page` through it; bulk batching (§B1a); `writer.mode` + `managed` derivation; delete `write-through.ts` for `git-first`; B3 canonical serializer + provenance-out-of-frontmatter. | L | main risk = serializer round-trip regressions; gate with a corpus round-trip test over the whole arkology wiki |
 | **3** | Mechanism C in-engine: three-commit model in `get_health`/`sources_status`, score cap. Retire the phase-0 script's overlap. | M | low |

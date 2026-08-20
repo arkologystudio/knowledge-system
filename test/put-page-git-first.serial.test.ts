@@ -81,6 +81,10 @@ afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 describe('put_page on a machine-managed source', () => {
   beforeEach(async () => {
     await engine.setConfig(MANAGED_SOURCES_KEY, 'default');
+    // A git-first put_page pushes to origin, so remote callers sit behind the
+    // same gate commit_page uses. Enable it here; the gate itself is covered by
+    // its own tests below.
+    await engine.setConfig('writer.commit_page.enabled', 'true');
   });
 
   test('commits and pushes the exact caller content, then indexes', async () => {
@@ -131,10 +135,15 @@ describe('put_page on a machine-managed source', () => {
     expect(await pageRows('wiki/idem')).toHaveLength(1);
   });
 
-  test('a push that cannot land writes NO database row', async () => {
+  test('a push that cannot land writes NO database row AND leaves no divergent commit', async () => {
     // Break the remote so the push fails after a successful local commit. The
-    // brain must not end up holding a page git has never seen — that is the
-    // exact state the design forbids.
+    // brain must not end up holding a page git has never seen — and, just as
+    // importantly, the CHECKOUT must not be left one commit ahead of origin.
+    //
+    // Leaving that commit behind was the original behaviour and it is worse than
+    // it looks: `divergenceSafePull` rebases, so the next successful write
+    // replays and pushes the very content this call reported as failed.
+    const headBefore = git(checkout, ['rev-parse', 'HEAD']);
     fs.rmSync(remote, { recursive: true, force: true });
 
     await expect(
@@ -142,6 +151,96 @@ describe('put_page on a machine-managed source', () => {
     ).rejects.toThrow(/git-first write failed/);
 
     expect(await pageRows('wiki/unpushable')).toHaveLength(0);
+    expect(git(checkout, ['rev-parse', 'HEAD'])).toBe(headBefore);
+    expect(git(checkout, ['status', '--porcelain'])).toBe('');
+    expect(fs.existsSync(path.join(checkout, 'wiki/unpushable.md'))).toBe(false);
+  });
+
+  test('a failed write is not resurrected by the NEXT successful write', async () => {
+    // The regression this guards: with the commit left behind, the next write
+    // rebases it onto origin and pushes it, publishing content the caller was
+    // told had failed — unindexed and unattributed.
+    const remoteBackup = path.join(root, 'remote-backup.git');
+    fs.cpSync(remote, remoteBackup, { recursive: true });
+    fs.rmSync(remote, { recursive: true, force: true });
+    await expect(
+      putPage.handler(ctx(), { slug: 'wiki/ghost', content: page('should never be published') }),
+    ).rejects.toThrow(/git-first write failed/);
+    fs.cpSync(remoteBackup, remote, { recursive: true });
+
+    // A later, unrelated, successful write.
+    await putPage.handler(ctx(), { slug: 'wiki/legit', content: page('this one is real') });
+
+    const files = git(checkout, ['ls-tree', '-r', '--name-only', 'origin/main']);
+    expect(files).toContain('wiki/legit.md');
+    expect(files).not.toContain('wiki/ghost.md');
+    expect(await pageRows('wiki/ghost')).toHaveLength(0);
+  });
+
+  test('transient git failures are reported as retryable, not as bad content', async () => {
+    // An agent acts on the CODE. Telling it `invalid_params` for a repo problem
+    // makes it rewrite a perfectly good page instead of retrying.
+    fs.rmSync(remote, { recursive: true, force: true });
+    try {
+      await putPage.handler(ctx(), { slug: 'wiki/transient', content: page('fine content') });
+      throw new Error('expected the write to fail');
+    } catch (e: any) {
+      expect(['git_push_failed', 'git_conflict', 'storage_error']).toContain(e.code);
+      expect(e.code).not.toBe('invalid_params');
+    }
+  });
+
+  test('genuinely malformed content IS reported as invalid_params', async () => {
+    try {
+      await putPage.handler(ctx(), { slug: 'wiki/bad', content: 'no frontmatter\n' });
+      throw new Error('expected the write to fail');
+    } catch (e: any) {
+      expect(e.code).toBe('invalid_params');
+    }
+  });
+
+  test('a remote caller is refused when the commit_page gate is off', async () => {
+    // A git-first put_page pushes to origin — the same capability commit_page
+    // gates. Declaring a source managed must not silently create an ungated
+    // remote push surface.
+    await engine.setConfig('writer.commit_page.enabled', 'false');
+    await expect(
+      putPage.handler(ctx({ remote: true }), { slug: 'wiki/gated', content: page('x') }),
+    ).rejects.toThrow(/are disabled/);
+    expect(await pageRows('wiki/gated')).toHaveLength(0);
+    // A LOCAL caller is unaffected — the gate is about remote exposure.
+    await engine.setConfig('writer.commit_page.enabled', 'false');
+    await putPage.handler(ctx({ remote: false }), { slug: 'wiki/local-ok', content: page('y') });
+    expect(await pageRows('wiki/local-ok')).toHaveLength(1);
+  });
+
+  test('a remote caller without a scoped source is refused', async () => {
+    await engine.setConfig('writer.commit_page.enabled', 'true');
+    await expect(
+      putPage.handler(ctx({ remote: true, sourceId: undefined }), { slug: 'wiki/unscoped', content: page('x') }),
+    ).rejects.toThrow(/scoped to one write source/);
+  });
+
+  test('write-through refuses to leave a dropping on a managed source', async () => {
+    // The central guard: ANY direct writePageThrough caller (e.g. brainstorm
+    // --save) must not create an uncommitted file in a machine-managed tree.
+    const { writePageThrough } = await import('../src/core/write-through.ts');
+    await putPage.handler(ctx(), { slug: 'wiki/anchored', content: page('anchored') });
+    const res = await writePageThrough(engine, 'wiki/anchored', { sourceId: 'default', logger: { warn() {} } });
+    expect(res).toEqual({ written: false, skipped: 'git_first_source' });
+    expect(git(checkout, ['status', '--porcelain'])).toBe('');
+  });
+
+  test('a misconfigured writer mode surfaces as a structured operator error', async () => {
+    await engine.setConfig('writer.mode', 'git_first');   // underscore typo
+    try {
+      await putPage.handler(ctx(), { slug: 'wiki/typo', content: page('x') });
+      throw new Error('expected the write to fail');
+    } catch (e: any) {
+      expect(e.code).toBe('invalid_request');
+      expect(e.message).toMatch(/writer mode is misconfigured/);
+    }
+    await engine.setConfig('writer.mode', '');
   });
 
   test('a protected slug is refused and writes nothing', async () => {

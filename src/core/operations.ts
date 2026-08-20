@@ -904,11 +904,48 @@ const put_page: Operation = {
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
     let writerMode: import('./writer-mode.ts').WriterResolution | undefined;
     if (!ctx.dryRun && !isSandboxSubagentEarly) {
-      const { resolveWriterMode } = await import('./writer-mode.ts');
-      writerMode = await resolveWriterMode(ctx.engine, writerSourceId);
+      const { resolveWriterMode, WriterModeError } = await import('./writer-mode.ts');
+      try {
+        writerMode = await resolveWriterMode(ctx.engine, writerSourceId);
+      } catch (e) {
+        // A misconfigured writer mode is an operator problem, not an agent one.
+        // Surfacing it as a structured error (rather than letting it escape raw
+        // from the handler) means the agent is told what a human must fix.
+        if (e instanceof WriterModeError) {
+          throw new OperationError(
+            'invalid_request',
+            `writer mode is misconfigured for source '${writerSourceId}': ${e.message}`,
+            'An operator must correct writer.managed_sources / writer.mode on the brain host.',
+          );
+        }
+        throw e;
+      }
     }
     if (writerMode?.mode === 'git-first') {
-      const { gitFirstPageWrite, GitPageWriteError } = await import('./git-page-write.ts');
+      const { gitFirstPageWrite, GitPageWriteError, gitFailureCode, isRetryableGitFailure } = await import('./git-page-write.ts');
+
+      // A git-first put_page pushes to origin, so it is the SAME capability
+      // commit_page exposes and must sit behind the same fail-closed gate.
+      // Without this, declaring a source machine-managed would silently turn
+      // put_page into an ungated remote push surface and make
+      // `writer.commit_page.enabled=false` decorative for anyone who set it.
+      if (ctx.remote !== false) {
+        const enabled = await ctx.engine.getConfig('writer.commit_page.enabled');
+        if (enabled !== 'true') {
+          throw new OperationError(
+            'permission_denied',
+            `remote writes to machine-managed source '${writerSourceId}' are disabled`,
+            'An operator must set writer.commit_page.enabled=true on the brain host — a git-first put_page commits and pushes to the source repository, exactly as commit_page does.',
+          );
+        }
+        if (!ctx.sourceId) {
+          throw new OperationError(
+            'permission_denied',
+            'remote writes to a machine-managed source require an OAuth client scoped to one write source',
+          );
+        }
+      }
+
       const protectedRaw = (await ctx.engine.getConfig('writer.commit_page.protected_slugs')) ?? '';
       // Same derivation the schema-mutation path uses, so the audit trail reads
       // consistently across every actor-stamped write.
@@ -938,13 +975,20 @@ const put_page: Operation = {
           // remote, a broken checkout). Wrapping them all means the caller can
           // never receive a bare git error it has no way to interpret — and,
           // more importantly, can never mistake a failed anchor for a success.
-          const code = e instanceof GitPageWriteError && e.code === 'protected_path'
-            ? 'permission_denied'
-            : 'invalid_input';
+          //
+          // The CODE matters as much as the message, because it is what an agent
+          // acts on. Reporting a transient git condition as `invalid_input` tells
+          // the agent its content was malformed, so it rewrites a perfectly good
+          // page instead of retrying — and repo-lock contention with the
+          // 5-minutely sync makes that a routine occurrence, not a rare one.
+          const code = gitFailureCode(e);
           const detail = e instanceof Error ? e.message : String(e);
           throw new OperationError(
             code,
             `git-first write failed for '${slug}' on machine-managed source '${writerSourceId}': ${detail}`,
+            isRetryableGitFailure(e)
+              ? 'The repository was momentarily unavailable — the content is fine. Retry the same write; do not rewrite the page.'
+              : undefined,
           );
         }
       }
