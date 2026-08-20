@@ -63,11 +63,24 @@ pulling exactly as before.
   looking while recovery is still possible.
 - With no quarantine root configured, discarded files are still REPORTED rather
   than destroyed in silence.
-- **`mirror_violation` warnings now reach the caller.** Warnings were attached
-  only to the two no-op returns, but a violation almost always coincides with real
-  changes — so the structured warning was dropped in nearly every case it existed
-  for, surviving only as a log line. "Nothing is discarded silently" has to hold on
-  the success path or it does not hold at all.
+- **`mirror_violation` warnings reach the caller on EVERY return path.** They were
+  attached only to the two no-op returns, but a violation almost always coincides
+  with real changes, so the structured warning was dropped in nearly every case it
+  existed for. The worst case was the first sync: declaring a source managed for
+  the first time, with a pre-existing dropping in the tree, is precisely when a
+  violation exists and is guaranteed to take that path. Results are now merged
+  through one exit helper rather than per-return, so a future return path cannot
+  quietly drop them again.
+- **`clean -fd` runs BEFORE `reset --hard`.** The scan measures the working tree
+  against the CURRENT `.gitignore`; cleaning after the reset applied the INCOMING
+  one, so any file the old rules ignored and the new rules do not was deleted
+  without the scan ever seeing it — unpreserved, unreported, and reachable by an
+  ordinary upstream `.gitignore` edit. Cleaning first bounds the deletion to
+  exactly the state that was measured.
+- **`sync --dry-run` never converges.** `pull --ff-only` was harmless to run during
+  a preview; `convergeMirror` force-moves HEAD and deletes uncommitted files. A
+  dry run on a managed source now skips convergence and says why, rather than
+  being the thing that destroys the tree.
 
 ## [0.43.0.21] - 2026-08-20
 

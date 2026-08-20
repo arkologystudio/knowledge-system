@@ -1664,6 +1664,26 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // Did this run actually reach the remote? Distinguishes "nothing changed
   // upstream" from "we never got to look" when both land on `up_to_date`.
   const syncWarnings: SyncWarning[] = [];
+
+  /**
+   * Merge accumulated warnings into ANY result on the way out.
+   *
+   * Warnings used to be attached only to the two no-op returns, which is exactly
+   * backwards for mirror violations: discarding a local commit MOVES HEAD, and
+   * quarantining dirty files usually coincides with upstream changes — so the
+   * violation almost always leaves through a return that dropped it. The
+   * first-sync path is the worst case, because declaring a source managed for the
+   * first time, with a pre-existing dropping in the tree, is precisely when a
+   * violation exists and is GUARANTEED to take that path.
+   *
+   * Wrapping at the exits rather than threading a parameter through
+   * `performFullSync` / `buildPartialResult` means a future return path cannot
+   * quietly drop them again.
+   */
+  const withWarnings = <T extends SyncResult>(r: T): T =>
+    syncWarnings.length > 0
+      ? { ...r, warnings: [...(r.warnings ?? []), ...syncWarnings] }
+      : r;
   let remoteContacted = false;
 
   if (!opts.noPull && !detachedHead && originRemotePresent) {
@@ -1703,7 +1723,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // violation, never silently destroyed.
         const { isManagedSource } = await import('../core/writer-mode.ts');
         const managed = await isManagedSource(engine, opts.sourceId ?? 'default');
-        if (managed) {
+        // NEVER converge under --dry-run. `pullRepo --ff-only` was harmless to run
+        // during a preview; `convergeMirror` force-moves HEAD and deletes
+        // uncommitted files. A command whose entire contract is "show me what
+        // would happen" must not be the thing that destroys the tree.
+        if (managed && !opts.dryRun) {
           const { convergeMirror } = await import('../core/git-remote.ts');
           const { gbrainPath } = await import('../core/config.ts');
           const converged = convergeMirror(repoPath, {
@@ -1716,6 +1740,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             syncWarnings.push({ code: 'mirror_violation', message: detail });
           }
           serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms (converged ${converged.before.slice(0, 12)} -> ${converged.after.slice(0, 12)})`);
+        } else if (managed && opts.dryRun) {
+          const detail =
+            `--dry-run on machine-managed source '${opts.sourceId ?? 'default'}': skipped mirror convergence ` +
+            `(it would reset the working tree). This preview reflects LOCAL clone state, not upstream.`;
+          serr(`Warning: ${detail}`);
+          syncWarnings.push({ code: 'pull_failed', message: detail });
         } else {
           const { pullRepo } = await import('../core/git-remote.ts');
           // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,
@@ -1746,7 +1776,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           : undefined;
         const isTimeout = causeCode === 'ETIMEDOUT' || causeSignal === 'SIGTERM';
         if (isTimeout) {
-          return buildPartialResult({
+          return withWarnings(buildPartialResult({
             fromCommit: lastCommit,
             toCommit: lastCommit ?? '',
             filesImported: 0,
@@ -1754,7 +1784,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             chunksCreated: 0,
             added: 0, modified: 0, deleted: 0, renamed: 0,
             reason: 'pull_timeout',
-          });
+          }));
         }
         // Do NOT truncate to ~100 chars. execFileSync puts "Command failed: <the
         // full git invocation>" at the FRONT of .message and git's own stderr —
@@ -1853,7 +1883,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // back to the authoritative full reconcile (which now also purges stale
       // pages for deleted files; see performFullSync's delete-reconcile pass).
       serr(`Sync anchor ${lastCommit.slice(0, 8)} object missing (gc'd after history rewrite). Running full reimport.`);
-      return performFullSync(engine, repoPath, headCommit, opts);
+      return withWarnings(await performFullSync(engine, repoPath, headCommit, opts));
     }
 
     // Observability only — NOT control flow. A non-ancestor bookmark is still
@@ -1876,7 +1906,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   // First sync
   if (!lastCommit) {
-    return performFullSync(engine, repoPath, headCommit, opts);
+    return withWarnings(await performFullSync(engine, repoPath, headCommit, opts));
   }
 
   // v0.42.x (#1794): resumable incremental sync — resolve the PINNED target.
@@ -1963,7 +1993,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] chunker_version gate: stored=${storedVersion ?? 'unset'}, current=${currentVersion}. ` +
       `Forcing full re-chunk pass (git HEAD unchanged but pipeline version advanced).`,
     );
-    const result = await performFullSync(engine, repoPath, headCommit, opts);
+    const result = withWarnings(await performFullSync(engine, repoPath, headCommit, opts));
     await writeChunkerVersion(engine, opts.sourceId, currentVersion);
     return result;
   }
@@ -1992,7 +2022,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] delta ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)} unavailable ` +
       `(${delta.reason}) — falling back to full reconcile.`,
     );
-    return performFullSync(engine, repoPath, headCommit, opts);
+    return withWarnings(await performFullSync(engine, repoPath, headCommit, opts));
   }
   const manifest = delta.manifest;
 
@@ -2068,7 +2098,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     if (filtered.deleted.length) slog(`  Deleted: ${filtered.deleted.join(', ')}`);
     if (filtered.renamed.length) slog(`  Renamed: ${filtered.renamed.map(r => `${r.from} -> ${r.to}`).join(', ')}`);
     if (totalChanges === 0) slog(`  No syncable changes.`);
-    return {
+    return withWarnings({
       status: 'dry_run',
       fromCommit: lastCommit,
       toCommit: headCommit,
@@ -2079,7 +2109,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       chunksCreated: 0,
       embedded: 0,
       pagesAffected: [],
-    };
+    });
   }
 
   if (totalChanges === 0) {
@@ -2224,7 +2254,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] banked ${banked} file(s) this run; next 'gbrain sync' resumes from ` +
       `the checkpoint (last_commit unchanged at ${(lastCommit ?? '').slice(0, 8)}).`,
     );
-    return buildPartialResult({
+    return withWarnings(buildPartialResult({
       fromCommit: lastCommit,
       toCommit: pin,
       filesImported,
@@ -2236,7 +2266,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       renamed: filtered.renamed.length,
       reason: checkpointDead ? 'checkpoint_unavailable' : reason,
       bankedFiles,
-    });
+    }));
   };
 
   // v0.42.x (#1794): the pin write IS the mint of this run's checkpoint. If it
@@ -2945,7 +2975,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] banked ${bankedFiles} file(s) this run; next 'gbrain sync' resumes ` +
       `from the checkpoint (last_commit unchanged at ${(lastCommit ?? '').slice(0, 8)}).`,
     );
-    return {
+    return withWarnings({
       status: 'blocked_by_failures',
       fromCommit: lastCommit,
       toCommit: pin,
@@ -2958,7 +2988,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       pagesAffected,
       failedFiles: failedFiles.length,
       bankedFiles,
-    };
+    });
   }
 
   // Advanced. Surface what the gate did past the failures.
@@ -3099,7 +3129,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     slog(`Text imported. Run 'gbrain embed --stale' to generate embeddings.`);
   }
 
-  return {
+  return withWarnings({
     status: 'synced',
     fromCommit: lastCommit,
     toCommit: headCommit,
@@ -3110,15 +3140,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     chunksCreated,
     embedded,
     pagesAffected,
-    // Warnings were previously attached ONLY to the two no-op returns, which is
-    // exactly backwards for mirror violations: discarding a local commit MOVES
-    // HEAD, and quarantining dirty files usually coincides with upstream changes
-    // — so a violation almost always lands on THIS path. The structured warning
-    // was therefore dropped in nearly every case it existed for, surviving only
-    // as a log line. "Nothing is discarded silently" has to hold on the success
-    // path too, or it does not hold at all.
-    ...(syncWarnings.length > 0 ? { warnings: syncWarnings } : {}),
-  };
+  });
 }
 
 async function performFullSync(

@@ -739,8 +739,20 @@ export function convergeMirror(
   }
 
   // 3. Converge, unconditionally.
-  run(['reset', '--hard', `origin/${branch}`], timeoutMs);
+  //
+  // ORDER MATTERS: clean BEFORE reset.
+  //
+  // The scan above ran against the CURRENT `.gitignore`. Running `clean -fd`
+  // after the reset would apply the INCOMING one, so any file the old rules
+  // ignored and the new rules do not is deleted without ever having been seen by
+  // the scan — unpreserved, and with no violation reported. That is the same
+  // silent-loss class as the untracked-directory and quoted-path bugs, arriving
+  // through a different door: an ordinary upstream `.gitignore` edit.
+  //
+  // Cleaning first bounds `clean` to exactly the working-tree state the scan
+  // measured, so "what was quarantined" and "what was deleted" are the same set.
   run(['clean', '-fd'], timeoutMs);
+  run(['reset', '--hard', `origin/${branch}`], timeoutMs);
 
   return { before, after: run(['rev-parse', 'HEAD'], 10_000), branch, violations };
 }

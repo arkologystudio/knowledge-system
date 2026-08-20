@@ -129,6 +129,39 @@ describe('sync on a machine-managed source', () => {
     expect(stray).toHaveLength(0);
   });
 
+  test('--dry-run does NOT converge: no reset, no deletions', async () => {
+    // convergeMirror force-moves HEAD and deletes uncommitted files. A command
+    // whose entire contract is "show me what would happen" must never be the
+    // thing that destroys the tree.
+    upstream('preview', 'p');
+    const headBefore = git(mirror, ['rev-parse', 'HEAD']);
+    fs.writeFileSync(path.join(mirror, 'wiki/uncommitted.md'), page('Uncommitted', 'work in progress'));
+
+    const res: any = await performSync(engine, { ...syncOpts(), dryRun: true });
+
+    expect(fs.existsSync(path.join(mirror, 'wiki/uncommitted.md'))).toBe(true);
+    expect(git(mirror, ['rev-parse', 'HEAD'])).toBe(headBefore);
+    // And it says WHY the preview does not reflect upstream.
+    const warnings = res.warnings ?? [];
+    expect(warnings.some((w: any) => /dry-run/i.test(w.message))).toBe(true);
+  });
+
+  test('a violation on the FIRST sync still reaches the result', async () => {
+    // Declaring a source managed for the first time, with a pre-existing dropping
+    // in the tree, is exactly when a violation exists — and it is guaranteed to
+    // take the first-sync return path, which used to drop warnings entirely.
+    fs.writeFileSync(path.join(mirror, 'wiki/stray.md'), page('Stray', 'pre-existing'));
+    git(mirror, ['add', '.']);
+    git(mirror, ['commit', '-m', 'pre-existing local commit']);
+    upstream('fresh', 'f');
+
+    const res: any = await performSync(engine, syncOpts());
+    const warnings = res.warnings ?? [];
+    const violation = warnings.find((w: any) => w.code === 'mirror_violation');
+    expect(violation).toBeDefined();
+    expect(violation.message).toMatch(/local_commits/);
+  });
+
   test('the checkpoint survives HEAD moving backwards', async () => {
     // Convergence can move HEAD to a commit that is not a descendant of the one
     // the brain last indexed. The delta is an endpoint comparison, so this must

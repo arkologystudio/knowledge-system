@@ -220,6 +220,35 @@ describe('convergeMirror', () => {
     expect(git(mirror, ['status', '--porcelain'])).toBe('');
   });
 
+  test('an upstream .gitignore change cannot destroy a file the scan never saw', async () => {
+    // The scan runs against the CURRENT .gitignore; if `clean -fd` ran AFTER the
+    // reset it would apply the INCOMING one, deleting anything the old rules hid
+    // and the new rules do not — unpreserved, and with no violation reported.
+    // An ordinary upstream .gitignore edit is enough to trigger it.
+    fs.writeFileSync(path.join(author, '.gitignore'), 'scratch/\n');
+    git(author, ['add', '.']);
+    git(author, ['commit', '-m', 'ignore scratch']);
+    git(author, ['push', 'origin', 'main']);
+    convergeMirror(mirror, { quarantineRoot: quarantine });
+
+    // The mirror has an ignored file; upstream then STOPS ignoring that path.
+    fs.mkdirSync(path.join(mirror, 'scratch'), { recursive: true });
+    fs.writeFileSync(path.join(mirror, 'scratch/notes.md'), 'PRECIOUS DATA G\n');
+    fs.writeFileSync(path.join(author, '.gitignore'), '# nothing ignored now\n');
+    git(author, ['add', '.']);
+    git(author, ['commit', '-m', 'stop ignoring scratch']);
+    git(author, ['push', 'origin', 'main']);
+
+    const res = convergeMirror(mirror, { quarantineRoot: quarantine });
+
+    // Either it survived untouched, or it was quarantined — but it must not have
+    // been destroyed silently.
+    const stillThere = fs.existsSync(path.join(mirror, 'scratch/notes.md'));
+    const v = res.violations.find((x) => x.kind === 'dirty_files');
+    const quarantined = v ? fs.existsSync(path.join(v.preservedAt, 'scratch/notes.md')) : false;
+    expect(stillThere || quarantined).toBe(true);
+  });
+
   test('a failed fetch leaves the mirror untouched rather than resetting onto a stale ref', async () => {
     // Losing the remote must not cause the mirror to converge onto whatever its
     // remote-tracking ref last happened to say.
