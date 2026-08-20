@@ -2,6 +2,7 @@ import { execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
 import { basename, join, dirname, resolve } from 'path';
 import { VERSION } from '../version.ts';
+import { assertUpgradeAllowed } from '../core/distribution.ts';
 
 const GBRAIN_GITHUB_REPO = 'garrytan/gbrain';
 
@@ -10,6 +11,13 @@ export async function runUpgrade(args: string[]) {
     console.log('Usage: gbrain upgrade [--swap-only]\n\nSelf-update the CLI.\n\nDetects install method (bun, binary, clawhub) and runs the appropriate update.\nAfter upgrading, shows what\'s new and offers to set up new features.\n\n--swap-only  Perform ONLY the binary/source swap and skip post-upgrade\n             (migrations run on the next launch). Used by the autopilot\n             silent self-upgrade channel so the daemon can swap + relaunch\n             without a 30-min blocking post-upgrade inside its tick.');
     return;
   }
+
+  // Fork guard. This is the LAST line of defence before a foreign release is
+  // installed over this build, so it sits ahead of every branch below —
+  // including --swap-only, which the autopilot channel drives. Config cannot
+  // reach here (`self_upgrade.mode` gates only the nag + autopilot), which is
+  // precisely why the check is compiled in rather than looked up.
+  assertUpgradeAllowed('gbrain upgrade');
 
   // --swap-only: do the swap, skip the (potentially 30-min) post-upgrade. The
   // relaunched binary runs migrations on boot (split-brain guard). v0.42.

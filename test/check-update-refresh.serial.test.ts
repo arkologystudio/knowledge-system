@@ -15,6 +15,7 @@ import { VERSION } from '../src/version.ts';
 import { parseSemver } from '../src/core/semver.ts';
 import { readUpdateCache } from '../src/core/self-upgrade.ts';
 import { refreshUpdateCache } from '../src/commands/check-update.ts';
+import { isForkBuild } from '../src/core/distribution.ts';
 
 const realFetch = globalThis.fetch;
 let homeDir: string;
@@ -59,7 +60,14 @@ describe('refreshUpdateCache — full refresh orchestration (network stubbed)', 
     stubReleaseFetch(`v${latest}`);
     await refreshUpdateCache();
     const entry = readUpdateCache();
-    expect(entry?.marker).toEqual({ kind: 'upgrade_available', current: VERSION, latest });
+    // On a fork the upstream release is never resolved, so the nag can never be
+    // armed — that is the point of the guard, not a regression. Upstream builds
+    // still assert the real marker.
+    expect(entry?.marker).toEqual(
+      isForkBuild()
+        ? { kind: 'up_to_date', current: VERSION }
+        : { kind: 'upgrade_available', current: VERSION, latest },
+    );
   });
 
   test('patch-only release → writes up_to_date marker (patch ignored)', async () => {

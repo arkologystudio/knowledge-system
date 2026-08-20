@@ -3,6 +3,7 @@ import { isMinorOrMajorBump, isValidVersionString } from '../core/semver.ts';
 import { fetchChangelog, fetchLatestRelease } from './check-update.ts';
 import { detectInstallMethod, runUpgrade } from './upgrade.ts';
 import { writeUpdateCache } from '../core/self-upgrade.ts';
+import { assertUpgradeAllowed, isForkBuild, DISTRIBUTION_REPO, UPSTREAM_RELEASE_REPO } from '../core/distribution.ts';
 
 /**
  * `gbrain self-upgrade [--check-only] [--force] [--json]`
@@ -17,6 +18,15 @@ import { writeUpdateCache } from '../core/self-upgrade.ts';
  *   --force       Apply even if not behind (re-run the install-method swap).
  *   --json        Machine-readable output for the check.
  */
+/** Best-effort cache warm; a cache failure must never fail the command. */
+function writeUpdateCacheSafely(entry: Parameters<typeof writeUpdateCache>[0]): void {
+  try {
+    writeUpdateCache(entry);
+  } catch {
+    /* best-effort */
+  }
+}
+
 export async function runSelfUpgrade(args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(
@@ -34,6 +44,37 @@ export async function runSelfUpgrade(args: string[]): Promise<void> {
   const checkOnly = args.includes('--check-only');
   const force = args.includes('--force');
   const json = args.includes('--json');
+
+  // Fork guard, ahead of the release fetch and every apply branch.
+  //
+  // --check-only is PASSIVE, so it reports rather than throws — the agent skill
+  // polls it, and a thrown error there would read as a broken install instead of
+  // a deliberate policy. Everything else APPLIES a release and is refused.
+  // --force deliberately does NOT bypass this: --force skips the "am I behind?"
+  // check, which is exactly the shape that makes an accidental overwrite easy.
+  if (isForkBuild()) {
+    if (!checkOnly) assertUpgradeAllowed('gbrain self-upgrade');
+    writeUpdateCacheSafely({ kind: 'up_to_date', current: VERSION });
+    if (json) {
+      console.log(JSON.stringify({
+        current_version: VERSION,
+        latest_version: '',
+        update_available: false,
+        install_method: detectInstallMethod(),
+        changelog_diff: '',
+        release_url: '',
+        error: 'fork_build',
+        distribution_repo: DISTRIBUTION_REPO,
+        upstream_release_repo: UPSTREAM_RELEASE_REPO,
+      }, null, 2));
+    } else {
+      console.log(
+        `GBrain ${VERSION} — this build is ${DISTRIBUTION_REPO}, a fork.\n` +
+        `Upstream (${UPSTREAM_RELEASE_REPO}) release checks are disabled; deploy from the fork's own repository.`,
+      );
+    }
+    return;
+  }
 
   const release = await fetchLatestRelease();
   const latest = release ? release.tag.replace(/^v/, '') : null;

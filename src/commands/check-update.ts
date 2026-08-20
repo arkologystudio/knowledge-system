@@ -1,4 +1,5 @@
 import { VERSION } from '../version.ts';
+import { isForkBuild, UPSTREAM_LATEST_RELEASE_API, DISTRIBUTION_REPO, UPSTREAM_RELEASE_REPO } from '../core/distribution.ts';
 import { detectInstallMethod } from './upgrade.ts';
 import {
   isMinorOrMajorBump,
@@ -50,8 +51,12 @@ function upgradeCommandForMethod(method: string): string {
  * refresh, never the hot path, but a tight bound keeps the refresh cheap.
  */
 export async function fetchLatestRelease(): Promise<{ tag: string; published_at: string; url: string } | null> {
+  // A fork must never learn about upstream releases: this feeds the startup nag,
+  // and a nag for a release we refuse to install is pure noise. Structural, so it
+  // holds regardless of `self_upgrade.mode` (which does not gate this path).
+  if (isForkBuild()) return null;
   try {
-    const res = await fetch('https://api.github.com/repos/garrytan/gbrain/releases/latest', {
+    const res = await fetch(UPSTREAM_LATEST_RELEASE_API, {
       headers: { 'User-Agent': `gbrain/${VERSION}` },
       signal: AbortSignal.timeout(5_000),
     });
@@ -162,6 +167,36 @@ export async function runCheckUpdate(args: string[]) {
   const json = args.includes('--json');
   const method = detectInstallMethod();
   const upgradeCmd = upgradeCommandForMethod(method);
+
+  // A fork resolves no upstream release by design (fetchLatestRelease returns
+  // null), which would otherwise render as the generic "network unavailable"
+  // line below and read as a transient fault forever. Say the real reason once,
+  // and name the deploy path that does work for this build.
+  if (isForkBuild()) {
+    safeWriteCache({ kind: 'up_to_date', current: VERSION });
+    if (json) {
+      console.log(JSON.stringify({
+        current_version: VERSION,
+        current_source: 'package-json',
+        latest_version: '',
+        update_available: false,
+        upgrade_command: '',
+        release_url: '',
+        changelog_diff: '',
+        published_at: '',
+        error: 'fork_build',
+        distribution_repo: DISTRIBUTION_REPO,
+        upstream_release_repo: UPSTREAM_RELEASE_REPO,
+      }, null, 2));
+    } else {
+      console.log(
+        `GBrain ${VERSION} — this build is ${DISTRIBUTION_REPO}, a fork.\n` +
+        `Update checks against ${UPSTREAM_RELEASE_REPO} are disabled: installing an upstream\n` +
+        `release here would overwrite the fork. Deploy from the fork's own repository instead.`,
+      );
+    }
+    return;
+  }
 
   const release = await fetchLatestRelease();
 

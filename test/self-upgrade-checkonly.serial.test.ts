@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { VERSION } from '../src/version.ts';
 import { parseSemver } from '../src/core/semver.ts';
 import { runSelfUpgrade } from '../src/commands/self-upgrade.ts';
+import { isForkBuild, DISTRIBUTION_REPO } from '../src/core/distribution.ts';
 
 const realFetch = globalThis.fetch;
 const realLog = console.log;
@@ -51,7 +52,32 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-describe('self-upgrade --check-only surfaces what you get', () => {
+// A fork build resolves no upstream release BY DESIGN (see src/core/distribution.ts),
+// so the upstream-facing assertions below describe upstream behaviour only. They are
+// kept — not deleted — so this file stays correct on either build and can be
+// contributed upstream unchanged. `describe.if` keeps the skip visible in the runner
+// rather than silently passing.
+describe.if(isForkBuild())('self-upgrade --check-only on a fork build', () => {
+  test('reports fork status instead of an upstream version, and does not throw', async () => {
+    stub(`v${minorBump()}`, 'should-not-be-read');
+    await runSelfUpgrade(['--check-only', '--json']);
+    const out = JSON.parse(captured.join('\n'));
+    expect(out.update_available).toBe(false);
+    expect(out.error).toBe('fork_build');
+    expect(out.latest_version).toBe('');
+    expect(out.distribution_repo).toBe(DISTRIBUTION_REPO);
+  });
+
+  test('human output names the fork rather than offering an upgrade', async () => {
+    stub(`v${minorBump()}`, 'should-not-be-read');
+    await runSelfUpgrade(['--check-only']);
+    const text = captured.join('\n');
+    expect(text).toContain(DISTRIBUTION_REPO);
+    expect(text).not.toContain('What changed');
+  });
+});
+
+describe.if(!isForkBuild())('self-upgrade --check-only surfaces what you get', () => {
   test('behind → JSON includes changelog_diff + release_url + update_available', async () => {
     const latest = minorBump();
     const changelog = `# Changelog\n\n## [${latest}] - 2026-01-01\n\n- Shiny new thing\n- Another fix\n\n## [${VERSION}] - 2025-12-01\n\n- old\n`;
