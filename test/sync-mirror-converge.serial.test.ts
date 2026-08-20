@@ -201,12 +201,48 @@ describe('an undeclared checkout is never converged', () => {
     fs.writeFileSync(path.join(other, 'wiki/scratch.md'), page('Scratch', 'in progress'));
     upstream('moved-on', 'm');
 
-    await performSync(engine, { repoPath: other, sourceId: 'default', noEmbed: true } as any);
+    const res: any = await performSync(engine, { repoPath: other, sourceId: 'default', noEmbed: true } as any);
 
     // Their commit and their uncommitted file both survive.
     expect(git(other, ['rev-parse', 'HEAD'])).toBe(theirHead);
     expect(fs.existsSync(path.join(other, 'wiki/scratch.md'))).toBe(true);
     expect(fs.existsSync(path.join(other, 'wiki/precious.md'))).toBe(true);
+
+    // And the skip is NOT silent: falling back to --ff-only cannot recover a
+    // diverged clone, so a mismatch has to be visible rather than looking like
+    // an ordinary pull failure.
+    const warnings = res.warnings ?? [];
+    expect(warnings.some((w: any) => /declared machine-managed/.test(w.message))).toBe(true);
+  });
+
+  test('a converge that fails mid-way tells the operator what it deleted', async () => {
+    // The error carries its violations precisely so the quarantine copies can be
+    // found; the generic pull-failure handler must not swallow them.
+    await engine.setConfig(MANAGED_SOURCES_KEY, 'default');
+    upstream('before-fail', 'x');
+    await performSync(engine, syncOpts());
+
+    fs.writeFileSync(path.join(mirror, 'wiki/doomed.md'), page('Doomed', 'about to be cleaned'));
+    // Force the reset to fail: a read-only directory the incoming tree must write
+    // into, with a file inside so `clean -fd` cannot remove it first.
+    fs.mkdirSync(path.join(author, 'locked'), { recursive: true });
+    fs.writeFileSync(path.join(author, 'locked/f.md'), 'x\n');
+    git(author, ['add', '.']);
+    git(author, ['commit', '-m', 'locked dir']);
+    git(author, ['push', 'origin', 'main']);
+    fs.mkdirSync(path.join(mirror, 'locked'), { recursive: true });
+    fs.writeFileSync(path.join(mirror, 'locked/blocker.md'), 'blocks checkout\n');
+    fs.chmodSync(path.join(mirror, 'locked'), 0o500);
+
+    let res: any;
+    try {
+      res = await performSync(engine, syncOpts());
+    } finally {
+      fs.chmodSync(path.join(mirror, 'locked'), 0o700);
+    }
+
+    const warnings = res?.warnings ?? [];
+    expect(warnings.some((w: any) => w.code === 'mirror_violation')).toBe(true);
   });
 });
 

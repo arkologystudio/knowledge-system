@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join, relative, resolve as resolvePath } from 'path';
+import { realpathSync } from 'fs';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { importFile } from '../core/import-file.ts';
@@ -1733,8 +1734,32 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // so converging without the check turns a safe override into a
         // destructive one.
         const declaredPath = await resolveSourceRepoPath(engine, writerSourceId);
-        const isDeclaredCheckout = !!declaredPath && resolvePath(declaredPath) === resolvePath(repoPath);
-        const managed = (await isManagedSource(engine, writerSourceId)) && isDeclaredCheckout;
+        // realpath, not string compare: a symlinked path (/var vs /private/var on
+        // macOS) or a trailing slash would otherwise read as "not the declared
+        // checkout" and silently drop back to `--ff-only` — which is the wedging
+        // behaviour this whole phase exists to remove. Fall back to `resolve` when
+        // realpath cannot run (path missing).
+        const samePath = (a: string, b: string): boolean => {
+          try {
+            return realpathSync(a) === realpathSync(b);
+          } catch {
+            return resolvePath(a) === resolvePath(b);
+          }
+        };
+        const isManaged = await isManagedSource(engine, writerSourceId);
+        const isDeclaredCheckout = !!declaredPath && samePath(declaredPath, repoPath);
+        const managed = isManaged && isDeclaredCheckout;
+        if (isManaged && !isDeclaredCheckout) {
+          // Declared managed but pointed somewhere else. Refusing to converge is
+          // correct, but doing it silently would hide a wedging mirror behind a
+          // "pull failed" that nobody connects to a path mismatch.
+          const detail =
+            `source '${writerSourceId}' is declared machine-managed, but this run targets ` +
+            `${repoPath} while the source's checkout is ${declaredPath ?? '(unset)'}. ` +
+            `Skipped mirror convergence and fell back to --ff-only, which cannot recover a diverged clone.`;
+          serr(`Warning: ${detail}`);
+          syncWarnings.push({ code: 'mirror_violation', message: detail });
+        }
         // NEVER converge under --dry-run. `pullRepo --ff-only` was harmless to run
         // during a preview; `convergeMirror` force-moves HEAD and deletes
         // uncommitted files. A command whose entire contract is "show me what
@@ -1773,6 +1798,19 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         serr(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 80)})`);
+        // A convergence that failed part way through has already DELETED untracked
+        // files. Its error carries the violations precisely so the operator can
+        // find the quarantine copies; letting the generic pull-failure handler
+        // swallow them would leave "git pull failed" as the only signal that
+        // anything was removed.
+        const { MirrorConvergeError } = await import('../core/git-remote.ts');
+        if (e instanceof MirrorConvergeError) {
+          for (const v of e.violations) {
+            const detail = `mirror violation (${v.kind}): ${v.detail}. Preserved at ${v.preservedAt}`;
+            serr(`Warning: ${detail}`);
+            syncWarnings.push({ code: 'mirror_violation', message: detail });
+          }
+        }
         // v0.41.13.0 (T3 / D-V4-mech-7): pullRepo wraps execFileSync errors
         // in GitOperationError, so `error.code === 'ETIMEDOUT'` and
         // `error.signal === 'SIGTERM'` live on `.cause`, NOT on the top-
