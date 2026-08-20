@@ -302,6 +302,23 @@ describe('put_page on a machine-managed source', () => {
     expect(await pageRows('wiki/broken')).toHaveLength(0);
   });
 
+  test('refuses to write while the managed clone is ahead of origin', async () => {
+    // Otherwise the rebase inside the pull would replay and PUSH an operator's
+    // stray commit — while the sync loop's policy for that same commit is to
+    // quarantine and discard it. Whoever ran first would decide whether it became
+    // canonical wiki content.
+    fs.writeFileSync(path.join(checkout, 'stray.md'), 'someone committed here\n');
+    git(checkout, ['add', '.']);
+    git(checkout, ['commit', '-m', 'stray local commit']);
+
+    await expect(
+      putPage.handler(ctx(), { slug: 'wiki/blocked', content: page('x') }),
+    ).rejects.toThrow(/ahead of origin/);
+    expect(await pageRows('wiki/blocked')).toHaveLength(0);
+    // The stray commit is untouched — it is sync's to deal with, not ours.
+    expect(git(checkout, ['rev-list', '--count', 'origin/main..HEAD'])).toBe('1');
+  });
+
   test('a dry run touches neither git nor the index', async () => {
     const head = git(checkout, ['rev-parse', 'HEAD']);
     await putPage.handler(ctx({ dryRun: true }), { slug: 'wiki/dry', content: page('dry') });

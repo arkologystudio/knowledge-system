@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { join, relative } from 'path';
+import { join, relative, resolve as resolvePath } from 'path';
+import { realpathSync } from 'fs';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { importFile } from '../core/import-file.ts';
@@ -250,7 +251,7 @@ export interface SyncResult {
 
 export interface SyncWarning {
   /** Machine-stable discriminator. Additive only. */
-  code: 'pull_failed' | 'noop_without_remote_contact';
+  code: 'pull_failed' | 'noop_without_remote_contact' | 'mirror_violation' | 'dry_run_skipped_converge';
   message: string;
 }
 
@@ -1664,6 +1665,26 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // Did this run actually reach the remote? Distinguishes "nothing changed
   // upstream" from "we never got to look" when both land on `up_to_date`.
   const syncWarnings: SyncWarning[] = [];
+
+  /**
+   * Merge accumulated warnings into ANY result on the way out.
+   *
+   * Warnings used to be attached only to the two no-op returns, which is exactly
+   * backwards for mirror violations: discarding a local commit MOVES HEAD, and
+   * quarantining dirty files usually coincides with upstream changes — so the
+   * violation almost always leaves through a return that dropped it. The
+   * first-sync path is the worst case, because declaring a source managed for the
+   * first time, with a pre-existing dropping in the tree, is precisely when a
+   * violation exists and is GUARANTEED to take that path.
+   *
+   * Wrapping at the exits rather than threading a parameter through
+   * `performFullSync` / `buildPartialResult` means a future return path cannot
+   * quietly drop them again.
+   */
+  const withWarnings = <T extends SyncResult>(r: T): T =>
+    syncWarnings.length > 0
+      ? { ...r, warnings: [...(r.warnings ?? []), ...syncWarnings] }
+      : r;
   let remoteContacted = false;
 
   if (!opts.noPull && !detachedHead && originRemotePresent) {
@@ -1693,20 +1714,124 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       serr(`Warning: ${detail}`);
       syncWarnings.push({ code: 'pull_failed', message: detail });
     } else {
+      // Resolve writer mode OUTSIDE the pull try. Inside it, a transient database
+      // error while reading `writer.managed_sources` was caught by the pull
+      // handler — so `pullRepo` never ran and the whole sync proceeded against an
+      // unrefreshed clone under a `pull_failed` warning. A DB hiccup could not
+      // affect the pull before this feature existed; it must not now.
+      let isManaged = false;
+      let declaredPath: string | null = null;
+      let writerLookupFailed = false;
+      const writerSourceId = opts.sourceId ?? 'default';
       try {
-        const { pullRepo } = await import('../core/git-remote.ts');
-        // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,
-        // bound the pull subprocess to a fraction of the remaining budget.
-        // We pass a safe default (the operator's full --timeout if set, else
-        // pullRepo's own 300s default). The catch below distinguishes
-        // timeout (ETIMEDOUT / SIGTERM on err.cause) from ordinary pull
-        // failure.
-        pullRepo(repoPath);
-        remoteContacted = true;
-        serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
+        const { isManagedSource, resolveSourceRepoPath } = await import('../core/writer-mode.ts');
+        isManaged = await isManagedSource(engine, writerSourceId);
+        declaredPath = await resolveSourceRepoPath(engine, writerSourceId);
+      } catch {
+        writerLookupFailed = true;              // fall back to the ordinary pull
+      }
+
+      try {
+        // A machine-managed mirror CONVERGES rather than pulls. `--ff-only`
+        // protects local commits, which is right for a checkout a human works in
+        // and wrong for a tree a machine owns: one local commit wedged the
+        // Arkology mirror for a day and hid three weeks of staleness behind it.
+        // Fetch + reset makes divergence impossible instead of merely detected.
+        // Anything that should not exist is preserved first and reported as a
+        // violation, never silently destroyed.
+        // Being declared managed is necessary but NOT sufficient: the tree about
+        // to be reset must actually BE that source's checkout. `repoPath` comes
+        // from `opts.repoPath` (the `--repo` flag, and the `repo` argument of the
+        // `sync_brain` MCP op, which passes no sourceId at all), so without this
+        // comparison `gbrain sync --repo /any/checkout` would `clean -fd` +
+        // `reset --hard` an operator-supplied directory that was never declared.
+        // That path previously ran `pull --ff-only`, which is non-destructive —
+        // so converging without the check turns a safe override into a
+        // destructive one.
+        // realpath, not string compare: a symlinked path (/var vs /private/var on
+        // macOS) or a trailing slash would otherwise read as "not the declared
+        // checkout" and silently drop back to `--ff-only` — which is the wedging
+        // behaviour this whole phase exists to remove. Fall back to `resolve` when
+        // realpath cannot run (path missing).
+        const samePath = (a: string, b: string): boolean => {
+          try {
+            return realpathSync(a) === realpathSync(b);
+          } catch {
+            return resolvePath(a) === resolvePath(b);
+          }
+        };
+        const isDeclaredCheckout = !!declaredPath && samePath(declaredPath, repoPath);
+        const managed = isManaged && isDeclaredCheckout;
+        if (writerLookupFailed) {
+          const detail =
+            `could not read the writer-mode configuration for source '${writerSourceId}'; ` +
+            `fell back to --ff-only, which cannot recover a diverged clone. ` +
+            `If this source is machine-managed, convergence did NOT run this tick.`;
+          serr(`Warning: ${detail}`);
+          syncWarnings.push({ code: 'mirror_violation', message: detail });
+        }
+        if (isManaged && !isDeclaredCheckout) {
+          // Declared managed but pointed somewhere else. Refusing to converge is
+          // correct, but doing it silently would hide a wedging mirror behind a
+          // "pull failed" that nobody connects to a path mismatch.
+          const detail =
+            `source '${writerSourceId}' is declared machine-managed, but this run targets ` +
+            `${repoPath} while the source's checkout is ${declaredPath ?? '(unset)'}. ` +
+            `Skipped mirror convergence and fell back to --ff-only, which cannot recover a diverged clone.`;
+          serr(`Warning: ${detail}`);
+          syncWarnings.push({ code: 'mirror_violation', message: detail });
+        }
+        // NEVER converge under --dry-run. `pullRepo --ff-only` was harmless to run
+        // during a preview; `convergeMirror` force-moves HEAD and deletes
+        // uncommitted files. A command whose entire contract is "show me what
+        // would happen" must not be the thing that destroys the tree.
+        if (managed && !opts.dryRun) {
+          const { convergeMirror } = await import('../core/git-remote.ts');
+          const { gbrainPath } = await import('../core/config.ts');
+          const converged = convergeMirror(repoPath, {
+            quarantineRoot: gbrainPath('quarantine', writerSourceId),
+          });
+          remoteContacted = true;
+          for (const v of converged.violations) {
+            const detail = `mirror violation (${v.kind}): ${v.detail}. Preserved at ${v.preservedAt}`;
+            serr(`Warning: ${detail}`);
+            syncWarnings.push({ code: 'mirror_violation', message: detail });
+          }
+          serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms (converged ${converged.before.slice(0, 12)} -> ${converged.after.slice(0, 12)})`);
+        } else if (managed && opts.dryRun) {
+          const detail =
+            `--dry-run on machine-managed source '${opts.sourceId ?? 'default'}': skipped mirror convergence ` +
+            `(it would reset the working tree). This preview reflects LOCAL clone state, not upstream.`;
+          serr(`Warning: ${detail}`);
+          syncWarnings.push({ code: 'dry_run_skipped_converge', message: detail });
+        } else {
+          const { pullRepo } = await import('../core/git-remote.ts');
+          // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,
+          // bound the pull subprocess to a fraction of the remaining budget.
+          // We pass a safe default (the operator's full --timeout if set, else
+          // pullRepo's own 300s default). The catch below distinguishes
+          // timeout (ETIMEDOUT / SIGTERM on err.cause) from ordinary pull
+          // failure.
+          pullRepo(repoPath);
+          remoteContacted = true;
+          serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
+        }
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         serr(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 80)})`);
+        // A convergence that failed part way through has already DELETED untracked
+        // files. Its error carries the violations precisely so the operator can
+        // find the quarantine copies; letting the generic pull-failure handler
+        // swallow them would leave "git pull failed" as the only signal that
+        // anything was removed.
+        const { MirrorConvergeError } = await import('../core/git-remote.ts');
+        if (e instanceof MirrorConvergeError) {
+          for (const v of e.violations) {
+            const detail = `mirror violation (${v.kind}): ${v.detail}. Preserved at ${v.preservedAt}`;
+            serr(`Warning: ${detail}`);
+            syncWarnings.push({ code: 'mirror_violation', message: detail });
+          }
+        }
         // v0.41.13.0 (T3 / D-V4-mech-7): pullRepo wraps execFileSync errors
         // in GitOperationError, so `error.code === 'ETIMEDOUT'` and
         // `error.signal === 'SIGTERM'` live on `.cause`, NOT on the top-
@@ -1722,7 +1847,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           : undefined;
         const isTimeout = causeCode === 'ETIMEDOUT' || causeSignal === 'SIGTERM';
         if (isTimeout) {
-          return buildPartialResult({
+          return withWarnings(buildPartialResult({
             fromCommit: lastCommit,
             toCommit: lastCommit ?? '',
             filesImported: 0,
@@ -1730,7 +1855,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             chunksCreated: 0,
             added: 0, modified: 0, deleted: 0, renamed: 0,
             reason: 'pull_timeout',
-          });
+          }));
         }
         // Do NOT truncate to ~100 chars. execFileSync puts "Command failed: <the
         // full git invocation>" at the FRONT of .message and git's own stderr —
@@ -1829,7 +1954,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // back to the authoritative full reconcile (which now also purges stale
       // pages for deleted files; see performFullSync's delete-reconcile pass).
       serr(`Sync anchor ${lastCommit.slice(0, 8)} object missing (gc'd after history rewrite). Running full reimport.`);
-      return performFullSync(engine, repoPath, headCommit, opts);
+      return withWarnings(await performFullSync(engine, repoPath, headCommit, opts));
     }
 
     // Observability only — NOT control flow. A non-ancestor bookmark is still
@@ -1852,7 +1977,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   // First sync
   if (!lastCommit) {
-    return performFullSync(engine, repoPath, headCommit, opts);
+    return withWarnings(await performFullSync(engine, repoPath, headCommit, opts));
   }
 
   // v0.42.x (#1794): resumable incremental sync — resolve the PINNED target.
@@ -1939,7 +2064,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] chunker_version gate: stored=${storedVersion ?? 'unset'}, current=${currentVersion}. ` +
       `Forcing full re-chunk pass (git HEAD unchanged but pipeline version advanced).`,
     );
-    const result = await performFullSync(engine, repoPath, headCommit, opts);
+    const result = withWarnings(await performFullSync(engine, repoPath, headCommit, opts));
     await writeChunkerVersion(engine, opts.sourceId, currentVersion);
     return result;
   }
@@ -1968,7 +2093,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] delta ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)} unavailable ` +
       `(${delta.reason}) — falling back to full reconcile.`,
     );
-    return performFullSync(engine, repoPath, headCommit, opts);
+    return withWarnings(await performFullSync(engine, repoPath, headCommit, opts));
   }
   const manifest = delta.manifest;
 
@@ -2044,7 +2169,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     if (filtered.deleted.length) slog(`  Deleted: ${filtered.deleted.join(', ')}`);
     if (filtered.renamed.length) slog(`  Renamed: ${filtered.renamed.map(r => `${r.from} -> ${r.to}`).join(', ')}`);
     if (totalChanges === 0) slog(`  No syncable changes.`);
-    return {
+    return withWarnings({
       status: 'dry_run',
       fromCommit: lastCommit,
       toCommit: headCommit,
@@ -2055,7 +2180,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       chunksCreated: 0,
       embedded: 0,
       pagesAffected: [],
-    };
+    });
   }
 
   if (totalChanges === 0) {
@@ -2200,7 +2325,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] banked ${banked} file(s) this run; next 'gbrain sync' resumes from ` +
       `the checkpoint (last_commit unchanged at ${(lastCommit ?? '').slice(0, 8)}).`,
     );
-    return buildPartialResult({
+    return withWarnings(buildPartialResult({
       fromCommit: lastCommit,
       toCommit: pin,
       filesImported,
@@ -2212,7 +2337,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       renamed: filtered.renamed.length,
       reason: checkpointDead ? 'checkpoint_unavailable' : reason,
       bankedFiles,
-    });
+    }));
   };
 
   // v0.42.x (#1794): the pin write IS the mint of this run's checkpoint. If it
@@ -2921,7 +3046,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       `[sync] banked ${bankedFiles} file(s) this run; next 'gbrain sync' resumes ` +
       `from the checkpoint (last_commit unchanged at ${(lastCommit ?? '').slice(0, 8)}).`,
     );
-    return {
+    return withWarnings({
       status: 'blocked_by_failures',
       fromCommit: lastCommit,
       toCommit: pin,
@@ -2934,7 +3059,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       pagesAffected,
       failedFiles: failedFiles.length,
       bankedFiles,
-    };
+    });
   }
 
   // Advanced. Surface what the gate did past the failures.
@@ -3075,7 +3200,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     slog(`Text imported. Run 'gbrain embed --stale' to generate embeddings.`);
   }
 
-  return {
+  return withWarnings({
     status: 'synced',
     fromCommit: lastCommit,
     toCommit: headCommit,
@@ -3086,7 +3211,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     chunksCreated,
     embedded,
     pagesAffected,
-  };
+  });
 }
 
 async function performFullSync(

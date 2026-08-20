@@ -2,6 +2,132 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.22] - 2026-08-20
+
+**A machine-managed mirror can no longer diverge.** Sync stops pulling
+`--ff-only` on those sources and converges instead: fetch, preserve anything that
+should not exist, then `reset --hard origin/<branch>`.
+
+`--ff-only` PROTECTS local commits. That is the right instinct for a checkout a
+human works in and exactly the wrong one for a tree a machine owns. When the
+Arkology mirror acquired one local commit, every subsequent pull failed — and
+stayed failed until a person intervened a day later, while `get_health` read
+clean the whole time. Divergence was a permanently wedging condition that only a
+human could clear.
+
+Fetch + reset makes divergence **impossible rather than merely detected**: a
+diverged, dirty, or locally-committed mirror now recovers on the next tick without
+a human — as does one holding a path `git clean -fd` cannot remove (a nested git
+repository, or one the process cannot write); the mirror converges and reports the
+stray path as `unremovable` until somebody clears it. **A detached HEAD is the one
+state that still needs a human**, and it is refused loudly rather than wedging
+silently.
+
+**Nothing tracked or untracked is discarded silently.** Before the reset,
+local-only commits are saved to a `refs/gbrain/rescue/<sha>` ref and uncommitted
+work is copied to a timestamped quarantine directory; both are reported as
+`mirror_violation` sync warnings naming where the evidence went, and the report
+survives a convergence that fails part way through. A reset that quietly ate a
+colleague's work would trade one incident class for a worse one.
+
+One gap remains, disclosed rather than fixed: **ignored files** (`.gitignore`d,
+and so absent from both `status -uall` and `clean -fd`) are overwritten by
+`reset --hard` without passing through the scan, so they are neither quarantined
+nor reported. Tracked with Phase 1b.
+
+Only sources declared in `writer.managed_sources` converge. Everything else keeps
+pulling exactly as before.
+
+### Added
+- `convergeMirror()` in `src/core/git-remote.ts`, with `MirrorViolation` reporting.
+- `mirror_violation` sync warning code.
+- `test/mirror-convergence.serial.test.ts` — real repositories, including a test
+  that reproduces the incident state (a local commit plus upstream commits),
+  asserts `git pull --ff-only` genuinely fails there, and then proves convergence
+  resolves it on the first attempt with the stray commit still reachable by ref.
+  Also pins untracked directories, quoted/non-ASCII paths, renames, symlinks and
+  deletions — the cases whose absence hid two data-loss bugs.
+- `test/sync-mirror-converge.serial.test.ts` — the same recovery driven through
+  `performSync` itself, asserting the violation arrives in the RESULT and that an
+  UNMANAGED source still keeps its local commit rather than being reset.
+
+### Fixed
+- A failed fetch aborts before the reset, so losing the remote can never converge
+  a mirror onto a stale remote-tracking ref.
+- A detached HEAD is refused rather than guessed at.
+- **The quarantine scan reads `git status --porcelain -z -uall`.** Two ways the
+  naive read destroyed the very files it exists to save, both found in review:
+  without `-uall` git collapses an untracked DIRECTORY to a single `dir/` entry,
+  which cannot be copied but is happily deleted by `clean -fd` — and a brand-new
+  slug namespace is exactly that shape; without `-z` git quotes and C-escapes any
+  path with non-ASCII, a quote, a backslash or a tab, so the path never resolved,
+  the file was skipped, and the reset removed it. `-z` emits raw bytes with NUL
+  terminators, which removes the parsing problem rather than out-guessing it. A
+  path containing only a space survived naive parsing by luck, which is why a
+  suite built on ordinary filenames reported success.
+- Rename/copy records consume their extra origin-path field, so one rename can no
+  longer shift every subsequent entry by one.
+- Symlinks are preserved as links rather than dereferenced into copies, and
+  directories are copied recursively.
+- A failed `update-ref` no longer reports a rescue that did not happen; it names
+  the reflog instead. An operator who trusts a false "preserved" line will not go
+  looking while recovery is still possible.
+- With no quarantine root configured, discarded files are still REPORTED rather
+  than destroyed in silence.
+- **`mirror_violation` warnings reach the caller on EVERY return path.** They were
+  attached only to the two no-op returns, but a violation almost always coincides
+  with real changes, so the structured warning was dropped in nearly every case it
+  existed for. The worst case was the first sync: declaring a source managed for
+  the first time, with a pre-existing dropping in the tree, is precisely when a
+  violation exists and is guaranteed to take that path. Results are now merged
+  through one exit helper rather than per-return, so a future return path cannot
+  quietly drop them again.
+- **`clean -fd` runs BEFORE `reset --hard`.** The scan measures the working tree
+  against the CURRENT `.gitignore`; cleaning after the reset applied the INCOMING
+  one, so any file the old rules ignored and the new rules do not was deleted
+  without the scan ever seeing it — unpreserved, unreported, and reachable by an
+  ordinary upstream `.gitignore` edit. Cleaning first bounds the deletion to
+  exactly the state that was measured.
+- **An undeclared checkout is never converged.** Being declared in
+  `writer.managed_sources` is necessary but not sufficient — the tree about to be
+  reset must actually BE that source's checkout. `gbrain sync --repo <path>` and
+  the `sync_brain` MCP op (which passes no source id at all) can point anywhere,
+  and that path previously ran the non-destructive `pull --ff-only`; converging
+  without the comparison would have turned a safe override flag into a destructive
+  one.
+- **A convergence that fails part way through still reports what it removed.**
+  `clean` is destructive and `reset` is the step most likely to throw; a bare
+  throw deleted files and took the record of their quarantine with it, leaving a
+  generic "pull failed". Failures now carry their violations.
+- **An un-cleanable path is reported, not re-quarantined — and does not stop the
+  mirror converging.** Two cases look identical to an operator and behaved
+  completely differently: `git clean -fd` REFUSES a nested git repository but exits
+  0, while it EXITS 1 on a path it cannot unlink (unwritable directory, EBUSY
+  mount, NFS silly-rename). Treating that non-zero exit as fatal meant `reset`
+  never ran and the mirror never converged — permanently stale, recoverable only
+  by hand, which is the original wedging bug in a new costume. A failed `clean` is
+  now non-fatal: whatever survives is reported as `unremovable`, the reset
+  proceeds, and quarantine copies of surviving files are dropped because a file
+  that was not destroyed does not need preserving.
+- **`dirty_files` reports what was actually destroyed**, not the whole scan —
+  counting survivors as losses overstated the damage at the moment the number
+  matters most.
+- **A git-first write refuses while a managed clone is ahead of origin.** The pull
+  path rebases, so a stray local commit would be replayed and PUSHED by the next
+  write — publishing an operator's untidy commit to origin unindexed, while the
+  sync loop's policy for that same commit is to quarantine and discard it.
+  Whichever ran first decided whether it became canonical wiki content. One policy
+  per clone now: the write pauses, and the next convergence clears it.
+- Resolving writer mode no longer happens inside the pull's `try`, where a
+  transient database error was caught by the pull handler — so `pullRepo` never
+  ran and the sync proceeded against an unrefreshed clone. A DB hiccup could not
+  affect the pull before this feature existed and must not now.
+- **`sync --dry-run` never converges.** `pull --ff-only` was harmless to run during
+  a preview; `convergeMirror` force-moves HEAD and deletes uncommitted files. A
+  dry run on a managed source now skips convergence and says why, under its own
+  `dry_run_skipped_converge` warning code rather than borrowing `pull_failed` —
+  nothing failed.
+
 ## [0.43.0.21] - 2026-08-20
 
 **`put_page` no longer makes the brain a second author.** On a machine-managed

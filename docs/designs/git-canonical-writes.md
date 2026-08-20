@@ -1,6 +1,6 @@
 # Design: Git-Anchored Writes — structural enforcement of repo canonicality
 
-**Status:** in progress — Phase 0, 0b and 2a landed · **Author:** Claude (session 2026-08-18, with Ross) · **Target:** `arkologystudio/knowledge-system` (gbrain fork)
+**Status:** in progress — Phase 0, 0b, 2a and 1 landed · **Author:** Claude (session 2026-08-18, with Ross) · **Target:** `arkologystudio/knowledge-system` (gbrain fork)
 **Suggested landing path:** `docs/designs/git-canonical-writes.md`
 
 ## 0. The invariant
@@ -16,7 +16,8 @@ This design makes the invariant **structural**: after it lands, there is *no rea
 - ✅ No `put_page` write leaves the DB ahead of git on a managed source, and no write-through path leaves an *uncommitted file* in a managed tree (the refusal is central and fails closed).
 - ⚠️ `gbrain rid backfill` writes RID stamps directly via `writeBrainPage`, bypassing write-through entirely. It leaves a dropping that the next converge quarantines and reverts — so the stamps do not stick on a managed source. Tracked with Phase 2b.
 - ⚠️ Two paths are still DB-only on a managed source: `submit_ingest` and sandbox subagents (Phase 2b). They cannot wedge a mirror, but they are not anchored.
-- ⚠️ The mirror recovers unattended from divergence, dirt, and local commits — but **not** from a detached HEAD or a missing `origin/<branch>`, both of which still require a human. Those are refusals rather than wedges, but the "no state" claim is not yet literal.
+- ⚠️ The mirror recovers unattended from divergence, dirt, local commits, **and** from a path `git clean -fd` cannot remove (it converges and reports the stray path as `unremovable`). Two states still need a human: a **detached HEAD** and a **missing `origin/<branch>`**. Both are refused loudly rather than wedging silently, but neither self-heals, so the "no state" claim is not yet literal.
+- ⚠️ **Ignored files are outside the preserve/report machinery.** `.gitignore`d paths appear in neither `status -uall` nor `clean -fd`, so when an upstream commit starts tracking a path a mirror currently ignores, `reset --hard` overwrites the local content unscanned, unquarantined and unreported. Phase 1b.
 
 ## 1. Root-cause taxonomy (why prose failed)
 
@@ -166,7 +167,7 @@ Tier 2 (valuable, independent): structural write accounting for subagent jobs; d
 | **0b — done** | Close the self-upgrade footgun structurally: build identity as a compile-time constant (`src/core/distribution.ts`), foreign releases refused on every apply path, passive checks report fork status. Config could not do this — `self_upgrade.mode` is not on the path the dangerous commands take. **Done** (v0.43.0.20). | S | none — inert on upstream builds |
 | **2a — done** | Mechanism B core: `writer.mode` derived from a `writer.managed_sources` declaration; `put_page` routed through the git-first commit+push path on managed sources; write-through refused centrally for managed sources; provenance kept out of the committed bytes as a consequence of committing the caller's content. **Done** (v0.43.0.21). | M | landed |
 | **2b — open** | Anchor the two remaining database-only paths on managed sources: `submit_ingest` (ingest-capture minion → `importFromContent` with no git) and sandbox subagents (`viaSubagent` without `allowedSlugPrefixes`). Neither leaves a dropping, so neither can wedge a mirror — but neither is reachable from `origin/main` either, so §0's invariant is not yet literally true. Also owed: §B1a bulk batching. | M | — |
-| **1** | Mechanism A: sync's git step → fetch + quarantine + reset; mirror dir hygiene. **Ordering hazard is now RESOLVED by 2a** — see below. | M | low, now that 2a has landed |
+| **1 — done** | Mechanism A: sync's git step → fetch + quarantine + reset for machine-managed sources; violations reported as `mirror_violation` warnings. Ordering hazard resolved by landing 2a first. **Done** (v0.43.0.22). Mirror dir hygiene (0700 + `DO-NOT-EDIT.md` breadcrumb) still outstanding. | M | landed |
 | **2** | Mechanism B: worktree write path (refactor `git-page-write.ts` onto ephemeral worktrees + private refspec); route `put_page` through it; bulk batching (§B1a); `writer.mode` + `managed` derivation; delete `write-through.ts` for `git-first`; B3 canonical serializer + provenance-out-of-frontmatter. | L | main risk = serializer round-trip regressions; gate with a corpus round-trip test over the whole arkology wiki |
 | **3** | Mechanism C in-engine: three-commit model in `get_health`/`sources_status`, score cap. Retire the phase-0 script's overlap. | M | low |
 | Interleaved | Tier-1 cherry-picks, each with its upstream tests. | M | per-pick |
