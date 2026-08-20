@@ -27,12 +27,14 @@ import { CONTENT_FLAG_KEY, QUARANTINE_KEY } from './quarantine.ts';
 import { EMBED_SKIP_KEY } from './embed-skip.ts';
 import {
   divergenceSafePull,
+  GitOperationError,
   GIT_ENV_AUTH,
   GIT_SSRF_SUBCOMMAND_FLAGS,
   isWorkingTreeDirty,
 } from './git-remote.ts';
 import { unifiedDiff } from './skillpack/diff-text.ts';
 import { acquireRepoLock } from './repo-lock.ts';
+import { resolveSourceRepoPath } from './writer-mode.ts';
 
 const MAX_CONTENT_BYTES = 5_000_000;
 const MAX_DIFF_CHARS = 40_000;
@@ -62,6 +64,20 @@ export interface GitPageWriteInput {
   commitMessage?: string;
   actor: string;
   protectedSlugs?: readonly string[];
+  /**
+   * Single-shot write with no preview round-trip (the `put_page` git-first path).
+   *
+   * The expectedHead / expectedContentSha256 pins exist to stop an `apply` that
+   * was previewed against a DIFFERENT repo state from landing — a real hazard for
+   * `commit_page`, where preview and apply are separate MCP calls with an operator
+   * in between. A self-pinned write computes both values microseconds earlier
+   * inside the SAME repo lock, so there is no window for them to go stale and
+   * demanding them would just mean echoing back what we ourselves just read.
+   *
+   * This weakens no invariant that matters: validation, protected slugs, path
+   * confinement, commit and push are all unchanged.
+   */
+  selfPin?: boolean;
 }
 
 export interface GitPageWriteResult {
@@ -97,6 +113,52 @@ export class GitPageWriteError extends Error {
     super(message);
     this.name = 'GitPageWriteError';
   }
+}
+
+/**
+ * Map a git-write failure onto an operation error code an AGENT can act on.
+ *
+ * This distinction is not cosmetic. `invalid_params` tells an agent its content
+ * was malformed, so it rewrites the page; `git_conflict` / `git_push_failed` tell
+ * it the content was fine and the repository was momentarily unavailable, so it
+ * retries. Collapsing the second class into the first makes an agent respond to a
+ * 30-second lock contention with the 5-minutely sync by rewriting a perfectly
+ * good page — and lock contention is routine, not exceptional.
+ */
+export function gitFailureCode(e: unknown): string {
+  // A failed fetch/pull arrives as GitOperationError from git-remote.ts, NOT as
+  // GitPageWriteError — it is raised below this layer, before a page write ever
+  // gets its hands on the repo. An unreachable remote is the single most common
+  // transient condition there is, so falling through to `storage_error` told the
+  // agent "operator problem, do not retry" for exactly the case where retrying is
+  // the right answer.
+  if (e instanceof GitOperationError) {
+    return e.op === 'fetch' || e.op === 'pull' ? 'git_conflict' : 'storage_error';
+  }
+  if (!(e instanceof GitPageWriteError)) return 'storage_error';
+  switch (e.code) {
+    case 'protected_path':
+      return 'permission_denied';           // deliberate policy; never retry
+    case 'invalid_content':
+      return 'invalid_params';              // the content really is the problem
+    case 'repo_dirty':
+    case 'repo_conflict':
+    case 'stale_preview':
+      return 'git_conflict';                // transient; retry is correct
+    case 'push_failed':
+    case 'commit_failed':
+      return 'git_push_failed';             // transient; retry is correct
+    case 'repo_unavailable':
+    case 'disabled':
+    default:
+      return 'storage_error';               // operator/configuration problem
+  }
+}
+
+/** True when the failure is worth retrying rather than rewriting the content. */
+export function isRetryableGitFailure(e: unknown): boolean {
+  const code = gitFailureCode(e);
+  return code === 'git_conflict' || code === 'git_push_failed';
 }
 
 const repoQueues = new Map<string, Promise<void>>();
@@ -171,23 +233,10 @@ function validateContent(slug: string, content: string, protectedSlugs: readonly
 }
 
 async function resolveRepoPath(engine: BrainEngine, sourceId: string): Promise<string> {
-  const rows = await engine.executeRaw<{ local_path: string | null }>(
-    'SELECT local_path FROM sources WHERE id = $1',
-    [sourceId],
-  );
-  const sourcePath = rows[0]?.local_path ?? null;
-  if (sourcePath) return sourcePath;
-
-  const repoPath = await engine.getConfig('sync.repo_path');
+  // Shared with writer-mode.ts so the two can never disagree about which
+  // directory a source's writes belong in; this wrapper only adds the throw.
+  const repoPath = await resolveSourceRepoPath(engine, sourceId);
   if (!repoPath) throw new GitPageWriteError('repo_unavailable', `source '${sourceId}' has no local checkout`);
-
-  const otherSources = await engine.executeRaw<{ id: string }>(
-    'SELECT id FROM sources WHERE id <> $1 AND local_path = $2 LIMIT 1',
-    [sourceId, repoPath],
-  );
-  if (otherSources.length > 0) {
-    throw new GitPageWriteError('repo_unavailable', `configured checkout belongs to another source`);
-  }
   return repoPath;
 }
 
@@ -276,13 +325,13 @@ export async function gitFirstPageWrite(
       };
 
       if (input.mode === 'preview') return base;
-      if (!input.expectedHead || input.expectedHead !== head) {
+      if (!input.selfPin && (!input.expectedHead || input.expectedHead !== head)) {
         throw new GitPageWriteError(
           'stale_preview',
           `previewed HEAD ${input.expectedHead || '<missing>'} does not match current HEAD ${head}`,
         );
       }
-      if (!input.expectedContentSha256 || input.expectedContentSha256 !== base.content_sha256) {
+      if (!input.selfPin && (!input.expectedContentSha256 || input.expectedContentSha256 !== base.content_sha256)) {
         throw new GitPageWriteError(
           'stale_preview',
           `previewed content hash ${input.expectedContentSha256 || '<missing>'} does not match proposed content ${base.content_sha256}`,
@@ -309,9 +358,47 @@ export async function gitFirstPageWrite(
           'push', ...GIT_SSRF_SUBCOMMAND_FLAGS, 'origin', `HEAD:${branch}`,
         ], 180_000);
       } catch (e) {
+        // Roll the commit back. Leaving it behind was the pre-existing behaviour
+        // and it is worse than it looks: the checkout is left CLEAN but one commit
+        // ahead of origin — the exact divergent state this whole design exists to
+        // prevent — and because `divergenceSafePull` rebases, the NEXT successful
+        // write replays and pushes this commit. The caller was told its write
+        // failed and no index row was created, yet the content reaches
+        // `origin/main` later, unindexed and unattributed.
+        //
+        // Reset to the pre-write commit so a failed write leaves nothing at all.
+        // `--hard` is safe here and nowhere else: we are inside the repo lock, we
+        // verified the tree was clean before writing, and the only change since is
+        // the one file we just wrote.
+        // Did the push actually land? A remote can accept the ref and the client
+        // still see a network error on the response. Rolling back then would
+        // discard a commit that IS live on origin, and report a success as a
+        // failure. Ask the remote before touching anything.
+        let landed = false;
+        try {
+          const remoteRef = git(repoPath, [
+            '-c', 'http.followRedirects=false',
+            'ls-remote', 'origin', `refs/heads/${branch}`,
+          ], 30_000);
+          landed = remoteRef.startsWith(committedHead);
+        } catch {
+          landed = false;                      // cannot tell → treat as not landed
+        }
+        if (landed) {
+          return { ...base, head_after: committedHead, committed: true, pushed: true };
+        }
+
+        let rollback = 'rolled back';
+        try {
+          git(repoPath, ['reset', '--hard', head], 30_000);
+        } catch (resetErr) {
+          // Report the failure to roll back rather than hiding it — a mirror left
+          // ahead of origin is something an operator needs to know about.
+          rollback = `ROLLBACK FAILED (${redactGitError(resetErr instanceof Error ? resetErr.message : String(resetErr))}); commit ${committedHead.slice(0, 12)} is local-only and will be replayed by the next write`;
+        }
         throw new GitPageWriteError(
           'push_failed',
-          `commit ${committedHead.slice(0, 12)} is local-only; push failed: ${redactGitError(e instanceof Error ? e.message : String(e))}`,
+          `push failed (${rollback}): ${redactGitError(e instanceof Error ? e.message : String(e))}`,
         );
       }
 

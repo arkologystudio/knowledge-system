@@ -905,6 +905,12 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // protected_slugs is a comma-separated exact/glob list (e.g. voice/*).
   'writer.commit_page.enabled',
   'writer.commit_page.protected_slugs',
+  // Git-first writer modes (v0.43.0.21). `writer.managed_sources` is a
+  // comma-separated list of source ids whose working tree a machine pulls and
+  // resets; those are FORCED to git-first. `writer.mode` (and the per-source
+  // `writer.mode.<sourceId>`) only applies to UNMANAGED sources.
+  'writer.managed_sources',
+  'writer.mode',
   // Skill-nag suppression (#2180): brain-resident pack install nag off-switch.
   'skillpack.nag_disabled',
   // Self-upgrade (v0.42; file plane, read on the hot path)
@@ -948,6 +954,12 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'mcp.',               // mcp.publish_skills, mcp.skills_dir (PR1 skill catalog)
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
+  // NOT a blanket 'writer.' prefix: `writer.managed_sources` is the declaration
+  // that decides whether a source is protected at all, so a typo
+  // (`writer.managed_source`) must be REJECTED as an unknown key rather than
+  // silently accepted and silently leaving the source unmanaged. Only the
+  // genuinely open-ended per-source namespace is prefixed.
+  'writer.mode.',       // writer.mode.<sourceId>
 ];
 
 export function saveConfig(config: GBrainConfig): void {

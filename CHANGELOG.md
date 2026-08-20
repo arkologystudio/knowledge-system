@@ -2,6 +2,124 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.21] - 2026-08-20
+
+**`put_page` no longer makes the brain a second author.** On a machine-managed
+source the page is now committed and PUSHED before the index is allowed to know
+about it. If the push cannot land, the write fails, no database row exists, and
+the checkout is left exactly as it was.
+
+Until now `put_page` had one behaviour for every source: write the row, then drop
+an *uncommitted* `.md` into whatever checkout `sync.repo_path` resolved to. On a
+hand-tended wiki that is right — the working tree is the truth and a human commits
+it. On a machine-managed clone it is a half-write, and it stays one until somebody
+happens to commit the file. Telling agents "call `commit_page` instead" is prose,
+and prose is what failed: a CLAUDE.md actively instructed the losing call.
+
+The discriminator is deliberately NOT "does this source have a git remote" — a
+hand-tended wiki has an origin too. It is **"does a machine pull and reset this
+working tree"**, declared once in `writer.managed_sources`. Given that, `git-first`
+is forced: asking for `local-tree` or `db-only` on a machine-managed source is
+refused, because that combination IS the incident.
+
+**Declaring nothing changes nothing.** Sources you have not declared keep their
+exact present behaviour.
+
+### Scope of the guarantee
+
+On a machine-managed source, **no `put_page` write leaves the database ahead of
+git, and no write path leaves an uncommitted file in the tree.** Two narrower
+paths remain database-only by design and are NOT anchored in git:
+
+- `submit_ingest` (the ingest-capture minion) writes through `importFromContent`
+  directly and never touches git.
+- Sandbox subagents (`viaSubagent` without `allowedSlugPrefixes`) are deliberately
+  database-only and already reported `skipped: 'subagent_sandbox'`.
+
+`gbrain rid backfill` also writes stamps directly via `writeBrainPage`, bypassing
+write-through; on a managed source the next converge quarantines and reverts them.
+
+None of these leaves a dropping through the guarded path, but none is anchored
+either. Closing them is tracked in `docs/designs/git-canonical-writes.md`.
+
+**Rolling this out takes TWO keys, not one.** Declaring a source in
+`writer.managed_sources` makes its remote `put_page` writes subject to the same
+gate as `commit_page`, so `writer.commit_page.enabled=true` must be set as well or
+remote writes to that source will be refused. Local callers are unaffected.
+
+### Added
+- `src/core/writer-mode.ts` — `git-first` / `local-tree` / `db-only`, derived from
+  the `writer.managed_sources` declaration rather than freely chosen. Refuses a
+  weaker mode on a managed source, and refuses a managed source with no checkout
+  instead of silently degrading it. An unrecognized mode string throws rather than
+  falling back permissively, and surfaces to the caller as a structured
+  `invalid_request` naming what an operator must fix.
+- `writer.managed_sources`, `writer.mode`, and per-source `writer.mode.<sourceId>`
+  config keys. `writer.managed_sources` is registered as an EXACT key, not behind a
+  blanket `writer.` prefix, so a typo (`writer.managed_source`) is rejected rather
+  than silently leaving a source unmanaged.
+- `gitFailureCode()` / `isRetryableGitFailure()` — git failures now map to codes an
+  agent can act on (`git_conflict`, `git_push_failed`, `invalid_params`,
+  `permission_denied`), with a suggestion telling a retryable caller not to rewrite
+  its content. A failed fetch/pull arrives as `GitOperationError` from below the
+  page-write layer and is classified retryable too — an unreachable remote is the
+  most common transient condition there is.
+- `put_page` responses carry `writer_mode`, `writer_managed`, and `git_first`.
+- `test/writer-mode.test.ts` and `test/put-page-git-first.serial.test.ts` — the
+  latter runs the real handler against real git repositories and pins the negative
+  cases hardest.
+
+### Fixed
+- **A push that actually landed is no longer reported as a failure.** A remote can
+  accept the ref while the client sees a network error on the response; rolling
+  back then would discard a commit that is live on origin. The remote is asked
+  (`ls-remote`) before anything is undone.
+- **A failed push no longer leaves a divergent commit behind.** Previously the
+  local commit survived a push failure: the checkout was left clean but one commit
+  ahead of origin, and because the pull path rebases, the NEXT successful write
+  replayed and pushed the content this call had reported as failed — unindexed and
+  unattributed. The commit is now rolled back, and a failed rollback is reported
+  rather than hidden. (Pre-existing in `commit_page`; this release moves the path
+  onto the highest-traffic write, which is what made it worth fixing.)
+- **A git-first `put_page` is gated exactly like `commit_page`.** It pushes to
+  origin, so remote callers now require `writer.commit_page.enabled=true` and an
+  OAuth client scoped to one write source. Without this, declaring a source
+  machine-managed would have silently turned `put_page` into an ungated remote push
+  surface.
+- **Write-through refuses centrally on a machine-managed source**, and fails
+  CLOSED. The guard lives in `writePageThrough` rather than at each call site, so
+  callers that never knew about writer modes — `gbrain brainstorm/lsd --save`, and
+  any future one — cannot leave a dropping either. The managed check is asked
+  first and independently, because resolving the full mode can throw on a bad
+  `writer.mode` value and swallowing that threw the guard away entirely: one typo
+  silently re-enabled droppings for every source.
+- Write-through is skipped on the git-first `put_page` path; running it would
+  overwrite the just-committed file with the DB's re-serialisation, reintroducing
+  the provenance-stamp diff that collided add/add during the incident.
+- Committing the caller's own bytes rather than a re-render means `ingested_via`,
+  `ingested_at` and `source_kind` never reach the repository at all.
+- `resolveSourceRepoPath` is shared by the writer and the git-write path, so the
+  two can no longer disagree about which checkout a source's pages belong in.
+
+### Changed (breaking, on machine-managed sources only)
+- **`put_page` now validates content strictly** on a machine-managed source,
+  because the bytes go straight into the repository: frontmatter must parse, the
+  `slug:` must match the target, and gate-owned keys (`quarantine`, `content_flag`,
+  `embed_skip`) are rejected rather than stripped. Callers that previously
+  succeeded with looser content will now fail with `invalid_params`. This affects
+  agents sending bare markdown and any caller whose frontmatter carries a differing
+  `slug:`.
+- **Dream-cycle subagents writing to a machine-managed source now commit and push
+  to `origin/<branch>`.** That is the intended consequence of making the repository
+  canonical, but it is a real change in what reaches the wiki automatically — worth
+  a deliberate decision before declaring a source managed on a brain that runs the
+  nightly cycle.
+
+### Notes
+- Ephemeral-worktree isolation for writes is deliberately NOT in this release. The
+  design asks for it to be decided by measurement rather than assertion, and the
+  existing cross-process repo lock already serialises writers against the sync loop.
+
 ## [0.43.0.20] - 2026-08-18
 
 **The runbook said "never run this"; the binary now says it too.** v0.43.0.19
