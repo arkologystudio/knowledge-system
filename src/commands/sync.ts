@@ -3110,6 +3110,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     chunksCreated,
     embedded,
     pagesAffected,
+    // Warnings were previously attached ONLY to the two no-op returns, which is
+    // exactly backwards for mirror violations: discarding a local commit MOVES
+    // HEAD, and quarantining dirty files usually coincides with upstream changes
+    // — so a violation almost always lands on THIS path. The structured warning
+    // was therefore dropped in nearly every case it existed for, surviving only
+    // as a log line. "Nothing is discarded silently" has to hold on the success
+    // path too, or it does not hold at all.
+    ...(syncWarnings.length > 0 ? { warnings: syncWarnings } : {}),
   };
 }
 

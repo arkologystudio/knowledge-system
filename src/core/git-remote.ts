@@ -15,7 +15,7 @@
  * stderr warning at use site is the operator's signal.
  */
 import { execFileSync } from 'child_process';
-import { lstatSync, existsSync, readdirSync, mkdirSync, copyFileSync } from 'fs';
+import { lstatSync, existsSync, readdirSync, mkdirSync, copyFileSync, symlinkSync, readlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { isInternalUrl } from './url-safety.ts';
 
@@ -625,51 +625,116 @@ export function convergeMirror(
   // 1. Local-only commits → rescue ref.
   const ahead = run(['log', '--format=%H %s', `origin/${branch}..HEAD`], 30_000);
   if (ahead) {
+    // The ref is named for the tip commit, so re-converging at the same HEAD is
+    // idempotent rather than collision-prone. One ref preserves the whole chain:
+    // every local commit is an ancestor of the tip, so `git log <ref>` shows all
+    // of them and the objects stay GC-rooted.
     const ref = `refs/gbrain/rescue/${stamp}`;
+    let preserved = true;
     try {
       run(['update-ref', ref, 'HEAD'], 10_000);
-    } catch { /* preserving is best-effort; the report below still names the sha */ }
-    const count = ahead.split('\n').filter(Boolean).length;
+    } catch {
+      // Claiming preservation that did not happen is worse than admitting the
+      // loss: an operator who trusts the report will not go looking in the reflog
+      // while it is still recoverable.
+      preserved = false;
+    }
+    const lines = ahead.split('\n').filter(Boolean);
     violations.push({
       kind: 'local_commits',
-      detail: `${count} local-only commit(s) on ${branch}; someone committed inside a machine-managed mirror. First: ${ahead.split('\n')[0]}`,
-      preservedAt: `${ref} (recover with: git -C ${repoPath} log ${ref})`,
+      detail: `${lines.length} local-only commit(s) on ${branch}; someone committed inside a machine-managed mirror. Tip: ${lines[0]}`,
+      preservedAt: preserved
+        ? `${ref} (recover with: git -C ${repoPath} log ${ref})`
+        : `PRESERVATION FAILED — could not write ${ref}. The commits are only in the reflog: git -C ${repoPath} reflog`,
     });
   }
 
   // 2. Dirty / untracked files → quarantine directory.
   //
-  // Read status WITHOUT trimming. Porcelain v1 encodes state in two fixed
-  // columns, and a modified-but-unstaged file is ` M path` — leading space and
-  // all. Trimming the output ate that space on the first line only, so the first
-  // entry's path was parsed one character short, the file silently failed to
-  // copy, and the reset then destroyed it. A quarantine that loses the very file
-  // it exists to save is worse than no quarantine, so this reads raw.
-  const dirtyRaw = execFileSync('git', ['-C', repoPath, 'status', '--porcelain'], {
+  // `-z -uall` is load-bearing, not a style choice. Two ways the naive read lost
+  // exactly the files this quarantine exists to save, both fixed here:
+  //
+  //   * WITHOUT `-uall`, git collapses an untracked DIRECTORY to a single `dir/`
+  //     entry. Copying that entry fails (it is not a file), while `clean -fd`
+  //     happily deletes the whole tree — so a brand-new slug namespace (the most
+  //     likely shape for an unanchored write) vanished entirely.
+  //   * WITHOUT `-z`, git QUOTES and C-escapes any path with non-ASCII, a quote,
+  //     a backslash, a tab or a newline (`"caf\303\251.md"`). Stripping the outer
+  //     quotes is not enough — the escapes remain, the path does not resolve, the
+  //     file is skipped, and the reset destroys it. `-z` emits raw bytes with NUL
+  //     terminators and no quoting at all, which removes the parsing problem
+  //     rather than trying to out-guess it.
+  //
+  // A path that merely contains a SPACE survives naive parsing by luck, which is
+  // precisely why a test suite built on ordinary filenames reported success.
+  const dirtyRaw = execFileSync('git', ['-C', repoPath, 'status', '--porcelain', '-z', '-uall'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
     env: { ...process.env, ...GIT_ENV },
   });
-  const dirty = dirtyRaw.replace(/\n$/, '');
-  if (dirty && opts.quarantineRoot) {
+
+  // -z record grammar: `XY <path>\0`, and for renames/copies an EXTRA `\0<origin>`
+  // field follows. Consume that origin field so it is never mistaken for a status
+  // record — misreading it would shift every subsequent entry by one.
+  const entries: { xy: string; path: string }[] = [];
+  const fields = dirtyRaw.split('\0');
+  for (let i = 0; i < fields.length; i++) {
+    const f = fields[i];
+    if (!f) continue;
+    const xy = f.slice(0, 2);
+    const path0 = f.slice(3);
+    if (!path0) continue;
+    entries.push({ xy, path: path0 });
+    if (xy[0] === 'R' || xy[0] === 'C') i++;   // skip the origin-path field
+  }
+
+  if (entries.length > 0 && opts.quarantineRoot) {
     const dest = join(opts.quarantineRoot, `${stamp}-${process.pid}`);
     let moved = 0;
-    for (const line of dirty.split('\n').filter(Boolean)) {
-      // Porcelain v1: XY<space>path. Rename entries carry ` -> `; take the destination.
-      const raw = line.slice(3);
-      const rel = raw.includes(' -> ') ? raw.split(' -> ')[1]! : raw;
-      const src = join(repoPath, rel.replace(/^"|"$/g, ''));
-      if (!existsSync(src)) continue;
+    let failed = 0;
+    const preserve = (rel: string): void => {
+      const src = join(repoPath, rel);
+      let st;
       try {
-        const target = join(dest, rel.replace(/^"|"$/g, ''));
+        st = lstatSync(src);
+      } catch {
+        return;                                  // deleted entries have nothing to save
+      }
+      const target = join(dest, rel);
+      try {
+        if (st.isDirectory()) {
+          // Belt and braces: with `-uall` git already lists directory CONTENTS, so
+          // this should not trigger — but a directory entry reaching the reset
+          // unpreserved is the failure that motivated this whole rewrite.
+          mkdirSync(target, { recursive: true });
+          for (const child of readdirSync(src)) preserve(join(rel, child));
+          return;
+        }
         mkdirSync(dirname(target), { recursive: true });
-        copyFileSync(src, target);
+        if (st.isSymbolicLink()) {
+          // Preserve the LINK, not its target: copyFileSync would dereference it
+          // and silently turn a symlink into a copy of whatever it pointed at.
+          symlinkSync(readlinkSync(src), target);
+        } else {
+          copyFileSync(src, target);
+        }
         moved++;
-      } catch { /* one unreadable file must not stop convergence */ }
-    }
+      } catch {
+        failed++;                                // one unreadable file must not stop convergence
+      }
+    };
+    for (const e of entries) preserve(e.path);
     violations.push({
       kind: 'dirty_files',
-      detail: `${dirty.split('\n').filter(Boolean).length} uncommitted change(s) in a machine-managed mirror (${moved} preserved)`,
+      detail: `${entries.length} uncommitted change(s) in a machine-managed mirror (${moved} preserved${failed > 0 ? `, ${failed} FAILED to preserve` : ''})`,
       preservedAt: dest,
+    });
+  } else if (entries.length > 0) {
+    // No quarantine root configured. Still report it — destroying files AND
+    // staying silent about it is the worst of both worlds.
+    violations.push({
+      kind: 'dirty_files',
+      detail: `${entries.length} uncommitted change(s) in a machine-managed mirror DISCARDED — no quarantine root was configured`,
+      preservedAt: '(nothing preserved)',
     });
   }
 

@@ -127,6 +127,87 @@ describe('convergeMirror', () => {
     expect(fs.readFileSync(path.join(v!.preservedAt, 'README.md'), 'utf8')).toContain('locally modified');
   });
 
+  test('preserves an untracked DIRECTORY tree rather than letting clean -fd eat it', async () => {
+    // The shape that actually loses data: a new slug namespace is a new untracked
+    // directory, which porcelain collapses to `dir/` without -uall. Copying that
+    // entry fails while `clean -fd` deletes the whole tree.
+    fs.mkdirSync(path.join(mirror, 'wiki/notes'), { recursive: true });
+    fs.writeFileSync(path.join(mirror, 'wiki/notes/important.md'), 'PRECIOUS DATA A\n');
+    fs.writeFileSync(path.join(mirror, 'wiki/top.md'), 'also precious\n');
+    upstreamCommit('unrelated.md');
+
+    const res = convergeMirror(mirror, { quarantineRoot: quarantine });
+
+    expect(git(mirror, ['status', '--porcelain'])).toBe('');
+    expect(fs.existsSync(path.join(mirror, 'wiki/notes/important.md'))).toBe(false);
+    const v = res.violations.find((x) => x.kind === 'dirty_files')!;
+    expect(fs.readFileSync(path.join(v.preservedAt, 'wiki/notes/important.md'), 'utf8')).toBe('PRECIOUS DATA A\n');
+    expect(fs.readFileSync(path.join(v.preservedAt, 'wiki/top.md'), 'utf8')).toBe('also precious\n');
+  });
+
+  test('preserves paths git would quote and C-escape', async () => {
+    // Without -z, git emits `"caf\303\251.md"`; stripping the quotes leaves the
+    // escapes, the path never resolves, and the reset destroys the file.
+    fs.writeFileSync(path.join(mirror, 'café.md'), 'PRECIOUS DATA B\n');
+    fs.writeFileSync(path.join(mirror, 'with space.md'), 'PRECIOUS DATA C\n');
+    fs.writeFileSync(path.join(mirror, 'quo"te.md'), 'PRECIOUS DATA D\n');
+    upstreamCommit('unrelated2.md');
+
+    const res = convergeMirror(mirror, { quarantineRoot: quarantine });
+    const v = res.violations.find((x) => x.kind === 'dirty_files')!;
+
+    expect(fs.readFileSync(path.join(v.preservedAt, 'café.md'), 'utf8')).toBe('PRECIOUS DATA B\n');
+    expect(fs.readFileSync(path.join(v.preservedAt, 'with space.md'), 'utf8')).toBe('PRECIOUS DATA C\n');
+    expect(fs.readFileSync(path.join(v.preservedAt, 'quo"te.md'), 'utf8')).toBe('PRECIOUS DATA D\n');
+    expect(git(mirror, ['status', '--porcelain'])).toBe('');
+  });
+
+  test('preserves a staged rename without mis-parsing the origin-path field', async () => {
+    // -z emits `R  new\0old\0`; consuming the origin field is required or every
+    // later entry shifts by one and gets mis-copied.
+    git(mirror, ['mv', 'README.md', 'RENAMED.md']);
+    fs.writeFileSync(path.join(mirror, 'after-rename.md'), 'PRECIOUS DATA E\n');
+    upstreamCommit('unrelated3.md');
+
+    const res = convergeMirror(mirror, { quarantineRoot: quarantine });
+    const v = res.violations.find((x) => x.kind === 'dirty_files')!;
+    expect(fs.readFileSync(path.join(v.preservedAt, 'after-rename.md'), 'utf8')).toBe('PRECIOUS DATA E\n');
+    expect(git(mirror, ['status', '--porcelain'])).toBe('');
+    expect(fs.existsSync(path.join(mirror, 'README.md'))).toBe(true);
+  });
+
+  test('preserves a symlink as a link, not as a copy of its target', async () => {
+    fs.writeFileSync(path.join(mirror, 'target.md'), 'target body\n');
+    fs.symlinkSync('target.md', path.join(mirror, 'link.md'));
+    upstreamCommit('unrelated4.md');
+
+    const res = convergeMirror(mirror, { quarantineRoot: quarantine });
+    const v = res.violations.find((x) => x.kind === 'dirty_files')!;
+    const saved = path.join(v.preservedAt, 'link.md');
+    expect(fs.lstatSync(saved).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(saved)).toBe('target.md');
+  });
+
+  test('a deleted tracked file is restored and does not abort the scan', async () => {
+    fs.rmSync(path.join(mirror, 'README.md'));
+    fs.writeFileSync(path.join(mirror, 'survivor.md'), 'PRECIOUS DATA F\n');
+    upstreamCommit('unrelated5.md');
+
+    const res = convergeMirror(mirror, { quarantineRoot: quarantine });
+    expect(fs.existsSync(path.join(mirror, 'README.md'))).toBe(true);
+    const v = res.violations.find((x) => x.kind === 'dirty_files')!;
+    expect(fs.readFileSync(path.join(v.preservedAt, 'survivor.md'), 'utf8')).toBe('PRECIOUS DATA F\n');
+  });
+
+  test('with no quarantine root it still REPORTS the discard instead of going silent', async () => {
+    fs.writeFileSync(path.join(mirror, 'doomed.md'), 'x\n');
+    upstreamCommit('unrelated6.md');
+    const res = convergeMirror(mirror, { quarantineRoot: '' });
+    const v = res.violations.find((x) => x.kind === 'dirty_files');
+    expect(v).toBeDefined();
+    expect(v!.detail).toMatch(/DISCARDED/);
+  });
+
   test('reports both violation kinds when both are present', async () => {
     fs.writeFileSync(path.join(mirror, 'a.md'), 'a\n');
     git(mirror, ['add', '.']);

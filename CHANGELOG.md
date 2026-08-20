@@ -34,16 +34,40 @@ pulling exactly as before.
   that reproduces the incident state (a local commit plus upstream commits),
   asserts `git pull --ff-only` genuinely fails there, and then proves convergence
   resolves it on the first attempt with the stray commit still reachable by ref.
+  Also pins untracked directories, quoted/non-ASCII paths, renames, symlinks and
+  deletions — the cases whose absence hid two data-loss bugs.
+- `test/sync-mirror-converge.serial.test.ts` — the same recovery driven through
+  `performSync` itself, asserting the violation arrives in the RESULT and that an
+  UNMANAGED source still keeps its local commit rather than being reset.
 
 ### Fixed
 - A failed fetch aborts before the reset, so losing the remote can never converge
   a mirror onto a stale remote-tracking ref.
 - A detached HEAD is refused rather than guessed at.
-- Quarantine reads `git status --porcelain` **untrimmed**. Porcelain v1 encodes
-  state in two fixed columns and a modified-unstaged file is ` M path`, leading
-  space included; trimming ate that space on the first line, parsed its path one
-  character short, and silently failed to preserve exactly the file the quarantine
-  exists to save. Caught by the tests before it could reach a mirror.
+- **The quarantine scan reads `git status --porcelain -z -uall`.** Two ways the
+  naive read destroyed the very files it exists to save, both found in review:
+  without `-uall` git collapses an untracked DIRECTORY to a single `dir/` entry,
+  which cannot be copied but is happily deleted by `clean -fd` — and a brand-new
+  slug namespace is exactly that shape; without `-z` git quotes and C-escapes any
+  path with non-ASCII, a quote, a backslash or a tab, so the path never resolved,
+  the file was skipped, and the reset removed it. `-z` emits raw bytes with NUL
+  terminators, which removes the parsing problem rather than out-guessing it. A
+  path containing only a space survived naive parsing by luck, which is why a
+  suite built on ordinary filenames reported success.
+- Rename/copy records consume their extra origin-path field, so one rename can no
+  longer shift every subsequent entry by one.
+- Symlinks are preserved as links rather than dereferenced into copies, and
+  directories are copied recursively.
+- A failed `update-ref` no longer reports a rescue that did not happen; it names
+  the reflog instead. An operator who trusts a false "preserved" line will not go
+  looking while recovery is still possible.
+- With no quarantine root configured, discarded files are still REPORTED rather
+  than destroyed in silence.
+- **`mirror_violation` warnings now reach the caller.** Warnings were attached
+  only to the two no-op returns, but a violation almost always coincides with real
+  changes — so the structured warning was dropped in nearly every case it existed
+  for, surviving only as a log line. "Nothing is discarded silently" has to hold on
+  the success path or it does not hold at all.
 
 ## [0.43.0.21] - 2026-08-20
 
