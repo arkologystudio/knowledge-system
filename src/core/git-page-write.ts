@@ -34,7 +34,7 @@ import {
 } from './git-remote.ts';
 import { unifiedDiff } from './skillpack/diff-text.ts';
 import { acquireRepoLock } from './repo-lock.ts';
-import { resolveSourceRepoPath } from './writer-mode.ts';
+import { resolveSourceRepoPath, isManagedSource } from './writer-mode.ts';
 
 const MAX_CONTENT_BYTES = 5_000_000;
 const MAX_DIFF_CHARS = 40_000;
@@ -300,6 +300,32 @@ export async function gitFirstPageWrite(
       }
 
       const head = git(repoPath, ['rev-parse', 'HEAD'], 10_000);
+
+      // ONE POLICY PER CLONE.
+      //
+      // `divergenceSafePull` rebases, so a stray local commit sitting in the
+      // checkout would be replayed and PUSHED by this write — publishing an
+      // operator's untidy commit to origin, unindexed and unreviewed. On a
+      // machine-managed source the sync loop's policy for that same commit is the
+      // opposite: quarantine it to a rescue ref and discard it. Whichever ran
+      // first would win, which is a coin toss deciding whether a stray commit
+      // becomes canonical wiki content.
+      //
+      // Refusing here leaves exactly one policy in force on a managed clone —
+      // sync's — and the next converge (within 5 minutes) clears the condition
+      // unattended, so this is a pause rather than a wedge.
+      if (await isManagedSource(engine, input.sourceId)) {
+        const ahead = git(repoPath, ['rev-list', '--count', `origin/${branch}..HEAD`], 10_000);
+        if (ahead !== '0') {
+          throw new GitPageWriteError(
+            'repo_conflict',
+            `machine-managed checkout is ${ahead} commit(s) ahead of origin/${branch}. ` +
+              `Writing now would rebase and push those commits. The sync loop quarantines ` +
+              `them instead; retry after the next convergence (within 5 minutes).`,
+          );
+        }
+      }
+
       const filePath = join(repoPath, `${slug}.md`);
       if (!isWriteTargetContained(filePath, repoPath)) {
         throw new GitPageWriteError('invalid_content', 'resolved page path escapes source checkout');

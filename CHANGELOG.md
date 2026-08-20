@@ -17,10 +17,11 @@ human could clear.
 
 Fetch + reset makes divergence **impossible rather than merely detected**: a
 diverged, dirty, or locally-committed mirror now recovers on the next tick without
-a human. Two states still need one — a detached HEAD, and an untracked path
-`git clean -fd` refuses to remove (a nested git repository, or one the process
-cannot write). Both are refused or reported rather than wedging silently, but
-neither self-heals, and the design doc says so too.
+a human — as does one holding a path `git clean -fd` cannot remove (a nested git
+repository, or one the process cannot write); the mirror converges and reports the
+stray path as `unremovable` until somebody clears it. **A detached HEAD is the one
+state that still needs a human**, and it is refused loudly rather than wedging
+silently.
 
 **Nothing tracked or untracked is discarded silently.** Before the reset,
 local-only commits are saved to a `refs/gbrain/rescue/<sha>` ref and uncommitted
@@ -98,12 +99,29 @@ pulling exactly as before.
   `clean` is destructive and `reset` is the step most likely to throw; a bare
   throw deleted files and took the record of their quarantine with it, leaving a
   generic "pull failed". Failures now carry their violations.
-- **An un-cleanable path is reported once, not re-quarantined forever.**
-  `git clean -fd` refuses to delete a nested git repository, so it survives —
-  meaning it was never destroyed and must not be claimed as quarantined. On a
-  5-minute timer the old behaviour produced a fresh quarantine tree and a fresh
-  violation every tick, which is the alert-fatigue shape this design exists to
-  avoid. Such paths now report as `unremovable` and their copies are dropped.
+- **An un-cleanable path is reported, not re-quarantined — and does not stop the
+  mirror converging.** Two cases look identical to an operator and behaved
+  completely differently: `git clean -fd` REFUSES a nested git repository but exits
+  0, while it EXITS 1 on a path it cannot unlink (unwritable directory, EBUSY
+  mount, NFS silly-rename). Treating that non-zero exit as fatal meant `reset`
+  never ran and the mirror never converged — permanently stale, recoverable only
+  by hand, which is the original wedging bug in a new costume. A failed `clean` is
+  now non-fatal: whatever survives is reported as `unremovable`, the reset
+  proceeds, and quarantine copies of surviving files are dropped because a file
+  that was not destroyed does not need preserving.
+- **`dirty_files` reports what was actually destroyed**, not the whole scan —
+  counting survivors as losses overstated the damage at the moment the number
+  matters most.
+- **A git-first write refuses while a managed clone is ahead of origin.** The pull
+  path rebases, so a stray local commit would be replayed and PUSHED by the next
+  write — publishing an operator's untidy commit to origin unindexed, while the
+  sync loop's policy for that same commit is to quarantine and discard it.
+  Whichever ran first decided whether it became canonical wiki content. One policy
+  per clone now: the write pauses, and the next convergence clears it.
+- Resolving writer mode no longer happens inside the pull's `try`, where a
+  transient database error was caught by the pull handler — so `pullRepo` never
+  ran and the sync proceeded against an unrefreshed clone. A DB hiccup could not
+  affect the pull before this feature existed and must not now.
 - **`sync --dry-run` never converges.** `pull --ff-only` was harmless to run during
   a preview; `convergeMirror` force-moves HEAD and deletes uncommitted files. A
   dry run on a managed source now skips convergence and says why, under its own

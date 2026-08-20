@@ -753,71 +753,115 @@ export function convergeMirror(
     });
   }
 
-  // 3. Converge, unconditionally.
+  // 3. Converge.
   //
   // ORDER MATTERS: clean BEFORE reset.
   //
   // The scan above ran against the CURRENT `.gitignore`. Running `clean -fd`
   // after the reset would apply the INCOMING one, so any file the old rules
   // ignored and the new rules do not is deleted without ever having been seen by
-  // the scan — unpreserved, and with no violation reported. That is the same
-  // silent-loss class as the untracked-directory and quoted-path bugs, arriving
-  // through a different door: an ordinary upstream `.gitignore` edit.
+  // the scan — unpreserved, and with no violation reported. Cleaning first bounds
+  // the deletion to exactly the working-tree state the scan measured.
   //
-  // Cleaning first bounds `clean` to exactly the working-tree state the scan
-  // measured, so "what was quarantined" and "what was deleted" are the same set.
-  //
-  // The failure path matters as much as the happy one: `clean` is destructive and
-  // `reset` is the step most likely to throw (a read-only directory in the
-  // incoming tree is enough). A bare throw would delete files and take the record
-  // of where they went down with it, leaving the operator with a generic "pull
-  // failed" and no idea anything was removed.
+  // Everything from here to the final rev-parse is wrapped, because `clean` is
+  // destructive: any throw after it must still carry the violations, or the
+  // operator gets a generic "pull failed" and no idea files were removed — or
+  // where the copies went.
+  const finish = (): MirrorConvergeResult => ({
+    before, after: run(['rev-parse', 'HEAD'], 10_000), branch, violations,
+  });
   try {
-    run(['clean', '-fd'], timeoutMs);
-  } catch (e) {
-    throw new MirrorConvergeError(
-      `mirror clean failed in ${repoPath}: ${(e as Error).message}`, violations, e,
+    // A NON-ZERO EXIT FROM `clean` IS NOT FATAL.
+    //
+    // `git clean -fd` exits 1 when it cannot unlink something — a path the
+    // process cannot write, an EBUSY mount, an NFS silly-rename. Treating that as
+    // fatal meant `reset` never ran and the mirror NEVER converged: permanently
+    // stale, recoverable only by hand. That is the original wedging bug in a new
+    // costume, and it defeated the survivor handling below, which exists to
+    // report exactly this case.
+    //
+    // (A nested git repository is the confusing sibling: `clean` REFUSES it but
+    // exits 0, so that path always worked. The two cases look identical to an
+    // operator and behaved completely differently.)
+    //
+    // Whatever clean could not remove is caught by the re-scan and reported as
+    // `unremovable`; the reset then proceeds, which is what actually makes the
+    // brain fresh again.
+    let cleanFailure: string | null = null;
+    try {
+      run(['clean', '-fd'], timeoutMs);
+    } catch (e) {
+      cleanFailure = (e as Error).message;
+    }
+
+    // Anything still untracked was therefore NOT destroyed. It must not be
+    // reported as quarantined-and-deleted, and its copies must not accumulate: on
+    // a 5-minute timer an un-cleanable path would otherwise produce a fresh
+    // quarantine tree and a fresh violation forever — the alert-fatigue shape
+    // this design exists to avoid.
+    //
+    // Intersected with the ORIGINAL untracked set: a file created by a human or
+    // Obsidian between the scan and the re-scan is not serialised by our repo
+    // lock, and counting it as a survivor could drive the arithmetic below to
+    // delete the quarantine of files that genuinely were destroyed.
+    const originalUntracked = new Set(entries.filter((e) => e.xy === '??').map((e) => e.path));
+    const survivors = new Set(
+      scanStatus(repoPath)
+        .filter((e) => e.xy === '??' && originalUntracked.has(e.path))
+        .map((e) => e.path),
     );
-  }
 
-  // Anything `clean -fd` could NOT remove was therefore never destroyed — a
-  // nested git repo (clean refuses without -ff) or an unwritable directory. Those
-  // must not be reported as quarantined-and-deleted, and their copies must not
-  // accumulate: on a 5-minute timer an un-cleanable directory would otherwise
-  // produce a fresh quarantine tree and a fresh violation forever, which is the
-  // alert-fatigue shape this design exists to avoid.
-  const survivors = new Set(
-    scanStatus(repoPath).filter((e) => e.xy === '??').map((e) => e.path),
-  );
-  if (survivors.size > 0) {
-    for (const rel of survivors) {
-      try { rmSync(join(quarantineDest, rel), { recursive: true, force: true }); } catch { /* best-effort */ }
-    }
-    const dirty = violations.find((v) => v.kind === 'dirty_files');
-    if (dirty) {
-      const remaining = untrackedCount - survivors.size;
-      if (remaining <= 0 && trackedDirtyCount === 0) {
-        violations.splice(violations.indexOf(dirty), 1);   // nothing was destroyed
-        try { rmSync(quarantineDest, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (survivors.size > 0) {
+      if (quarantineDest) {
+        // Guarded: with no quarantine root this join yields a RELATIVE path and
+        // rmSync would delete from the process CWD — outside the repo entirely.
+        for (const rel of survivors) {
+          try { rmSync(join(quarantineDest, rel), { recursive: true, force: true }); } catch { /* best-effort */ }
+        }
       }
+      const dirty = violations.find((v) => v.kind === 'dirty_files');
+      const destroyedCount = (untrackedCount - survivors.size) + trackedDirtyCount;
+      if (dirty) {
+        if (destroyedCount <= 0) {
+          violations.splice(violations.indexOf(dirty), 1);   // nothing was destroyed
+          if (quarantineDest) {
+            try { rmSync(quarantineDest, { recursive: true, force: true }); } catch { /* best-effort */ }
+          }
+        } else {
+          // Report what was actually destroyed, not the whole scan: counting
+          // survivors as losses overstates the damage and erodes trust in the
+          // number when it matters.
+          dirty.detail =
+            `${destroyedCount} uncommitted change(s) destroyed in a machine-managed mirror ` +
+            `(${survivors.size} further path(s) could not be removed — see the unremovable violation)`;
+        }
+      }
+      violations.push({
+        kind: 'unremovable',
+        detail:
+          `${survivors.size} untracked path(s) could not be removed by \`git clean -fd\` ` +
+          `(a nested git repository, or a path the process cannot write` +
+          `${cleanFailure ? `; git reported: ${cleanFailure.split('\n')[0].slice(0, 200)}` : ''}): ` +
+          `${[...survivors].slice(0, 5).join(', ')}${survivors.size > 5 ? ', …' : ''}. ` +
+          `They were NOT destroyed and were NOT quarantined; the mirror converges ` +
+          `regardless, but will keep reporting this until a human removes them.`,
+        preservedAt: '(still in the working tree — nothing was lost)',
+      });
+    } else if (cleanFailure) {
+      // Clean failed but left nothing untracked behind — report it rather than
+      // swallowing a non-zero exit entirely.
+      violations.push({
+        kind: 'unremovable',
+        detail: `git clean reported a failure but left no untracked paths: ${cleanFailure.split('\n')[0].slice(0, 200)}`,
+        preservedAt: '(nothing left in the working tree)',
+      });
     }
-    violations.push({
-      kind: 'unremovable',
-      detail:
-        `${survivors.size} untracked path(s) could not be removed by \`git clean -fd\` ` +
-        `(a nested git repository, or a path the process cannot write): ` +
-        `${[...survivors].slice(0, 5).join(', ')}${survivors.size > 5 ? ', …' : ''}. ` +
-        `They were NOT destroyed and were NOT quarantined; the mirror will keep ` +
-        `reporting this until a human removes them.`,
-      preservedAt: '(still in the working tree — nothing was lost)',
-    });
-  }
 
-  try {
     run(['reset', '--hard', `origin/${branch}`], timeoutMs);
+    return finish();
   } catch (e) {
     throw new MirrorConvergeError(
-      `mirror reset failed in ${repoPath} AFTER clean removed untracked files` +
+      `mirror convergence failed in ${repoPath} after clean removed untracked files` +
         (violations.some((v) => v.kind === 'dirty_files')
           ? ` (quarantined at ${violations.find((v) => v.kind === 'dirty_files')!.preservedAt})`
           : '') +
@@ -826,6 +870,4 @@ export function convergeMirror(
       e,
     );
   }
-
-  return { before, after: run(['rev-parse', 'HEAD'], 10_000), branch, violations };
 }

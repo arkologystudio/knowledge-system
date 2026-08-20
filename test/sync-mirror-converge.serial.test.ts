@@ -182,6 +182,31 @@ describe('sync on a machine-managed source', () => {
   });
 });
 
+describe('the declared-checkout comparison', () => {
+  test('a symlinked --repo still converges (realpath, not string compare)', async () => {
+    // A string compare would read a symlinked or trailing-slash path as "not the
+    // declared checkout" and SILENTLY drop back to --ff-only — which cannot
+    // recover a diverged clone. Silent reversion to the original bug is worse
+    // than the bug.
+    await engine.setConfig(MANAGED_SOURCES_KEY, 'default');
+    const link = path.join(root, 'mirror-link');
+    fs.symlinkSync(mirror, link);
+
+    // Diverge the mirror so --ff-only would definitely fail.
+    fs.writeFileSync(path.join(mirror, 'wiki/stray.md'), page('Stray', 'local'));
+    git(mirror, ['add', '.']);
+    git(mirror, ['commit', '-m', 'stray']);
+    upstream('via-link', 'v');
+
+    const res: any = await performSync(engine, { repoPath: link, sourceId: 'default', noEmbed: true } as any);
+
+    // It converged through the symlink rather than silently falling back.
+    expect(git(mirror, ['rev-parse', 'HEAD'])).toBe(git(remote, ['rev-parse', 'refs/heads/main']));
+    const warnings = res.warnings ?? [];
+    expect(warnings.some((w: any) => /declared machine-managed, but this run targets/.test(w.message))).toBe(false);
+  });
+});
+
 describe('an undeclared checkout is never converged', () => {
   test('--repo pointing at a DIFFERENT tree is not reset, even when the source is managed', async () => {
     // Being declared managed is necessary but not sufficient: the tree about to

@@ -1714,6 +1714,23 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       serr(`Warning: ${detail}`);
       syncWarnings.push({ code: 'pull_failed', message: detail });
     } else {
+      // Resolve writer mode OUTSIDE the pull try. Inside it, a transient database
+      // error while reading `writer.managed_sources` was caught by the pull
+      // handler — so `pullRepo` never ran and the whole sync proceeded against an
+      // unrefreshed clone under a `pull_failed` warning. A DB hiccup could not
+      // affect the pull before this feature existed; it must not now.
+      let isManaged = false;
+      let declaredPath: string | null = null;
+      let writerLookupFailed = false;
+      const writerSourceId = opts.sourceId ?? 'default';
+      try {
+        const { isManagedSource, resolveSourceRepoPath } = await import('../core/writer-mode.ts');
+        isManaged = await isManagedSource(engine, writerSourceId);
+        declaredPath = await resolveSourceRepoPath(engine, writerSourceId);
+      } catch {
+        writerLookupFailed = true;              // fall back to the ordinary pull
+      }
+
       try {
         // A machine-managed mirror CONVERGES rather than pulls. `--ff-only`
         // protects local commits, which is right for a checkout a human works in
@@ -1722,8 +1739,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // Fetch + reset makes divergence impossible instead of merely detected.
         // Anything that should not exist is preserved first and reported as a
         // violation, never silently destroyed.
-        const { isManagedSource, resolveSourceRepoPath } = await import('../core/writer-mode.ts');
-        const writerSourceId = opts.sourceId ?? 'default';
         // Being declared managed is necessary but NOT sufficient: the tree about
         // to be reset must actually BE that source's checkout. `repoPath` comes
         // from `opts.repoPath` (the `--repo` flag, and the `repo` argument of the
@@ -1733,7 +1748,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // That path previously ran `pull --ff-only`, which is non-destructive —
         // so converging without the check turns a safe override into a
         // destructive one.
-        const declaredPath = await resolveSourceRepoPath(engine, writerSourceId);
         // realpath, not string compare: a symlinked path (/var vs /private/var on
         // macOS) or a trailing slash would otherwise read as "not the declared
         // checkout" and silently drop back to `--ff-only` — which is the wedging
@@ -1746,9 +1760,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             return resolvePath(a) === resolvePath(b);
           }
         };
-        const isManaged = await isManagedSource(engine, writerSourceId);
         const isDeclaredCheckout = !!declaredPath && samePath(declaredPath, repoPath);
         const managed = isManaged && isDeclaredCheckout;
+        if (writerLookupFailed) {
+          const detail =
+            `could not read the writer-mode configuration for source '${writerSourceId}'; ` +
+            `fell back to --ff-only, which cannot recover a diverged clone. ` +
+            `If this source is machine-managed, convergence did NOT run this tick.`;
+          serr(`Warning: ${detail}`);
+          syncWarnings.push({ code: 'mirror_violation', message: detail });
+        }
         if (isManaged && !isDeclaredCheckout) {
           // Declared managed but pointed somewhere else. Refusing to converge is
           // correct, but doing it silently would hide a wedging mirror behind a

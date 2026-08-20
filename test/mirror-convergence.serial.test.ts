@@ -289,6 +289,73 @@ describe('convergeMirror', () => {
     expect(after).toBe(before);
   });
 
+  test('an UNWRITABLE untracked path does not stop the mirror converging', async () => {
+    // `git clean -fd` EXITS 1 when it cannot unlink something (unwritable dir,
+    // EBUSY mount, NFS silly-rename). Treating that as fatal meant reset never
+    // ran and the mirror never converged — permanently stale, recoverable only by
+    // hand: the original wedging bug in a new costume. The confusing sibling is a
+    // nested git repo, which clean REFUSES but exits 0, so that case always
+    // worked. Both must converge.
+    const locked = path.join(mirror, 'locked');
+    fs.mkdirSync(locked, { recursive: true });
+    fs.writeFileSync(path.join(locked, 'stuck.md'), 'cannot be removed\n');
+    fs.chmodSync(locked, 0o500);
+    const head = upstreamCommit('progress.md');
+
+    let res;
+    try {
+      res = convergeMirror(mirror, { quarantineRoot: quarantine });
+    } finally {
+      fs.chmodSync(locked, 0o700);
+    }
+
+    // The mirror CONVERGED despite the un-cleanable path.
+    expect(res!.after).toBe(head);
+    expect(fs.existsSync(path.join(mirror, 'progress.md'))).toBe(true);
+    // …and said so, once, without claiming it was quarantined.
+    const stuck = res!.violations.find((v) => v.kind === 'unremovable');
+    expect(stuck).toBeDefined();
+    expect(stuck!.detail).toMatch(/locked/);
+    expect(fs.existsSync(path.join(locked, 'stuck.md'))).toBe(true);
+  });
+
+  test('dirty_files reports what was DESTROYED, not the whole scan', async () => {
+    // Counting survivors as losses overstates the damage and erodes trust in the
+    // number at the moment it matters.
+    const nested = path.join(mirror, 'nested');
+    fs.mkdirSync(nested, { recursive: true });
+    execFileSync('git', ['init', '-q', nested], { stdio: 'ignore' });
+    fs.writeFileSync(path.join(mirror, 'gone-a.md'), 'a\n');
+    fs.writeFileSync(path.join(mirror, 'gone-b.md'), 'b\n');
+    upstreamCommit('other8.md');
+
+    const res = convergeMirror(mirror, { quarantineRoot: quarantine });
+    const dirty = res.violations.find((v) => v.kind === 'dirty_files')!;
+    expect(dirty.detail).toMatch(/^2 uncommitted change\(s\) destroyed/);
+    expect(res.violations.find((v) => v.kind === 'unremovable')).toBeDefined();
+  });
+
+  test('with no quarantine root, survivor cleanup never touches the process CWD', async () => {
+    // `join('', rel)` is a RELATIVE path; rmSync would then delete from cwd,
+    // outside the repo entirely.
+    const decoy = path.join(root, 'cwd-decoy');
+    fs.mkdirSync(path.join(decoy, 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(decoy, 'nested/PRECIOUS_CWD.txt'), 'do not delete\n');
+    const nested = path.join(mirror, 'nested');
+    fs.mkdirSync(nested, { recursive: true });
+    execFileSync('git', ['init', '-q', nested], { stdio: 'ignore' });
+    upstreamCommit('other9.md');
+
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(decoy);
+      convergeMirror(mirror, { quarantineRoot: '' });
+    } finally {
+      process.chdir(prevCwd);
+    }
+    expect(fs.existsSync(path.join(decoy, 'nested/PRECIOUS_CWD.txt'))).toBe(true);
+  });
+
   test('a reset that fails after clean still reports where the files went', async () => {
     // clean is destructive and reset is the step most likely to throw. A bare
     // throw would delete files and take the record of their quarantine with it,
