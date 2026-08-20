@@ -250,48 +250,55 @@ same lock.
 This only excludes *gbrain* processes. A human running `git pull` in the
 checkout is not serialised by it.
 
-## Never run `gbrain self-upgrade` on this host — and it is NOT enforced
+## `gbrain self-upgrade` on this host is refused by the binary
 
 This deployment runs the **fork** (`arkologystudio/knowledge-system`), but the
-upgrade machinery fetches releases from **upstream**:
-`https://api.github.com/repos/garrytan/gbrain/releases/latest`, hardcoded at
-`src/core/binary-self-update.ts:85` with no env or config override (same in
-`check-update.ts`, `upgrade.ts`). Upgrading would silently replace the fork with
-upstream and revert every fork patch.
+upgrade machinery installs releases from **upstream**:
+`https://api.github.com/repos/garrytan/gbrain/releases/latest`. Upgrading would
+replace the fork with a different project and revert every fork patch.
 
-**What is disabled, and what is not.** `resolveSelfUpgradeMode`
-(`src/core/self-upgrade.ts`) has exactly two *enforcing* callers — the
-invocation-riding nag (`src/cli.ts`) and the autopilot channel
-(`src/commands/autopilot.ts`); `doctor.ts` reads it to report, not to gate. Both
-are off on this host:
+**Since v0.43.0.20 this is enforced in the binary, not by configuration.**
+`src/core/distribution.ts` carries the build's own identity as a compile-time
+constant; when it disagrees with the upgrade target, foreign releases are
+refused:
+
+```bash
+gbrain upgrade          # exits 1: "Refusing to run `gbrain upgrade`: this is a fork."
+gbrain self-upgrade     # exits 1, same refusal (--force does NOT bypass it)
+gbrain check-update     # exits 0, reports fork status instead of an upstream version
+```
+
+The refusal cannot be lifted by a config edit, a regenerated `config.json`, a
+typo'd env var, or a fresh install — there is deliberately no override. To move
+this host forward, deploy from the fork's own repository (see "Deploying"
+above). If you ever genuinely want upstream gbrain, install it separately rather
+than having this build replace itself.
+
+### Why config alone was not enough (v0.43.0.19 → v0.43.0.20)
+
+The first mitigation set `self_upgrade.mode=off`. A review found that
+`resolveSelfUpgradeMode` has only two enforcing callers — the invocation-riding
+nag (`src/cli.ts`) and the autopilot channel (`src/commands/autopilot.ts`);
+`doctor.ts` reads it to report, not to gate. **`gbrain self-upgrade`, `gbrain
+upgrade` and `gbrain check-update` never consulted it**, so the command the
+runbook forbade still worked. Configuration was not on the dangerous path.
+
+Both config settings remain in place on this host — they still suppress the nag
+and the autopilot lane, which is worth keeping — but they are no longer what
+protects you:
 
 - `/root/.gbrain/config.json` → `"self_upgrade": { "mode": "off" }`
-- `/etc/gbrain/gbrain.env` → `GBRAIN_SELF_UPGRADE_MODE=off` (env wins over
-  config, and covers the systemd units if the config file is regenerated)
+- `/etc/gbrain/gbrain.env` → `GBRAIN_SELF_UPGRADE_MODE=off`
 
-**The manual commands are NOT gated by either setting.**
-`src/commands/self-upgrade.ts` never calls `resolveSelfUpgradeMode` — it goes
-straight to `fetchLatestRelease()` → `runUpgrade()`, and `--force` skips even
-the "am I actually behind" check. `gbrain upgrade` and `gbrain check-update` are
-ungated too. So typing the command in this heading still fetches upstream and
-installs it. **Treat this as a human rule, not an enforced one.** A real block
-lands with Phase 1 of `docs/designs/git-canonical-writes.md`.
-
-Two related traps:
+Two traps worth knowing if you touch them:
 
 - `gbrain config set self_upgrade.mode off` — which the product itself suggests
-  (`upgrade.ts`, `doctor.ts`) — writes the **DB** plane while the resolver reads
-  the **file** plane. It is a silent no-op. Hand-edit `config.json`, as above.
-- The resolver falls back to the permissive `notify` on any unrecognized value.
-  A typo in `config.json` therefore silently re-enables the nag channel. A
-  typo in the env var alone is safe — an unrecognized env value is discarded
-  and the file plane still answers `off` — so the config file is the one that
-  must be right.
-
-Upgrades happen only via the fork's own deploy path (git pull in
-`/root/knowledge-system`, per "Deploying" above). If the `UPGRADE_AVAILABLE` nag
-ever reappears, a disable has been lost — restore both lines before anything
-else.
+  — writes the **DB** plane while the resolver reads the **file** plane. It is a
+  silent no-op. Hand-edit `config.json`.
+- The resolver falls back to the permissive `notify` on any unrecognized value,
+  so a typo in `config.json` re-enables the nag. A typo in the env var alone is
+  safe: an unrecognized env value is discarded and the file plane still answers
+  `off`.
 
 ## Source `default` is permanently `unmanaged-remote`
 

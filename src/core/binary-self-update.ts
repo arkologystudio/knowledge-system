@@ -27,6 +27,7 @@
 import { chmodSync, closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { isForkBuild, UPSTREAM_LATEST_RELEASE_API } from './distribution.ts';
 
 export interface ReleaseAsset {
   name: string;
@@ -81,8 +82,11 @@ export interface BinarySelfUpdateDeps {
 }
 
 async function defaultFetchRelease(): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
+  // Fork builds resolve no upstream release, so the binary swap has nothing to
+  // install and degrades to a no-op rather than replacing the fork's binary.
+  if (isForkBuild()) return null;
   try {
-    const res = await fetch('https://api.github.com/repos/garrytan/gbrain/releases/latest', {
+    const res = await fetch(UPSTREAM_LATEST_RELEASE_API, {
       headers: { 'User-Agent': 'gbrain-self-upgrade' },
       signal: AbortSignal.timeout(5_000),
     });

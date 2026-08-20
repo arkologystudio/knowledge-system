@@ -2,6 +2,54 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.20] - 2026-08-18
+
+**The runbook said "never run this"; the binary now says it too.** v0.43.0.19
+documented that `gbrain self-upgrade` on this fork would install an UPSTREAM
+release over it and revert every fork-local change, and disabled the two
+channels `self_upgrade.mode` actually gates. A review found the disable
+insufficient in the way that matters: `resolveSelfUpgradeMode` is never consulted
+by `gbrain self-upgrade`, `gbrain upgrade`, or `gbrain check-update`, so the
+forbidden command still worked exactly as before. Configuration could not fix
+this, because configuration is not on the path those commands take.
+
+Build identity is not a setting. `src/core/distribution.ts` declares which repo
+this build is distributed from as a compile-time constant, next to the repo whose
+releases the upgrade machinery installs. When they differ, this is a fork and
+foreign releases are refused — a refusal no config edit, regenerated
+`config.json`, typo'd env var, or fresh install can lift.
+
+On upstream builds the two constants are equal, `isForkBuild()` is false, and
+every guard here is inert. Forks flip one line and inherit the protection.
+
+### Added
+- `src/core/distribution.ts` — `DISTRIBUTION_REPO` / `UPSTREAM_RELEASE_REPO`,
+  `isForkBuild()`, and `assertUpgradeAllowed()`, which throws a refusal naming
+  both projects and the deploy path that IS correct for this build. Deliberately
+  no environment override: an operator who wants upstream gbrain installs it
+  directly rather than having a fork overwrite itself, and an override is how
+  that footgun would come back.
+- `test/distribution-fork-guard.test.ts` — behavioural pins plus structural pins
+  asserting the guard is reachable from, and ordered ahead of, every path that
+  could apply a release. The structural pins exist because the real risk is a
+  NEW apply path landing unguarded, which a behavioural test on today's paths
+  would not catch.
+
+### Fixed
+- `gbrain upgrade` and `gbrain self-upgrade` refuse on a fork build and exit 1.
+  The guard precedes the release fetch, and `--force` does not bypass it —
+  `--force` skips the "am I behind?" check, which is the shape that makes an
+  accidental overwrite easiest.
+- `--swap-only` (the autopilot channel's entry into `runUpgrade`) is guarded by
+  the same call, so the silent lane cannot do what the interactive one refuses.
+- `gbrain check-update` and `gbrain self-upgrade --check-only` stay passive:
+  they report fork status and exit 0 rather than throwing, and carry
+  `error: "fork_build"` plus both repo names in `--json`. A thrown error on a
+  polled, read-only command reads as a broken install rather than a policy.
+- The upstream release URL is defined once (`UPSTREAM_LATEST_RELEASE_API`)
+  instead of being hardcoded at each fetch site, so the upgrade target cannot
+  drift between callers.
+
 ## [0.43.0.19] - 2026-08-18
 
 **Three weeks of staleness behind a green guard.** The ingest checkpoint wedged
