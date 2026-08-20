@@ -15,14 +15,24 @@ stayed failed until a person intervened a day later, while `get_health` read
 clean the whole time. Divergence was a permanently wedging condition that only a
 human could clear.
 
-Fetch + reset makes divergence **impossible rather than merely detected**: there
-is now no state that clone can reach from which it cannot recover unattended.
+Fetch + reset makes divergence **impossible rather than merely detected**: a
+diverged, dirty, or locally-committed mirror now recovers on the next tick without
+a human. Two states still need one — a detached HEAD, and an untracked path
+`git clean -fd` refuses to remove (a nested git repository, or one the process
+cannot write). Both are refused or reported rather than wedging silently, but
+neither self-heals, and the design doc says so too.
 
-**Nothing is discarded silently.** Before the reset, local-only commits are saved
-to a `refs/gbrain/rescue/<sha>` ref and uncommitted work is copied to a timestamped
-quarantine directory; both are reported as `mirror_violation` sync warnings naming
-where the evidence went. A reset that quietly ate a colleague's work would trade
-one incident class for a worse one.
+**Nothing tracked or untracked is discarded silently.** Before the reset,
+local-only commits are saved to a `refs/gbrain/rescue/<sha>` ref and uncommitted
+work is copied to a timestamped quarantine directory; both are reported as
+`mirror_violation` sync warnings naming where the evidence went, and the report
+survives a convergence that fails part way through. A reset that quietly ate a
+colleague's work would trade one incident class for a worse one.
+
+One gap remains, disclosed rather than fixed: **ignored files** (`.gitignore`d,
+and so absent from both `status -uall` and `clean -fd`) are overwritten by
+`reset --hard` without passing through the scan, so they are neither quarantined
+nor reported. Tracked with Phase 1b.
 
 Only sources declared in `writer.managed_sources` converge. Everything else keeps
 pulling exactly as before.
@@ -77,10 +87,28 @@ pulling exactly as before.
   without the scan ever seeing it — unpreserved, unreported, and reachable by an
   ordinary upstream `.gitignore` edit. Cleaning first bounds the deletion to
   exactly the state that was measured.
+- **An undeclared checkout is never converged.** Being declared in
+  `writer.managed_sources` is necessary but not sufficient — the tree about to be
+  reset must actually BE that source's checkout. `gbrain sync --repo <path>` and
+  the `sync_brain` MCP op (which passes no source id at all) can point anywhere,
+  and that path previously ran the non-destructive `pull --ff-only`; converging
+  without the comparison would have turned a safe override flag into a destructive
+  one.
+- **A convergence that fails part way through still reports what it removed.**
+  `clean` is destructive and `reset` is the step most likely to throw; a bare
+  throw deleted files and took the record of their quarantine with it, leaving a
+  generic "pull failed". Failures now carry their violations.
+- **An un-cleanable path is reported once, not re-quarantined forever.**
+  `git clean -fd` refuses to delete a nested git repository, so it survives —
+  meaning it was never destroyed and must not be claimed as quarantined. On a
+  5-minute timer the old behaviour produced a fresh quarantine tree and a fresh
+  violation every tick, which is the alert-fatigue shape this design exists to
+  avoid. Such paths now report as `unremovable` and their copies are dropped.
 - **`sync --dry-run` never converges.** `pull --ff-only` was harmless to run during
   a preview; `convergeMirror` force-moves HEAD and deletes uncommitted files. A
-  dry run on a managed source now skips convergence and says why, rather than
-  being the thing that destroys the tree.
+  dry run on a managed source now skips convergence and says why, under its own
+  `dry_run_skipped_converge` warning code rather than borrowing `pull_failed` —
+  nothing failed.
 
 ## [0.43.0.21] - 2026-08-20
 

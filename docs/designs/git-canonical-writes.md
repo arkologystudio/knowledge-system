@@ -16,7 +16,8 @@ This design makes the invariant **structural**: after it lands, there is *no rea
 - ✅ No `put_page` write leaves the DB ahead of git on a managed source, and no write-through path leaves an *uncommitted file* in a managed tree (the refusal is central and fails closed).
 - ⚠️ `gbrain rid backfill` writes RID stamps directly via `writeBrainPage`, bypassing write-through entirely. It leaves a dropping that the next converge quarantines and reverts — so the stamps do not stick on a managed source. Tracked with Phase 2b.
 - ⚠️ Two paths are still DB-only on a managed source: `submit_ingest` and sandbox subagents (Phase 2b). They cannot wedge a mirror, but they are not anchored.
-- ⚠️ The mirror recovers unattended from divergence, dirt, and local commits — but **not** from a detached HEAD or a missing `origin/<branch>`, both of which still require a human. Those are refusals rather than wedges, but the "no state" claim is not yet literal.
+- ⚠️ The mirror recovers unattended from divergence, dirt, and local commits — but **not** from a detached HEAD, a missing `origin/<branch>`, or an untracked path `git clean -fd` refuses to remove (a nested git repository, or one the process cannot write). All three are refused or reported rather than wedging silently, but none self-heals, so the "no state" claim is not yet literal.
+- ⚠️ **Ignored files are outside the preserve/report machinery.** `.gitignore`d paths appear in neither `status -uall` nor `clean -fd`, so when an upstream commit starts tracking a path a mirror currently ignores, `reset --hard` overwrites the local content unscanned, unquarantined and unreported. Phase 1b.
 
 ## 1. Root-cause taxonomy (why prose failed)
 

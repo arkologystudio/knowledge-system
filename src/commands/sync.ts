@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { join, relative } from 'path';
+import { join, relative, resolve as resolvePath } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { importFile } from '../core/import-file.ts';
@@ -250,7 +250,7 @@ export interface SyncResult {
 
 export interface SyncWarning {
   /** Machine-stable discriminator. Additive only. */
-  code: 'pull_failed' | 'noop_without_remote_contact' | 'mirror_violation';
+  code: 'pull_failed' | 'noop_without_remote_contact' | 'mirror_violation' | 'dry_run_skipped_converge';
   message: string;
 }
 
@@ -1721,8 +1721,20 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // Fetch + reset makes divergence impossible instead of merely detected.
         // Anything that should not exist is preserved first and reported as a
         // violation, never silently destroyed.
-        const { isManagedSource } = await import('../core/writer-mode.ts');
-        const managed = await isManagedSource(engine, opts.sourceId ?? 'default');
+        const { isManagedSource, resolveSourceRepoPath } = await import('../core/writer-mode.ts');
+        const writerSourceId = opts.sourceId ?? 'default';
+        // Being declared managed is necessary but NOT sufficient: the tree about
+        // to be reset must actually BE that source's checkout. `repoPath` comes
+        // from `opts.repoPath` (the `--repo` flag, and the `repo` argument of the
+        // `sync_brain` MCP op, which passes no sourceId at all), so without this
+        // comparison `gbrain sync --repo /any/checkout` would `clean -fd` +
+        // `reset --hard` an operator-supplied directory that was never declared.
+        // That path previously ran `pull --ff-only`, which is non-destructive —
+        // so converging without the check turns a safe override into a
+        // destructive one.
+        const declaredPath = await resolveSourceRepoPath(engine, writerSourceId);
+        const isDeclaredCheckout = !!declaredPath && resolvePath(declaredPath) === resolvePath(repoPath);
+        const managed = (await isManagedSource(engine, writerSourceId)) && isDeclaredCheckout;
         // NEVER converge under --dry-run. `pullRepo --ff-only` was harmless to run
         // during a preview; `convergeMirror` force-moves HEAD and deletes
         // uncommitted files. A command whose entire contract is "show me what
@@ -1731,7 +1743,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           const { convergeMirror } = await import('../core/git-remote.ts');
           const { gbrainPath } = await import('../core/config.ts');
           const converged = convergeMirror(repoPath, {
-            quarantineRoot: gbrainPath('quarantine', opts.sourceId ?? 'default'),
+            quarantineRoot: gbrainPath('quarantine', writerSourceId),
           });
           remoteContacted = true;
           for (const v of converged.violations) {
@@ -1745,7 +1757,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             `--dry-run on machine-managed source '${opts.sourceId ?? 'default'}': skipped mirror convergence ` +
             `(it would reset the working tree). This preview reflects LOCAL clone state, not upstream.`;
           serr(`Warning: ${detail}`);
-          syncWarnings.push({ code: 'pull_failed', message: detail });
+          syncWarnings.push({ code: 'dry_run_skipped_converge', message: detail });
         } else {
           const { pullRepo } = await import('../core/git-remote.ts');
           // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,

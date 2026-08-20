@@ -182,6 +182,34 @@ describe('sync on a machine-managed source', () => {
   });
 });
 
+describe('an undeclared checkout is never converged', () => {
+  test('--repo pointing at a DIFFERENT tree is not reset, even when the source is managed', async () => {
+    // Being declared managed is necessary but not sufficient: the tree about to
+    // be reset must actually BE that source's checkout. `--repo` (and the
+    // `sync_brain` MCP op, which passes no sourceId at all) can point anywhere,
+    // and that path used to run the non-destructive `pull --ff-only`.
+    await engine.setConfig(MANAGED_SOURCES_KEY, 'default');
+
+    const other = path.join(root, 'someone-elses-checkout');
+    execFileSync('git', ['clone', remote, other], { stdio: 'ignore' });
+    git(other, ['config', 'user.name', 'GBrain Test']);
+    git(other, ['config', 'user.email', 'gbrain-test@example.invalid']);
+    fs.writeFileSync(path.join(other, 'wiki/precious.md'), page('Precious', 'uncommitted work'));
+    git(other, ['add', '.']);
+    git(other, ['commit', '-m', 'their local work']);
+    const theirHead = git(other, ['rev-parse', 'HEAD']);
+    fs.writeFileSync(path.join(other, 'wiki/scratch.md'), page('Scratch', 'in progress'));
+    upstream('moved-on', 'm');
+
+    await performSync(engine, { repoPath: other, sourceId: 'default', noEmbed: true } as any);
+
+    // Their commit and their uncommitted file both survive.
+    expect(git(other, ['rev-parse', 'HEAD'])).toBe(theirHead);
+    expect(fs.existsSync(path.join(other, 'wiki/scratch.md'))).toBe(true);
+    expect(fs.existsSync(path.join(other, 'wiki/precious.md'))).toBe(true);
+  });
+});
+
 describe('sync on an UNMANAGED source is untouched', () => {
   test('still pulls, and a divergent clone still fails rather than being reset', async () => {
     // Declaring nothing must change nothing — including keeping the old failure

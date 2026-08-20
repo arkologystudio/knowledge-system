@@ -15,7 +15,7 @@
  * stderr warning at use site is the operator's signal.
  */
 import { execFileSync } from 'child_process';
-import { lstatSync, existsSync, readdirSync, mkdirSync, copyFileSync, symlinkSync, readlinkSync } from 'fs';
+import { lstatSync, existsSync, readdirSync, mkdirSync, copyFileSync, symlinkSync, readlinkSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { isInternalUrl } from './url-safety.ts';
 
@@ -551,10 +551,27 @@ export function pushProbe(
  * `--ff-only`) made the same evidence indistinguishable from a network problem.
  */
 export interface MirrorViolation {
-  kind: 'local_commits' | 'dirty_files';
+  kind: 'local_commits' | 'dirty_files' | 'unremovable';
   detail: string;
   /** Where the evidence was preserved: a git ref, or a quarantine directory. */
   preservedAt: string;
+}
+
+/**
+ * Raised when convergence fails PART WAY THROUGH. It carries the violations
+ * gathered before the failure, because the destructive step (`clean`) runs before
+ * the step most likely to throw (`reset`) — so a bare throw would delete files
+ * and take the only record of where they were preserved down with it.
+ */
+export class MirrorConvergeError extends Error {
+  constructor(
+    message: string,
+    public violations: MirrorViolation[],
+    public cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'MirrorConvergeError';
+  }
 }
 
 export interface MirrorConvergeResult {
@@ -589,6 +606,38 @@ export interface MirrorConvergeResult {
  * and reported in `violations`. A reset that quietly destroyed a colleague's work
  * would trade one incident class for a worse one.
  */
+/**
+ * Parse `git status --porcelain -z -uall` into records.
+ *
+ * `-z` and `-uall` are both load-bearing. Without `-uall` an untracked DIRECTORY
+ * collapses to one `dir/` entry that cannot be copied but IS deleted by
+ * `clean -fd`. Without `-z` git quotes and C-escapes any path containing
+ * non-ASCII, a quote, a backslash or a tab, so the path never resolves and the
+ * file is skipped — then destroyed. `-z` emits raw bytes with NUL terminators and
+ * no quoting, which removes the parsing problem rather than out-guessing it.
+ *
+ * Record grammar: `XY <path>\0`, with renames/copies emitting an EXTRA
+ * `\0<origin>` field that must be consumed or every later entry shifts by one.
+ */
+function scanStatus(repoPath: string): { xy: string; path: string }[] {
+  const raw = execFileSync('git', ['-C', repoPath, 'status', '--porcelain', '-z', '-uall'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
+    env: { ...process.env, ...GIT_ENV },
+  });
+  const entries: { xy: string; path: string }[] = [];
+  const fields = raw.split('\0');
+  for (let i = 0; i < fields.length; i++) {
+    const f = fields[i];
+    if (!f) continue;
+    const xy = f.slice(0, 2);
+    const p = f.slice(3);
+    if (!p) continue;
+    entries.push({ xy, path: p });
+    if (xy[0] === 'R' || xy[0] === 'C') i++;   // skip the origin-path field
+  }
+  return entries;
+}
+
 export function convergeMirror(
   repoPath: string,
   opts: { branch?: string; quarantineRoot: string; timeoutMs?: number } = { quarantineRoot: '' },
@@ -650,45 +699,14 @@ export function convergeMirror(
   }
 
   // 2. Dirty / untracked files → quarantine directory.
-  //
-  // `-z -uall` is load-bearing, not a style choice. Two ways the naive read lost
-  // exactly the files this quarantine exists to save, both fixed here:
-  //
-  //   * WITHOUT `-uall`, git collapses an untracked DIRECTORY to a single `dir/`
-  //     entry. Copying that entry fails (it is not a file), while `clean -fd`
-  //     happily deletes the whole tree — so a brand-new slug namespace (the most
-  //     likely shape for an unanchored write) vanished entirely.
-  //   * WITHOUT `-z`, git QUOTES and C-escapes any path with non-ASCII, a quote,
-  //     a backslash, a tab or a newline (`"caf\303\251.md"`). Stripping the outer
-  //     quotes is not enough — the escapes remain, the path does not resolve, the
-  //     file is skipped, and the reset destroys it. `-z` emits raw bytes with NUL
-  //     terminators and no quoting at all, which removes the parsing problem
-  //     rather than trying to out-guess it.
-  //
-  // A path that merely contains a SPACE survives naive parsing by luck, which is
-  // precisely why a test suite built on ordinary filenames reported success.
-  const dirtyRaw = execFileSync('git', ['-C', repoPath, 'status', '--porcelain', '-z', '-uall'], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
-    env: { ...process.env, ...GIT_ENV },
-  });
+  const entries = scanStatus(repoPath);
+  const untrackedCount = entries.filter((e) => e.xy === '??').length;
+  const trackedDirtyCount = entries.length - untrackedCount;
+  const quarantineDest = opts.quarantineRoot
+    ? join(opts.quarantineRoot, `${stamp}-${process.pid}`)
+    : '';
 
-  // -z record grammar: `XY <path>\0`, and for renames/copies an EXTRA `\0<origin>`
-  // field follows. Consume that origin field so it is never mistaken for a status
-  // record — misreading it would shift every subsequent entry by one.
-  const entries: { xy: string; path: string }[] = [];
-  const fields = dirtyRaw.split('\0');
-  for (let i = 0; i < fields.length; i++) {
-    const f = fields[i];
-    if (!f) continue;
-    const xy = f.slice(0, 2);
-    const path0 = f.slice(3);
-    if (!path0) continue;
-    entries.push({ xy, path: path0 });
-    if (xy[0] === 'R' || xy[0] === 'C') i++;   // skip the origin-path field
-  }
-
-  if (entries.length > 0 && opts.quarantineRoot) {
-    const dest = join(opts.quarantineRoot, `${stamp}-${process.pid}`);
+  if (entries.length > 0 && quarantineDest) {
     let moved = 0;
     let failed = 0;
     const preserve = (rel: string): void => {
@@ -699,12 +717,9 @@ export function convergeMirror(
       } catch {
         return;                                  // deleted entries have nothing to save
       }
-      const target = join(dest, rel);
+      const target = join(quarantineDest, rel);
       try {
         if (st.isDirectory()) {
-          // Belt and braces: with `-uall` git already lists directory CONTENTS, so
-          // this should not trigger — but a directory entry reaching the reset
-          // unpreserved is the failure that motivated this whole rewrite.
           mkdirSync(target, { recursive: true });
           for (const child of readdirSync(src)) preserve(join(rel, child));
           return;
@@ -726,7 +741,7 @@ export function convergeMirror(
     violations.push({
       kind: 'dirty_files',
       detail: `${entries.length} uncommitted change(s) in a machine-managed mirror (${moved} preserved${failed > 0 ? `, ${failed} FAILED to preserve` : ''})`,
-      preservedAt: dest,
+      preservedAt: quarantineDest,
     });
   } else if (entries.length > 0) {
     // No quarantine root configured. Still report it — destroying files AND
@@ -751,8 +766,66 @@ export function convergeMirror(
   //
   // Cleaning first bounds `clean` to exactly the working-tree state the scan
   // measured, so "what was quarantined" and "what was deleted" are the same set.
-  run(['clean', '-fd'], timeoutMs);
-  run(['reset', '--hard', `origin/${branch}`], timeoutMs);
+  //
+  // The failure path matters as much as the happy one: `clean` is destructive and
+  // `reset` is the step most likely to throw (a read-only directory in the
+  // incoming tree is enough). A bare throw would delete files and take the record
+  // of where they went down with it, leaving the operator with a generic "pull
+  // failed" and no idea anything was removed.
+  try {
+    run(['clean', '-fd'], timeoutMs);
+  } catch (e) {
+    throw new MirrorConvergeError(
+      `mirror clean failed in ${repoPath}: ${(e as Error).message}`, violations, e,
+    );
+  }
+
+  // Anything `clean -fd` could NOT remove was therefore never destroyed — a
+  // nested git repo (clean refuses without -ff) or an unwritable directory. Those
+  // must not be reported as quarantined-and-deleted, and their copies must not
+  // accumulate: on a 5-minute timer an un-cleanable directory would otherwise
+  // produce a fresh quarantine tree and a fresh violation forever, which is the
+  // alert-fatigue shape this design exists to avoid.
+  const survivors = new Set(
+    scanStatus(repoPath).filter((e) => e.xy === '??').map((e) => e.path),
+  );
+  if (survivors.size > 0) {
+    for (const rel of survivors) {
+      try { rmSync(join(quarantineDest, rel), { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    const dirty = violations.find((v) => v.kind === 'dirty_files');
+    if (dirty) {
+      const remaining = untrackedCount - survivors.size;
+      if (remaining <= 0 && trackedDirtyCount === 0) {
+        violations.splice(violations.indexOf(dirty), 1);   // nothing was destroyed
+        try { rmSync(quarantineDest, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+    }
+    violations.push({
+      kind: 'unremovable',
+      detail:
+        `${survivors.size} untracked path(s) could not be removed by \`git clean -fd\` ` +
+        `(a nested git repository, or a path the process cannot write): ` +
+        `${[...survivors].slice(0, 5).join(', ')}${survivors.size > 5 ? ', …' : ''}. ` +
+        `They were NOT destroyed and were NOT quarantined; the mirror will keep ` +
+        `reporting this until a human removes them.`,
+      preservedAt: '(still in the working tree — nothing was lost)',
+    });
+  }
+
+  try {
+    run(['reset', '--hard', `origin/${branch}`], timeoutMs);
+  } catch (e) {
+    throw new MirrorConvergeError(
+      `mirror reset failed in ${repoPath} AFTER clean removed untracked files` +
+        (violations.some((v) => v.kind === 'dirty_files')
+          ? ` (quarantined at ${violations.find((v) => v.kind === 'dirty_files')!.preservedAt})`
+          : '') +
+        `: ${(e as Error).message}`,
+      violations,
+      e,
+    );
+  }
 
   return { before, after: run(['rev-parse', 'HEAD'], 10_000), branch, violations };
 }

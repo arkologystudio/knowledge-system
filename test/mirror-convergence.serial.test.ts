@@ -263,6 +263,67 @@ describe('convergeMirror', () => {
     expect(fs.existsSync(path.join(mirror, 'local-work.md'))).toBe(true);
   });
 
+  test('an un-cleanable nested repo is reported ONCE as unremovable, not re-quarantined forever', async () => {
+    // `git clean -fd` refuses to delete a nested git repository, so it survives.
+    // Reporting it as "quarantined" is a lie, and re-copying it every 5 minutes
+    // would grow the quarantine without bound and never clear the alarm.
+    const nested = path.join(mirror, 'nested');
+    fs.mkdirSync(nested, { recursive: true });
+    execFileSync('git', ['init', '-q', nested], { stdio: 'ignore' });
+    fs.writeFileSync(path.join(nested, 'inner.md'), 'inner\n');
+    upstreamCommit('other7.md');
+
+    const first = convergeMirror(mirror, { quarantineRoot: quarantine });
+    const stuck = first.violations.find((v) => v.kind === 'unremovable');
+    expect(stuck).toBeDefined();
+    expect(stuck!.detail).toMatch(/nested/);
+    // Nothing was lost, so nothing should be claimed as quarantined.
+    expect(first.violations.find((v) => v.kind === 'dirty_files')).toBeUndefined();
+    expect(fs.existsSync(path.join(nested, 'inner.md'))).toBe(true);
+
+    // A second run must not accumulate another copy of the same surviving tree.
+    const before = fs.existsSync(quarantine) ? fs.readdirSync(quarantine).length : 0;
+    const second = convergeMirror(mirror, { quarantineRoot: quarantine });
+    const after = fs.existsSync(quarantine) ? fs.readdirSync(quarantine).length : 0;
+    expect(second.violations.find((v) => v.kind === 'unremovable')).toBeDefined();
+    expect(after).toBe(before);
+  });
+
+  test('a reset that fails after clean still reports where the files went', async () => {
+    // clean is destructive and reset is the step most likely to throw. A bare
+    // throw would delete files and take the record of their quarantine with it,
+    // leaving the operator a generic "pull failed" and no idea anything was gone.
+    fs.writeFileSync(path.join(mirror, 'doomed.md'), 'PRECIOUS DATA H\n');
+    // Make the incoming tree impossible to check out: a read-only directory the
+    // reset must write into.
+    fs.mkdirSync(path.join(author, 'locked'), { recursive: true });
+    fs.writeFileSync(path.join(author, 'locked/file.md'), 'x\n');
+    git(author, ['add', '.']);
+    git(author, ['commit', '-m', 'add locked dir']);
+    git(author, ['push', 'origin', 'main']);
+    fs.mkdirSync(path.join(mirror, 'locked'), { recursive: true });
+    // A file inside, so `clean -fd` cannot remove the directory and `reset` is
+    // then forced to write into a read-only one.
+    fs.writeFileSync(path.join(mirror, 'locked/blocker.md'), 'blocks the checkout\n');
+    fs.chmodSync(path.join(mirror, 'locked'), 0o500);
+
+    let err: any;
+    try {
+      convergeMirror(mirror, { quarantineRoot: quarantine });
+    } catch (e) {
+      err = e;
+    } finally {
+      fs.chmodSync(path.join(mirror, 'locked'), 0o700);
+    }
+
+    expect(err).toBeDefined();
+    // The violations survived the throw, so the operator can find the copies.
+    expect(Array.isArray(err.violations)).toBe(true);
+    const v = err.violations.find((x: any) => x.kind === 'dirty_files');
+    expect(v).toBeDefined();
+    expect(fs.readFileSync(path.join(v.preservedAt, 'doomed.md'), 'utf8')).toBe('PRECIOUS DATA H\n');
+  });
+
   test('refuses a detached HEAD rather than guessing a branch', async () => {
     git(mirror, ['checkout', '--detach', 'HEAD']);
     expect(() => convergeMirror(mirror, { quarantineRoot: quarantine })).toThrow(/detached HEAD/);
