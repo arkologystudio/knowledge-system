@@ -886,6 +886,70 @@ const put_page: Operation = {
       // Pack load failed; fall through to legacy inferType behavior.
       activePack = undefined;
     }
+    // ── Git-first gate (v0.43.0.21) ────────────────────────────────────────
+    // On a machine-managed source the repository is the truth, so the page is
+    // committed and PUSHED before the index is allowed to know about it. If the
+    // push fails, this throws and NO DB row is written — the alternative (index
+    // now, reconcile later) is precisely the half-write that let the brain
+    // become a second author on 2026-08-18.
+    //
+    // Ordering is the whole point: git first, index second. It also removes the
+    // frontmatter collision class for free — the committed bytes are the caller's
+    // own content, not the DB's re-serialisation, so provenance stamps
+    // (`ingested_via`, `source_kind`, `ingested_at`) never reach the file and
+    // cannot conflict with a hand-authored version of the same page.
+    const writerSourceId = ctx.sourceId ?? 'default';
+    let gitFirst: { committed: boolean; head_after?: string; path?: string; unchanged?: boolean } | undefined;
+    const isSandboxSubagentEarly = ctx.viaSubagent === true
+      && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
+    let writerMode: import('./writer-mode.ts').WriterResolution | undefined;
+    if (!ctx.dryRun && !isSandboxSubagentEarly) {
+      const { resolveWriterMode } = await import('./writer-mode.ts');
+      writerMode = await resolveWriterMode(ctx.engine, writerSourceId);
+    }
+    if (writerMode?.mode === 'git-first') {
+      const { gitFirstPageWrite, GitPageWriteError } = await import('./git-page-write.ts');
+      const protectedRaw = (await ctx.engine.getConfig('writer.commit_page.protected_slugs')) ?? '';
+      // Same derivation the schema-mutation path uses, so the audit trail reads
+      // consistently across every actor-stamped write.
+      const actor = ctx.auth?.clientId ? `mcp:${ctx.auth.clientId.slice(0, 8)}` : (ctx.remote === false ? 'cli' : 'mcp');
+      try {
+        const res = await gitFirstPageWrite(ctx.engine, {
+          mode: 'apply',
+          selfPin: true,
+          sourceId: writerSourceId,
+          slug,
+          content: p.content as string,
+          commitMessage: `brain(put_page): ${slug}`,
+          actor,
+          protectedSlugs: protectedRaw.split(',').map((x: string) => x.trim()).filter(Boolean),
+        });
+        gitFirst = { committed: true, head_after: res.head_after, path: res.path };
+      } catch (e) {
+        // `nothing_to_commit` means the repository ALREADY holds exactly this
+        // content — the invariant is satisfied, so indexing proceeds. Every
+        // other failure (push rejected, conflict, protected slug, invalid
+        // frontmatter) fails the write.
+        if (e instanceof GitPageWriteError && e.code === 'nothing_to_commit') {
+          gitFirst = { committed: false, unchanged: true };
+        } else {
+          // EVERY other failure fails the write, including ones raised below
+          // git-page-write's own error type (a failed fetch, an unreachable
+          // remote, a broken checkout). Wrapping them all means the caller can
+          // never receive a bare git error it has no way to interpret — and,
+          // more importantly, can never mistake a failed anchor for a success.
+          const code = e instanceof GitPageWriteError && e.code === 'protected_path'
+            ? 'permission_denied'
+            : 'invalid_input';
+          const detail = e instanceof Error ? e.message : String(e);
+          throw new OperationError(
+            code,
+            `git-first write failed for '${slug}' on machine-managed source '${writerSourceId}': ${detail}`,
+          );
+        }
+      }
+    }
+
     const result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
       // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
@@ -952,9 +1016,16 @@ const put_page: Operation = {
     //   - Subagent sandbox (viaSubagent without allowedSlugPrefixes) → DB-only.
     //   - All other writes → write-through.
     let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
-    const isSandboxSubagent = ctx.viaSubagent === true
-      && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
-    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
+    const isSandboxSubagent = isSandboxSubagentEarly;
+    if (writerMode?.mode === 'git-first') {
+      // Nothing to write through: the git-first path already put the canonical
+      // bytes on disk AND in a pushed commit. Running the DB-render write-through
+      // here would overwrite that file with the re-serialised row — reintroducing
+      // the provenance-stamp diff that collided add/add in the incident.
+      writeThrough = { written: false, skipped: 'git_first' };
+    } else if (writerMode?.mode === 'db-only') {
+      writeThrough = { written: false, skipped: 'db_only' };
+    } else if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
       const sourceId = ctx.sourceId ?? 'default';
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
       // Shared canonical write-through (also used by `gbrain brainstorm/lsd
@@ -1147,6 +1218,12 @@ const put_page: Operation = {
       ...(factsQueued ? { facts_backstop: factsQueued } : {}),
       ...(chronicleQueued ? { chronicle_backstop: chronicleQueued } : {}),
       ...(writeThrough ? { write_through: writeThrough } : {}),
+      // Surfaced so an agent can SEE that its write is anchored in git rather
+      // than having to trust that it was. `writer_mode` is included even when
+      // git-first did not apply, so "why did this land DB-only?" is answerable
+      // from the response instead of by reading config on the host.
+      ...(writerMode ? { writer_mode: writerMode.mode, writer_managed: writerMode.managed } : {}),
+      ...(gitFirst ? { git_first: gitFirst } : {}),
     };
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },

@@ -33,6 +33,7 @@ import {
 } from './git-remote.ts';
 import { unifiedDiff } from './skillpack/diff-text.ts';
 import { acquireRepoLock } from './repo-lock.ts';
+import { resolveSourceRepoPath } from './writer-mode.ts';
 
 const MAX_CONTENT_BYTES = 5_000_000;
 const MAX_DIFF_CHARS = 40_000;
@@ -62,6 +63,20 @@ export interface GitPageWriteInput {
   commitMessage?: string;
   actor: string;
   protectedSlugs?: readonly string[];
+  /**
+   * Single-shot write with no preview round-trip (the `put_page` git-first path).
+   *
+   * The expectedHead / expectedContentSha256 pins exist to stop an `apply` that
+   * was previewed against a DIFFERENT repo state from landing — a real hazard for
+   * `commit_page`, where preview and apply are separate MCP calls with an operator
+   * in between. A self-pinned write computes both values microseconds earlier
+   * inside the SAME repo lock, so there is no window for them to go stale and
+   * demanding them would just mean echoing back what we ourselves just read.
+   *
+   * This weakens no invariant that matters: validation, protected slugs, path
+   * confinement, commit and push are all unchanged.
+   */
+  selfPin?: boolean;
 }
 
 export interface GitPageWriteResult {
@@ -171,23 +186,10 @@ function validateContent(slug: string, content: string, protectedSlugs: readonly
 }
 
 async function resolveRepoPath(engine: BrainEngine, sourceId: string): Promise<string> {
-  const rows = await engine.executeRaw<{ local_path: string | null }>(
-    'SELECT local_path FROM sources WHERE id = $1',
-    [sourceId],
-  );
-  const sourcePath = rows[0]?.local_path ?? null;
-  if (sourcePath) return sourcePath;
-
-  const repoPath = await engine.getConfig('sync.repo_path');
+  // Shared with writer-mode.ts so the two can never disagree about which
+  // directory a source's writes belong in; this wrapper only adds the throw.
+  const repoPath = await resolveSourceRepoPath(engine, sourceId);
   if (!repoPath) throw new GitPageWriteError('repo_unavailable', `source '${sourceId}' has no local checkout`);
-
-  const otherSources = await engine.executeRaw<{ id: string }>(
-    'SELECT id FROM sources WHERE id <> $1 AND local_path = $2 LIMIT 1',
-    [sourceId, repoPath],
-  );
-  if (otherSources.length > 0) {
-    throw new GitPageWriteError('repo_unavailable', `configured checkout belongs to another source`);
-  }
   return repoPath;
 }
 
@@ -276,13 +278,13 @@ export async function gitFirstPageWrite(
       };
 
       if (input.mode === 'preview') return base;
-      if (!input.expectedHead || input.expectedHead !== head) {
+      if (!input.selfPin && (!input.expectedHead || input.expectedHead !== head)) {
         throw new GitPageWriteError(
           'stale_preview',
           `previewed HEAD ${input.expectedHead || '<missing>'} does not match current HEAD ${head}`,
         );
       }
-      if (!input.expectedContentSha256 || input.expectedContentSha256 !== base.content_sha256) {
+      if (!input.selfPin && (!input.expectedContentSha256 || input.expectedContentSha256 !== base.content_sha256)) {
         throw new GitPageWriteError(
           'stale_preview',
           `previewed content hash ${input.expectedContentSha256 || '<missing>'} does not match proposed content ${base.content_sha256}`,

@@ -2,6 +2,66 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.21] - 2026-08-20
+
+**`put_page` no longer makes the brain a second author.** On a machine-managed
+source the page is now committed and PUSHED before the index is allowed to know
+about it. If the push cannot land, the write fails and no database row exists —
+because "index now, reconcile later" is exactly the half-write that let a brain
+serve pages git had never seen.
+
+Until now `put_page` had one behaviour for every source: write the row, then drop
+an *uncommitted* `.md` into whatever checkout `sync.repo_path` resolved to. On a
+hand-tended wiki that is right — the working tree is the truth and a human commits
+it. On a machine-managed clone it is a half-write, and it stays one until somebody
+happens to commit the file. Telling agents "call `commit_page` instead" is prose,
+and prose is what failed: a CLAUDE.md actively instructed the losing call.
+
+The discriminator is deliberately NOT "does this source have a git remote" — a
+hand-tended wiki has an origin too. It is **"does a machine pull and reset this
+working tree"**, declared once in `writer.managed_sources`. Given that, `git-first`
+is forced: asking for `local-tree` or `db-only` on a machine-managed source is
+refused, because that combination IS the incident.
+
+**Declaring nothing changes nothing.** Sources you have not declared keep their
+exact present behaviour.
+
+### Added
+- `src/core/writer-mode.ts` — `git-first` / `local-tree` / `db-only`, derived from
+  the `writer.managed_sources` declaration rather than freely chosen. Refuses a
+  weaker mode on a managed source, and refuses a managed source with no checkout
+  instead of silently degrading it (a silent degrade would recreate the half-write
+  under a new name). An unrecognized mode string throws rather than falling back
+  permissively.
+- `writer.managed_sources`, `writer.mode`, and per-source `writer.mode.<sourceId>`
+  config keys.
+- `put_page` responses carry `writer_mode`, `writer_managed`, and `git_first`, so
+  an agent can see that its write is anchored in git instead of trusting that it is.
+- `test/writer-mode.test.ts` and `test/put-page-git-first.serial.test.ts` — the
+  latter runs the real handler against real git repositories and pins the negative
+  cases hardest: a failed push, a protected slug, and invalid frontmatter each
+  leave zero rows and a clean checkout.
+
+### Fixed
+- Write-through is skipped entirely on a git-first source. Running it would
+  overwrite the just-committed file with the DB's re-serialisation, reintroducing
+  the provenance-stamp diff that collided add/add during the incident.
+- Committing the caller's own bytes rather than a re-render means `ingested_via`,
+  `ingested_at` and `source_kind` never reach the repository at all, so a
+  machine-written page and a hand-authored one of the same content no longer differ
+  by machine noise.
+- Every failure in the git-first path now fails the write with one coherent error,
+  including failures raised below the git-write layer (an unreachable remote, a
+  failed fetch). Previously a bare git error could surface uninterpreted.
+- `resolveSourceRepoPath` is shared by the writer and the git-write path, so the
+  two can no longer disagree about which checkout a source's pages belong in.
+
+### Notes
+- Ephemeral-worktree isolation for writes is deliberately NOT in this release. The
+  design asks for it to be decided by measurement rather than assertion, and the
+  existing cross-process repo lock already serialises writers against the sync
+  loop. Tracked in `docs/designs/git-canonical-writes.md`.
+
 ## [0.43.0.20] - 2026-08-18
 
 **The runbook said "never run this"; the binary now says it too.** v0.43.0.19

@@ -1,6 +1,6 @@
 # Design: Git-Anchored Writes — structural enforcement of repo canonicality
 
-**Status:** proposed · **Author:** Claude (session 2026-08-18, with Ross) · **Target:** `arkologystudio/knowledge-system` (gbrain fork)
+**Status:** in progress — Phase 0, 0b and 2a landed · **Author:** Claude (session 2026-08-18, with Ross) · **Target:** `arkologystudio/knowledge-system` (gbrain fork)
 **Suggested landing path:** `docs/designs/git-canonical-writes.md`
 
 ## 0. The invariant
@@ -58,6 +58,8 @@ git worktree remove
 1. **Never fetch into `FETCH_HEAD` from a write path.** Use an explicit private refspec (`+refs/heads/main:refs/gbrain/write/<id>`) so write fetches and the sync pull can never nominate competing merge candidates.
 2. **Writes continue to take the existing cross-process repo lock** (`src/core/repo-lock.ts`) around the fetch + worktree add/remove, exactly as page writes do today (30s wait, then fail loudly). The lock's scope shrinks — it no longer has to cover the commit itself — but it does not go away.
 3. **Prefer a separate git dir over a worktree if measurement shows ref-lock contention** at the write rates we actually see. A second bare clone costs disk and a fetch; it shares nothing. Decide with a measurement in Phase 2, not by assertion here.
+
+**Status:** 2a shipped WITHOUT worktree isolation, deliberately. The existing cross-process repo lock already serialises writers against the 5-minute sync, and this requirement asks for a measurement rather than an assertion — so the measurement is owed before the isolation lands, not after.
 
 The mirror directory itself gets aggressive hygiene: mode `0700`, and an ops-README breadcrumb *inside* it (`/srv/brain-repos/arkology/DO-NOT-EDIT.md`, git-ignored) saying "this tree is bulldozed every 5 minutes; write via MCP or push to origin". The 09:10 root commit that triggered this incident was a well-intentioned human tidying a dirty tree — make the tree self-describing so the tidy impulse routes correctly.
 
@@ -155,10 +157,13 @@ Tier 2 (valuable, independent): structural write accounting for subagent jobs; d
 |---|---|---|---|
 | **0 — today** | Extend the existing guard to alarm on indexed-commit lag vs `origin_head`, degrade (never `ok`) when it cannot measure, and never let a failed probe reset the staleness clock. Pure ops script + timer; no engine change. Document the self-upgrade footgun and disable its two gated channels on kb-vps. **Done** (v0.43.0.19). | S | none |
 | **0b — done** | Close the self-upgrade footgun structurally: build identity as a compile-time constant (`src/core/distribution.ts`), foreign releases refused on every apply path, passive checks report fork status. Config could not do this — `self_upgrade.mode` is not on the path the dangerous commands take. **Done** (v0.43.0.20). | S | none — inert on upstream builds |
-| **1** | Mechanism A: sync's git step → fetch + quarantine + reset; mirror dir hygiene. **Must also disable write-through for machine-managed sources in the same change** — see the ordering hazard below. | M | medium — see hazard |
+| **2a — done** | Mechanism B core: `writer.mode` derived from a `writer.managed_sources` declaration; `put_page` routed through the git-first commit+push path on managed sources; write-through skipped there; provenance kept out of the committed bytes as a consequence of committing the caller's content. **Done** (v0.43.0.21). | M | landed |
+| **1** | Mechanism A: sync's git step → fetch + quarantine + reset; mirror dir hygiene. **Ordering hazard is now RESOLVED by 2a** — see below. | M | low, now that 2a has landed |
 | **2** | Mechanism B: worktree write path (refactor `git-page-write.ts` onto ephemeral worktrees + private refspec); route `put_page` through it; bulk batching (§B1a); `writer.mode` + `managed` derivation; delete `write-through.ts` for `git-first`; B3 canonical serializer + provenance-out-of-frontmatter. | L | main risk = serializer round-trip regressions; gate with a corpus round-trip test over the whole arkology wiki |
 | **3** | Mechanism C in-engine: three-commit model in `get_health`/`sources_status`, score cap. Retire the phase-0 script's overlap. | M | low |
 | Interleaved | Tier-1 cherry-picks, each with its upstream tests. | M | per-pick |
+
+**Ordering hazard — RESOLVED by shipping 2a first.** The original plan ran Phase 1 before Phase 2 and the review caught that this destroys data; the resolution was simply to invert the order, which costs nothing and removes the hazard at its root rather than mitigating it. The reasoning, kept because it is the reason the order is what it is:
 
 **Ordering hazard — Phase 1 without part of Phase 2 destroys data.** Today `put_page` drops an *uncommitted* file into the machine-managed clone and it survives there until someone commits it (which is how the incident's two pages reached git at all). Phase 1's `reset --hard` bulldozes exactly that file within 5 minutes — quarantined rather than lost, but no longer landing in git by the accidental route people currently rely on. Write-through droppings are a **normal, everyday state**, not a failure state, so Phase 1 is not the low-risk change it first appears. Therefore Phase 1 must ship with write-through disabled for machine-managed sources (making `put_page` DB-only and *loudly* so, until Phase 2 makes it git-first), or Phases 1 and 2 must merge. Shipping Phase 1 alone is not an option.
 
