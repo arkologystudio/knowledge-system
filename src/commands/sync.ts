@@ -250,7 +250,7 @@ export interface SyncResult {
 
 export interface SyncWarning {
   /** Machine-stable discriminator. Additive only. */
-  code: 'pull_failed' | 'noop_without_remote_contact';
+  code: 'pull_failed' | 'noop_without_remote_contact' | 'mirror_violation';
   message: string;
 }
 
@@ -1694,16 +1694,40 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       syncWarnings.push({ code: 'pull_failed', message: detail });
     } else {
       try {
-        const { pullRepo } = await import('../core/git-remote.ts');
-        // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,
-        // bound the pull subprocess to a fraction of the remaining budget.
-        // We pass a safe default (the operator's full --timeout if set, else
-        // pullRepo's own 300s default). The catch below distinguishes
-        // timeout (ETIMEDOUT / SIGTERM on err.cause) from ordinary pull
-        // failure.
-        pullRepo(repoPath);
-        remoteContacted = true;
-        serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
+        // A machine-managed mirror CONVERGES rather than pulls. `--ff-only`
+        // protects local commits, which is right for a checkout a human works in
+        // and wrong for a tree a machine owns: one local commit wedged the
+        // Arkology mirror for a day and hid three weeks of staleness behind it.
+        // Fetch + reset makes divergence impossible instead of merely detected.
+        // Anything that should not exist is preserved first and reported as a
+        // violation, never silently destroyed.
+        const { isManagedSource } = await import('../core/writer-mode.ts');
+        const managed = await isManagedSource(engine, opts.sourceId ?? 'default');
+        if (managed) {
+          const { convergeMirror } = await import('../core/git-remote.ts');
+          const { gbrainPath } = await import('../core/config.ts');
+          const converged = convergeMirror(repoPath, {
+            quarantineRoot: gbrainPath('quarantine', opts.sourceId ?? 'default'),
+          });
+          remoteContacted = true;
+          for (const v of converged.violations) {
+            const detail = `mirror violation (${v.kind}): ${v.detail}. Preserved at ${v.preservedAt}`;
+            serr(`Warning: ${detail}`);
+            syncWarnings.push({ code: 'mirror_violation', message: detail });
+          }
+          serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms (converged ${converged.before.slice(0, 12)} -> ${converged.after.slice(0, 12)})`);
+        } else {
+          const { pullRepo } = await import('../core/git-remote.ts');
+          // v0.41.13.0 (T3 / D-V4-mech-7): if the operator set --timeout,
+          // bound the pull subprocess to a fraction of the remaining budget.
+          // We pass a safe default (the operator's full --timeout if set, else
+          // pullRepo's own 300s default). The catch below distinguishes
+          // timeout (ETIMEDOUT / SIGTERM on err.cause) from ordinary pull
+          // failure.
+          pullRepo(repoPath);
+          remoteContacted = true;
+          serr(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
+        }
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         serr(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 80)})`);

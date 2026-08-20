@@ -2,6 +2,49 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.22] - 2026-08-20
+
+**A machine-managed mirror can no longer diverge.** Sync stops pulling
+`--ff-only` on those sources and converges instead: fetch, preserve anything that
+should not exist, then `reset --hard origin/<branch>`.
+
+`--ff-only` PROTECTS local commits. That is the right instinct for a checkout a
+human works in and exactly the wrong one for a tree a machine owns. When the
+Arkology mirror acquired one local commit, every subsequent pull failed — and
+stayed failed until a person intervened a day later, while `get_health` read
+clean the whole time. Divergence was a permanently wedging condition that only a
+human could clear.
+
+Fetch + reset makes divergence **impossible rather than merely detected**: there
+is now no state that clone can reach from which it cannot recover unattended.
+
+**Nothing is discarded silently.** Before the reset, local-only commits are saved
+to a `refs/gbrain/rescue/<sha>` ref and uncommitted work is copied to a timestamped
+quarantine directory; both are reported as `mirror_violation` sync warnings naming
+where the evidence went. A reset that quietly ate a colleague's work would trade
+one incident class for a worse one.
+
+Only sources declared in `writer.managed_sources` converge. Everything else keeps
+pulling exactly as before.
+
+### Added
+- `convergeMirror()` in `src/core/git-remote.ts`, with `MirrorViolation` reporting.
+- `mirror_violation` sync warning code.
+- `test/mirror-convergence.serial.test.ts` — real repositories, including a test
+  that reproduces the incident state (a local commit plus upstream commits),
+  asserts `git pull --ff-only` genuinely fails there, and then proves convergence
+  resolves it on the first attempt with the stray commit still reachable by ref.
+
+### Fixed
+- A failed fetch aborts before the reset, so losing the remote can never converge
+  a mirror onto a stale remote-tracking ref.
+- A detached HEAD is refused rather than guessed at.
+- Quarantine reads `git status --porcelain` **untrimmed**. Porcelain v1 encodes
+  state in two fixed columns and a modified-unstaged file is ` M path`, leading
+  space included; trimming ate that space on the first line, parsed its path one
+  character short, and silently failed to preserve exactly the file the quarantine
+  exists to save. Caught by the tests before it could reach a mirror.
+
 ## [0.43.0.21] - 2026-08-20
 
 **`put_page` no longer makes the brain a second author.** On a machine-managed
