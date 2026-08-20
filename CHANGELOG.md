@@ -36,8 +36,16 @@ paths remain database-only by design and are NOT anchored in git:
 - Sandbox subagents (`viaSubagent` without `allowedSlugPrefixes`) are deliberately
   database-only and already reported `skipped: 'subagent_sandbox'`.
 
-Neither leaves a dropping, so neither can wedge a mirror — but neither is anchored
+`gbrain rid backfill` also writes stamps directly via `writeBrainPage`, bypassing
+write-through; on a managed source the next converge quarantines and reverts them.
+
+None of these leaves a dropping through the guarded path, but none is anchored
 either. Closing them is tracked in `docs/designs/git-canonical-writes.md`.
+
+**Rolling this out takes TWO keys, not one.** Declaring a source in
+`writer.managed_sources` makes its remote `put_page` writes subject to the same
+gate as `commit_page`, so `writer.commit_page.enabled=true` must be set as well or
+remote writes to that source will be refused. Local callers are unaffected.
 
 ### Added
 - `src/core/writer-mode.ts` — `git-first` / `local-tree` / `db-only`, derived from
@@ -53,13 +61,19 @@ either. Closing them is tracked in `docs/designs/git-canonical-writes.md`.
 - `gitFailureCode()` / `isRetryableGitFailure()` — git failures now map to codes an
   agent can act on (`git_conflict`, `git_push_failed`, `invalid_params`,
   `permission_denied`), with a suggestion telling a retryable caller not to rewrite
-  its content.
+  its content. A failed fetch/pull arrives as `GitOperationError` from below the
+  page-write layer and is classified retryable too — an unreachable remote is the
+  most common transient condition there is.
 - `put_page` responses carry `writer_mode`, `writer_managed`, and `git_first`.
 - `test/writer-mode.test.ts` and `test/put-page-git-first.serial.test.ts` — the
   latter runs the real handler against real git repositories and pins the negative
   cases hardest.
 
 ### Fixed
+- **A push that actually landed is no longer reported as a failure.** A remote can
+  accept the ref while the client sees a network error on the response; rolling
+  back then would discard a commit that is live on origin. The remote is asked
+  (`ls-remote`) before anything is undone.
 - **A failed push no longer leaves a divergent commit behind.** Previously the
   local commit survived a push failure: the checkout was left clean but one commit
   ahead of origin, and because the pull path rebases, the NEXT successful write
@@ -72,10 +86,13 @@ either. Closing them is tracked in `docs/designs/git-canonical-writes.md`.
   OAuth client scoped to one write source. Without this, declaring a source
   machine-managed would have silently turned `put_page` into an ungated remote push
   surface.
-- **Write-through refuses centrally on a machine-managed source.** The guard lives
-  in `writePageThrough` rather than at each call site, so callers that never knew
-  about writer modes — `gbrain brainstorm/lsd --save`, and any future one — cannot
-  leave a dropping either.
+- **Write-through refuses centrally on a machine-managed source**, and fails
+  CLOSED. The guard lives in `writePageThrough` rather than at each call site, so
+  callers that never knew about writer modes — `gbrain brainstorm/lsd --save`, and
+  any future one — cannot leave a dropping either. The managed check is asked
+  first and independently, because resolving the full mode can throw on a bad
+  `writer.mode` value and swallowing that threw the guard away entirely: one typo
+  silently re-enabled droppings for every source.
 - Write-through is skipped on the git-first `put_page` path; running it would
   overwrite the just-committed file with the DB's re-serialisation, reintroducing
   the provenance-stamp diff that collided add/add during the incident.

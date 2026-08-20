@@ -88,19 +88,37 @@ export async function writePageThrough(
   // yet. An uncommitted file in a machine-managed tree is a dropping, and once
   // mirrors converge (v0.43.0.22) it is a dropping that gets bulldozed within
   // five minutes.
+  //
+  // FAIL CLOSED on a misconfiguration. `resolveWriterMode` throws on a bad
+  // `writer.mode` value, and swallowing that threw the guard away entirely: one
+  // typo (`git_first`) silently re-enabled droppings for EVERY source, managed
+  // ones included. So the managed check is asked FIRST and independently — it
+  // reads one config key and cannot throw on a bad mode string — and only the
+  // richer resolution is allowed to fail open.
+  const { isManagedSource, resolveWriterMode } = await import('./writer-mode.ts');
+  let managed = false;
   try {
-    const { resolveWriterMode } = await import('./writer-mode.ts');
-    const writer = await resolveWriterMode(engine, sourceId);
-    if (writer.mode === 'git-first') {
-      opts.logger?.warn(
-        `[write-through] refused for '${slug}': source '${sourceId}' is machine-managed (git-first). ` +
-        `The page is in the database but NOT in git — write it via put_page or commit_page to anchor it.`,
-      );
-      return { written: false, skipped: 'git_first_source' };
-    }
+    managed = await isManagedSource(engine, sourceId);
   } catch {
-    // A writer-mode misconfiguration must not break the legacy write-through
-    // path; fall through to the pre-existing behaviour.
+    // Cannot even read the declaration: treat as unmanaged (the pre-existing
+    // behaviour) rather than blocking every write on a database hiccup.
+  }
+  let mode: string | null = null;
+  if (managed) {
+    mode = 'git-first';                       // forced; no resolution needed
+  } else {
+    try {
+      mode = (await resolveWriterMode(engine, sourceId)).mode;
+    } catch {
+      mode = null;                            // unmanaged + misconfigured → legacy behaviour
+    }
+  }
+  if (mode === 'git-first') {
+    opts.logger?.warn(
+      `[write-through] refused for '${slug}': source '${sourceId}' is machine-managed (git-first). ` +
+      `The page is in the database but NOT in git — write it via put_page or commit_page to anchor it.`,
+    );
+    return { written: false, skipped: 'git_first_source' };
   }
   try {
     // #2018: pick the disk target so a page is NEVER written into a different

@@ -13,7 +13,8 @@ This design makes the invariant **structural**: after it lands, there is *no rea
 
 **Status against that bar, as of v0.43.0.22** — stated plainly, because a design doc that overstates its own completion is how the next incident gets missed:
 
-- ✅ No `put_page` write leaves the DB ahead of git on a managed source, and no write path leaves an *uncommitted file* in a managed tree (the write-through refusal is central, not per-caller).
+- ✅ No `put_page` write leaves the DB ahead of git on a managed source, and no write-through path leaves an *uncommitted file* in a managed tree (the refusal is central and fails closed).
+- ⚠️ `gbrain rid backfill` writes RID stamps directly via `writeBrainPage`, bypassing write-through entirely. It leaves a dropping that the next converge quarantines and reverts — so the stamps do not stick on a managed source. Tracked with Phase 2b.
 - ⚠️ Two paths are still DB-only on a managed source: `submit_ingest` and sandbox subagents (Phase 2b). They cannot wedge a mirror, but they are not anchored.
 - ⚠️ The mirror recovers unattended from divergence, dirt, and local commits — but **not** from a detached HEAD or a missing `origin/<branch>`, both of which still require a human. Those are refusals rather than wedges, but the "no state" claim is not yet literal.
 

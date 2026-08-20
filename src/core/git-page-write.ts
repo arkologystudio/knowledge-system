@@ -27,6 +27,7 @@ import { CONTENT_FLAG_KEY, QUARANTINE_KEY } from './quarantine.ts';
 import { EMBED_SKIP_KEY } from './embed-skip.ts';
 import {
   divergenceSafePull,
+  GitOperationError,
   GIT_ENV_AUTH,
   GIT_SSRF_SUBCOMMAND_FLAGS,
   isWorkingTreeDirty,
@@ -125,6 +126,15 @@ export class GitPageWriteError extends Error {
  * good page — and lock contention is routine, not exceptional.
  */
 export function gitFailureCode(e: unknown): string {
+  // A failed fetch/pull arrives as GitOperationError from git-remote.ts, NOT as
+  // GitPageWriteError — it is raised below this layer, before a page write ever
+  // gets its hands on the repo. An unreachable remote is the single most common
+  // transient condition there is, so falling through to `storage_error` told the
+  // agent "operator problem, do not retry" for exactly the case where retrying is
+  // the right answer.
+  if (e instanceof GitOperationError) {
+    return e.op === 'fetch' || e.op === 'pull' ? 'git_conflict' : 'storage_error';
+  }
   if (!(e instanceof GitPageWriteError)) return 'storage_error';
   switch (e.code) {
     case 'protected_path':
@@ -360,6 +370,24 @@ export async function gitFirstPageWrite(
         // `--hard` is safe here and nowhere else: we are inside the repo lock, we
         // verified the tree was clean before writing, and the only change since is
         // the one file we just wrote.
+        // Did the push actually land? A remote can accept the ref and the client
+        // still see a network error on the response. Rolling back then would
+        // discard a commit that IS live on origin, and report a success as a
+        // failure. Ask the remote before touching anything.
+        let landed = false;
+        try {
+          const remoteRef = git(repoPath, [
+            '-c', 'http.followRedirects=false',
+            'ls-remote', 'origin', `refs/heads/${branch}`,
+          ], 30_000);
+          landed = remoteRef.startsWith(committedHead);
+        } catch {
+          landed = false;                      // cannot tell → treat as not landed
+        }
+        if (landed) {
+          return { ...base, head_after: committedHead, committed: true, pushed: true };
+        }
+
         let rollback = 'rolled back';
         try {
           git(repoPath, ['reset', '--hard', head], 30_000);

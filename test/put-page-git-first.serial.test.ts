@@ -35,6 +35,21 @@ function page(body: string): string {
   return `---\ntitle: Managed Page\ntype: note\n---\n\n# Managed Page\n\n${body}\n`;
 }
 
+function denyPushes(): void {
+  // Deleting the remote makes the FETCH fail, so no commit is ever created and a
+  // rollback assertion passes vacuously. A rejecting pre-receive hook is the only
+  // setup that reaches the push with a commit on the ground.
+  const hooks = path.join(remote, 'hooks');
+  fs.mkdirSync(hooks, { recursive: true });
+  const hook = path.join(hooks, 'pre-receive');
+  fs.writeFileSync(hook, '#!/bin/sh\necho "push refused by test" >&2\nexit 1\n');
+  fs.chmodSync(hook, 0o755);
+}
+
+function allowPushes(): void {
+  fs.rmSync(path.join(remote, 'hooks', 'pre-receive'), { force: true });
+}
+
 const putPage = operations.find((o) => o.name === 'put_page')!;
 
 function ctx(extra: Record<string, unknown> = {}): any {
@@ -144,14 +159,17 @@ describe('put_page on a machine-managed source', () => {
     // it looks: `divergenceSafePull` rebases, so the next successful write
     // replays and pushes the very content this call reported as failed.
     const headBefore = git(checkout, ['rev-parse', 'HEAD']);
-    fs.rmSync(remote, { recursive: true, force: true });
+    denyPushes();
 
     await expect(
       putPage.handler(ctx(), { slug: 'wiki/unpushable', content: page('never lands') }),
     ).rejects.toThrow(/git-first write failed/);
 
     expect(await pageRows('wiki/unpushable')).toHaveLength(0);
+    // The commit really was created and really was rolled back: HEAD is back
+    // where it started and the branch is not ahead of origin.
     expect(git(checkout, ['rev-parse', 'HEAD'])).toBe(headBefore);
+    expect(git(checkout, ['rev-list', '--count', 'origin/main..HEAD'])).toBe('0');
     expect(git(checkout, ['status', '--porcelain'])).toBe('');
     expect(fs.existsSync(path.join(checkout, 'wiki/unpushable.md'))).toBe(false);
   });
@@ -160,13 +178,11 @@ describe('put_page on a machine-managed source', () => {
     // The regression this guards: with the commit left behind, the next write
     // rebases it onto origin and pushes it, publishing content the caller was
     // told had failed — unindexed and unattributed.
-    const remoteBackup = path.join(root, 'remote-backup.git');
-    fs.cpSync(remote, remoteBackup, { recursive: true });
-    fs.rmSync(remote, { recursive: true, force: true });
+    denyPushes();
     await expect(
       putPage.handler(ctx(), { slug: 'wiki/ghost', content: page('should never be published') }),
     ).rejects.toThrow(/git-first write failed/);
-    fs.cpSync(remoteBackup, remote, { recursive: true });
+    allowPushes();
 
     // A later, unrelated, successful write.
     await putPage.handler(ctx(), { slug: 'wiki/legit', content: page('this one is real') });
@@ -180,13 +196,28 @@ describe('put_page on a machine-managed source', () => {
   test('transient git failures are reported as retryable, not as bad content', async () => {
     // An agent acts on the CODE. Telling it `invalid_params` for a repo problem
     // makes it rewrite a perfectly good page instead of retrying.
-    fs.rmSync(remote, { recursive: true, force: true });
+    denyPushes();
     try {
       await putPage.handler(ctx(), { slug: 'wiki/transient', content: page('fine content') });
       throw new Error('expected the write to fail');
     } catch (e: any) {
-      expect(['git_push_failed', 'git_conflict', 'storage_error']).toContain(e.code);
-      expect(e.code).not.toBe('invalid_params');
+      // Narrow, not an allowlist of everything: a refused push is precisely
+      // `git_push_failed`, and it must carry the do-not-rewrite suggestion.
+      expect(e.code).toBe('git_push_failed');
+      expect(e.suggestion).toMatch(/Retry the same write/);
+    }
+  });
+
+  test('an unreachable remote is retryable too, not an operator error', async () => {
+    // This fails at the FETCH rather than the push. It is just as transient, so
+    // it must not be reported as a storage/config problem with no guidance.
+    fs.rmSync(remote, { recursive: true, force: true });
+    try {
+      await putPage.handler(ctx(), { slug: 'wiki/offline', content: page('fine content') });
+      throw new Error('expected the write to fail');
+    } catch (e: any) {
+      expect(e.code).toBe('git_conflict');
+      expect(e.suggestion).toMatch(/Retry the same write/);
     }
   });
 
@@ -240,6 +271,18 @@ describe('put_page on a machine-managed source', () => {
       expect(e.code).toBe('invalid_request');
       expect(e.message).toMatch(/writer mode is misconfigured/);
     }
+    await engine.setConfig('writer.mode', '');
+  });
+
+  test('the write-through guard fails CLOSED on a misconfigured writer mode', async () => {
+    // A typo in `writer.mode` used to throw the guard away entirely, silently
+    // re-enabling droppings for every source including managed ones.
+    const { writePageThrough } = await import('../src/core/write-through.ts');
+    await putPage.handler(ctx(), { slug: 'wiki/guarded', content: page('anchored') });
+    await engine.setConfig('writer.mode', 'git_first');   // underscore typo
+    const res = await writePageThrough(engine, 'wiki/guarded', { sourceId: 'default', logger: { warn() {} } });
+    expect(res).toEqual({ written: false, skipped: 'git_first_source' });
+    expect(git(checkout, ['status', '--porcelain'])).toBe('');
     await engine.setConfig('writer.mode', '');
   });
 
