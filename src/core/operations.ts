@@ -996,6 +996,15 @@ const put_page: Operation = {
 
     const result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
+      // On the git-first path the page IS a file at a known path, so record it —
+      // exactly as `commit_page` does. Without it the row lands with
+      // `source_path IS NULL`, and sync's incremental delete cannot map a removed
+      // file back to the page: deleting the page from git leaves it in the index
+      // FOREVER, which is the design's own invariant inverted (found in
+      // production by deleting a verification page and watching it survive).
+      // `importFromContent`'s content-hash short-circuit means a later sync never
+      // backfills this, so it has to be right at write time.
+      ...(gitFirst ? { sourcePath: `${slug}.md` } : {}),
       // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
       // markers (quarantine/content_flag/embed_skip). Fail-closed — anything
       // not strictly local is remote (matches CV6 / v0.26.9 F7b posture).

@@ -319,6 +319,20 @@ describe('put_page on a machine-managed source', () => {
     expect(git(checkout, ['rev-list', '--count', 'origin/main..HEAD'])).toBe('1');
   });
 
+  test('records source_path so a later git deletion propagates to the index', async () => {
+    // Found in production: without source_path, sync's incremental delete cannot
+    // map a removed file back to its page, so deleting the page from git leaves
+    // it in the brain forever — the design's own invariant inverted (index ahead
+    // of git). importFromContent's content-hash short-circuit means a later sync
+    // never backfills it, so it has to be right at write time.
+    await putPage.handler(ctx(), { slug: 'wiki/deletable', content: page('will be removed') });
+
+    const rows: any[] = await engine.executeRaw(
+      'SELECT source_path FROM pages WHERE slug = $1', ['wiki/deletable'],
+    );
+    expect(rows[0]?.source_path).toBe('wiki/deletable.md');
+  });
+
   test('a dry run touches neither git nor the index', async () => {
     const head = git(checkout, ['rev-parse', 'HEAD']);
     await putPage.handler(ctx({ dryRun: true }), { slug: 'wiki/dry', content: page('dry') });
