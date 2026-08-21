@@ -2,6 +2,32 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.23] - 2026-08-21
+
+**Deleting a git-first page from git left it in the brain forever.** The
+git-first `put_page` path did not record `source_path`, so the row landed with
+`source_path IS NULL` and sync's incremental delete could not map a removed file
+back to its page. Remove the page from the repository and the index kept serving
+it — the design's own invariant inverted, with the brain ahead of git instead of
+behind it.
+
+Found in production, by writing a verification page through the newly-enabled
+managed source, deleting it via git, and watching it survive. `commit_page`
+always recorded the path; only `put_page` did not, which is why four review
+rounds classified the gap as a cosmetic inconsistency rather than a defect.
+`importFromContent`'s content-hash short-circuit means a later sync never
+backfills the value, so it has to be right at write time.
+
+### Fixed
+- The git-first `put_page` path records `sourcePath`, matching `commit_page`.
+  Pinned by a test that fails when the fix is removed.
+
+### Note for existing brains
+Rows written by `put_page` before this release keep `source_path IS NULL` and
+will not be removed from the index when their file is deleted from git. A
+`gbrain sync --full` reconciles them; nothing is lost either way, since the file
+in git remains canonical.
+
 ## [0.43.0.22] - 2026-08-20
 
 **A machine-managed mirror can no longer diverge.** Sync stops pulling
