@@ -6180,6 +6180,316 @@ export const MIGRATIONS: Migration[] = [
       return rows[0]?.column_ok === true && rows[0]?.index_ok === true;
     },
   },
+  {
+    version: 129,
+    name: 'per_artifact_space_labels',
+    // Per-artifact access labels — the unit of access moves from the SOURCE to
+    // the ARTIFACT.
+    //
+    // v125 made the database the enforcement point (`gbrain_request` +
+    // `app.allowed_sources` GUC + SELECT policies on 11 tables). Its predicate
+    // asks one question: "is this row's source in the caller's grant?" A source
+    // is a whole brain, so the smallest thing anyone can be granted is
+    // everything. Sharing one folder of one wiki with a funder is not
+    // expressible.
+    //
+    // This migration replaces that question, for pages and everything hanging
+    // off a page, with: "does this artifact carry a label the caller holds?"
+    // Labels live in `page_spaces` — a join table, NOT frontmatter and NOT a
+    // tag — because a tag is authored inside the artifact and every `write`-
+    // scoped agent can set one. Authority over access and authority over
+    // content have to be different authorities.
+    //
+    // SHIPS DARK. The backfill seeds each page's label set with its OWN
+    // source_id, and registers every existing source id as a space. So a caller
+    // granted `default` matches every page whose label set contains `default`
+    // = every page in that source = exactly today's result set. The GUC keeps
+    // its name and contents (an opaque list of ids); nothing in the engine,
+    // dispatcher, governance, or any client changes. Behaviour is bit-identical
+    // until a steward adds a second label to some artifact.
+    //
+    // Coverage split, chosen so NO table loses protection:
+    //   - Page-labelled (predicate now `page_spaces`): pages, content_chunks,
+    //     links, tags, raw_data, timeline_entries, page_versions.
+    //   - Source-scoped (predicate UNCHANGED): artifacts, facts, ingest_log —
+    //     these have no page linkage, so `source_id = ANY(guc)` remains correct
+    //     and fail-closed. A principal holding only a label (never a source id)
+    //     simply matches zero rows there.
+    //   - `files` gets BOTH, OR'd: page-linked files follow their page's labels,
+    //     page-less files keep source scoping. Strictly non-narrowing.
+    // Policy count stays 11, so v125's verify hook keeps passing.
+    //
+    // `links` is deliberately STRICTER than v125. v125 scoped only the near
+    // endpoint (`from_page_id`), leaving a far slug disclosable to an untrusted
+    // caller (the app layer patched that in `linkReadScopeOpts`). Here both
+    // endpoints — and the origin, when set — must be visible, so an edge into an
+    // artifact the caller cannot read simply does not exist for them. That is
+    // the silent-drop rule enforced in the database rather than remembered in
+    // application code.
+    //
+    // A page with NO rows in `page_spaces` is invisible to every RLS-scoped
+    // caller. That is the intended fail-closed default, and it is why the two
+    // triggers below exist: they guarantee no page can be created without a
+    // label regardless of which write path created it (git sync, commit_page,
+    // import, a future one nobody has written yet). Enforcing that in the data
+    // layer rather than in each ingest path is the same reasoning as v125.
+    //
+    // Postgres-only for triggers + policies (guarded), matching v125: PGLite has
+    // no roles/policies and its `withRlsScope` is a pass-through no-op, so those
+    // deployments keep app-layer enforcement exclusively. The TABLES and the
+    // backfill run on both engines so the data model is uniform.
+    idempotent: true,
+    sql: `
+      -- The grantable unit. \`class\` is an admin guardrail, not an authz input:
+      -- it constrains which spaces a grant editor may OFFER for an external
+      -- principal. Nothing at request time reads it, so membership type never
+      -- becomes an authorisation input.
+      CREATE TABLE IF NOT EXISTS spaces (
+        id          TEXT PRIMARY KEY,
+        label       TEXT NOT NULL,
+        class       TEXT NOT NULL DEFAULT 'internal'
+                    CHECK (class IN ('internal','shareable')),
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      -- Every existing source becomes a space of the same id. This is what
+      -- makes the migration behaviour-preserving: existing grants name source
+      -- ids, and those ids are now valid labels.
+      INSERT INTO spaces (id, label, class)
+      SELECT id, name, 'internal' FROM sources
+      ON CONFLICT (id) DO NOTHING;
+
+      -- \`public\` is an ordinary space, not a special case. An anonymous
+      -- principal is a real principal holding exactly {public}; there is no
+      -- "unauthenticated means open" branch anywhere, because a second code
+      -- path is where a bypass bug would live.
+      INSERT INTO spaces (id, label, class) VALUES
+        ('public', 'Public', 'shareable')
+      ON CONFLICT (id) DO NOTHING;
+
+      -- An artifact's label set IS its access control list. Set-valued, not a
+      -- tier: audiences are peers (a Habitat funder and a Zoa contact are both
+      -- "external" and must not see each other's material), so this can never
+      -- collapse to a single clearance column.
+      CREATE TABLE IF NOT EXISTS page_spaces (
+        page_id   INTEGER NOT NULL REFERENCES pages(id)  ON DELETE CASCADE,
+        space_id  TEXT    NOT NULL REFERENCES spaces(id) ON DELETE RESTRICT,
+        granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (page_id, space_id)
+      );
+
+      -- Drives the RLS EXISTS probe (space_id first: the GUC set is the
+      -- selective side) and the "what is in this space" steward listing.
+      CREATE INDEX IF NOT EXISTS idx_page_spaces_space ON page_spaces(space_id, page_id);
+
+      -- Backfill: each page keeps exactly the reach it has today.
+      INSERT INTO page_spaces (page_id, space_id)
+      SELECT id, source_id FROM pages
+      ON CONFLICT DO NOTHING;
+    `,
+    handler: async (engine) => {
+      if (engine.kind !== 'postgres') return;
+      await engine.runMigration(129, `
+        DO $$
+        BEGIN
+          -- Mirror new sources into spaces, so a source registered later is
+          -- immediately grantable and the pages trigger below cannot hit a
+          -- missing FK target.
+          CREATE OR REPLACE FUNCTION ks_mirror_source_space() RETURNS trigger
+            SET search_path = pg_catalog, public AS $fn$
+          BEGIN
+            INSERT INTO spaces (id, label, class)
+            VALUES (NEW.id, NEW.name, 'internal')
+            ON CONFLICT (id) DO NOTHING;
+            RETURN NEW;
+          END;
+          $fn$ LANGUAGE plpgsql;
+
+          DROP TRIGGER IF EXISTS ks_source_space_mirror ON sources;
+          CREATE TRIGGER ks_source_space_mirror AFTER INSERT ON sources
+            FOR EACH ROW EXECUTE FUNCTION ks_mirror_source_space();
+
+          -- No page may exist without a label. A new page inherits its source
+          -- as its label, which is what makes ingest behaviour-preserving: a
+          -- caller granted the source keeps seeing everything in it.
+          --
+          -- A per-source default OTHER than the source id (so a source could
+          -- land its pages straight into, say, the public space) is deliberately
+          -- NOT built here. Nothing needs it until a steward UI exists to set
+          -- it, and an unused column on sources would diverge from the schema
+          -- blob for no gain.
+          CREATE OR REPLACE FUNCTION ks_default_page_space() RETURNS trigger
+            SET search_path = pg_catalog, public AS $fn$
+          BEGIN
+            INSERT INTO page_spaces (page_id, space_id)
+            VALUES (NEW.id, NEW.source_id)
+            ON CONFLICT DO NOTHING;
+            RETURN NEW;
+          END;
+          $fn$ LANGUAGE plpgsql;
+
+          DROP TRIGGER IF EXISTS ks_page_space_default ON pages;
+          CREATE TRIGGER ks_page_space_default AFTER INSERT ON pages
+            FOR EACH ROW EXECUTE FUNCTION ks_default_page_space();
+        END $$;
+
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'gbrain_request') THEN
+            RAISE WARNING 'v129: role gbrain_request absent (v125 provisioning was skipped); labels are stored but not DB-enforced. App-layer isolation remains.';
+            RETURN;
+          END IF;
+
+          -- The policies probe page_spaces, so the request role must read it.
+          -- spaces is granted too (steward listings, label rendering).
+          GRANT SELECT ON page_spaces, spaces TO gbrain_request;
+
+          -- A GRANT alone is not enough. Both tables are created into a schema
+          -- where RLS is enabled table-by-table, and an RLS-enabled table with
+          -- NO policy denies every row — so the EXISTS probe below would find
+          -- nothing and every scoped read would return zero rows. These two
+          -- policies are load-bearing, not hygiene.
+          --
+          -- They are also deliberately SCOPED rather than permissive: a caller
+          -- sees only the label rows for spaces it actually holds, which is
+          -- exactly what the EXISTS needs. So a funder granted habitat cannot
+          -- learn that an artifact ALSO carries internal, nor enumerate the
+          -- org's other audiences. The membership metadata is scoped by the same
+          -- rule as the content.
+          DROP POLICY IF EXISTS ks_space_membership ON page_spaces;
+          CREATE POLICY ks_space_membership ON page_spaces FOR SELECT TO gbrain_request
+            USING (space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+          DROP POLICY IF EXISTS ks_space_visibility ON spaces;
+          CREATE POLICY ks_space_visibility ON spaces FOR SELECT TO gbrain_request
+            USING (id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]));
+
+          -- ── pages: the label predicate replaces the source predicate ──────
+          -- Fail-closed exactly as v125: NULLIF turns an unset ('') or absent
+          -- GUC into NULL, ANY(NULL) yields no match, and a page with an empty
+          -- label set matches nothing. Never a scalar 'default'.
+          DROP POLICY IF EXISTS ks_source_isolation ON pages;
+          CREATE POLICY ks_source_isolation ON pages FOR SELECT TO gbrain_request
+            USING (EXISTS (
+              SELECT 1 FROM page_spaces ps
+               WHERE ps.page_id = pages.id
+                 AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])
+            ));
+
+          -- ── transitive: inherit the parent page's labels ──────────────────
+          -- content_chunks is why this matters most: semantic search runs over
+          -- chunk vectors, so without this a passage could surface from an
+          -- artifact the caller cannot open. The artifact_id branch (v123's
+          -- page_id XOR artifact_id) stays source-scoped.
+          DROP POLICY IF EXISTS ks_source_isolation ON content_chunks;
+          CREATE POLICY ks_source_isolation ON content_chunks FOR SELECT TO gbrain_request
+            USING (
+              EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = content_chunks.page_id
+                        AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]))
+              OR EXISTS (SELECT 1 FROM artifacts a WHERE a.id = content_chunks.artifact_id
+                        AND a.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]))
+            );
+
+          -- links: BOTH endpoints must be visible (and the origin, when set).
+          -- An edge into an unreadable artifact does not exist for this caller
+          -- — the silent-drop rule, enforced here rather than remembered in
+          -- every traversal path.
+          DROP POLICY IF EXISTS ks_source_isolation ON links;
+          CREATE POLICY ks_source_isolation ON links FOR SELECT TO gbrain_request
+            USING (
+              EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = links.from_page_id
+                        AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]))
+              AND EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = links.to_page_id
+                        AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]))
+              AND (links.origin_page_id IS NULL OR EXISTS (
+                    SELECT 1 FROM page_spaces ps WHERE ps.page_id = links.origin_page_id
+                      AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])))
+            );
+
+          DROP POLICY IF EXISTS ks_source_isolation ON tags;
+          CREATE POLICY ks_source_isolation ON tags FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = tags.page_id
+                      AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON raw_data;
+          CREATE POLICY ks_source_isolation ON raw_data FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = raw_data.page_id
+                      AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON timeline_entries;
+          CREATE POLICY ks_source_isolation ON timeline_entries FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = timeline_entries.page_id
+                      AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+
+          DROP POLICY IF EXISTS ks_source_isolation ON page_versions;
+          CREATE POLICY ks_source_isolation ON page_versions FOR SELECT TO gbrain_request
+            USING (EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = page_versions.page_id
+                      AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+
+          -- files: page-linked rows follow their page's labels; page-less rows
+          -- keep source scoping. OR'd, so this can only widen relative to v125,
+          -- never narrow — an image on a public artifact stays reachable.
+          DROP POLICY IF EXISTS ks_source_isolation ON files;
+          CREATE POLICY ks_source_isolation ON files FOR SELECT TO gbrain_request
+            USING (
+              EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = files.page_id
+                        AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[]))
+              OR files.source_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])
+            );
+
+          -- artifacts, facts, ingest_log keep v125's source predicate: they
+          -- have no page linkage, so there is nothing to label them by yet.
+        END $$;
+      `);
+    },
+    verify: async (engine) => {
+      // Both engines: the tables must exist and the backfill must be total —
+      // a page with no label is invisible to every scoped caller, so an
+      // incomplete backfill is a silent outage, not a cosmetic gap.
+      const shape = await engine.executeRaw<{ spaces_ok: boolean; join_ok: boolean; unlabelled: number }>(
+        `SELECT
+           EXISTS (SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = current_schema() AND table_name = 'spaces') AS spaces_ok,
+           EXISTS (SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = current_schema() AND table_name = 'page_spaces') AS join_ok,
+           (SELECT count(*)::int FROM pages p
+             WHERE NOT EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = p.id)) AS unlabelled`,
+      );
+      if (shape[0]?.spaces_ok !== true || shape[0]?.join_ok !== true) return false;
+      if ((shape[0]?.unlabelled ?? 1) !== 0) return false;
+      if (engine.kind !== 'postgres') return true;
+
+      // Postgres: if v125 provisioning was skipped the role is absent by
+      // design and there are no policies to check (v125 verify precedent).
+      const role = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'gbrain_request'`,
+      );
+      if ((role[0]?.n ?? 0) === 0) return true;
+
+      // The pages policy must actually reference page_spaces — otherwise v125's
+      // source predicate is still in force and this migration is a no-op that
+      // reports success.
+      const pol = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_policies
+          WHERE schemaname = current_schema() AND policyname = 'ks_source_isolation'
+            AND tablename IN ('pages','content_chunks','links','tags','raw_data',
+                              'timeline_entries','page_versions','files')
+            AND qual LIKE '%page_spaces%'`,
+      );
+      if ((pol[0]?.n ?? 0) !== 8) return false;
+
+      // The label tables carry RLS too, and an RLS-enabled table with no policy
+      // denies everything — which would make every scoped read return zero rows
+      // while looking perfectly healthy. Assert their policies explicitly.
+      const meta = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_policies
+          WHERE schemaname = current_schema()
+            AND (tablename, policyname) IN
+                (('page_spaces','ks_space_membership'), ('spaces','ks_space_visibility'))`,
+      );
+      return (meta[0]?.n ?? 0) === 2;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

@@ -695,6 +695,15 @@ export interface BrainEngine {
    */
   withRlsScope<T>(allowedSources: string[], fn: (engine: BrainEngine) => Promise<T>): Promise<T>;
 
+  /**
+   * v129: true ONLY on the engine handed to `withRlsScope`'s callback, and only
+   * when the database is genuinely enforcing the scope (Postgres role drop +
+   * GUC applied). Absent everywhere else, including PGLite's pass-through
+   * `withRlsScope`, so "not set" always means "the app layer is still the only
+   * enforcement" — the safe reading. Never set this by hand.
+   */
+  readonly rlsScoped?: boolean;
+
   // Pages CRUD
   /**
    * Fetch a page by slug.

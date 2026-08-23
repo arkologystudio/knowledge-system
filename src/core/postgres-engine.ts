@@ -960,6 +960,15 @@ export class PostgresEngine implements BrainEngine {
       const txEngine = Object.create(this) as PostgresEngine;
       Object.defineProperty(txEngine, 'sql', { get: () => scopedSql });
       Object.defineProperty(txEngine, '_sql', { value: scopedSql, writable: false });
+      // v129: mark that the DATABASE is now enforcing this request's scope. The
+      // app-layer filter (`sourceScopeOpts`) reads this to stand down, because
+      // its vocabulary is source ids while a grant may name per-artifact space
+      // labels — ANDing `source_id = ANY(['habitat'])` against pages whose
+      // source is 'default' returns zero rows and silently blanks a legitimate
+      // guest. Set ONLY here, on the real Postgres path, after the role drop and
+      // GUC have actually been applied: PGLite's withRlsScope is a pass-through
+      // no-op, so it never sets this and its app-layer filter stays primary.
+      Object.defineProperty(txEngine, 'rlsScoped', { value: true, writable: false });
       return fn(txEngine);
     }) as Promise<T>;
   }
