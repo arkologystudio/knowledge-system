@@ -314,3 +314,71 @@ alias backed by a deploy key, and `parseRemoteUrl` accepts HTTPS only, so the UR
 cannot be recorded in config. Recording the HTTPS equivalent would put config and
 clone in disagreement — that is `url-drift`, and sync refuses to run on it. The
 source is pulled by the systemd unit, not by gbrain's own clone management.
+
+## v129 — per-artifact access labels: deploy runbook
+
+Migration 129 moves the unit of access from the source to the artifact. It ships
+**dark**: the backfill gives every page its own `source_id` as a label, so an
+existing grant resolves to exactly the pre-v129 result set. Nothing changes for
+anyone until a steward calls `classify_page`.
+
+Three scripts in this directory. All are safe to re-run.
+
+| Script | When |
+|---|---|
+| `v129-verify.sql`   | after deploy, and after any rollback |
+| `v129-rollback.sql` | restore the v125 source predicate |
+| `v129-reapply.sql`  | go forward again after a rollback |
+
+### Deploy
+
+```bash
+# 1. Baseline BEFORE upgrading — you need this number to compare against.
+psql "$GBRAIN_DATABASE_URL" -tAc \
+  "SELECT count(*) FROM pages WHERE deleted_at IS NULL"
+
+# 2. Upgrade + migrate as usual (migration 129 runs on boot).
+
+# 3. Verify. Exits non-zero on the first failed check.
+psql "$GBRAIN_DATABASE_URL" -v ON_ERROR_STOP=1 \
+     -f ops/kb-vps/v129-verify.sql --set expect=v129
+
+# 4. Confirm the live page count matches step 1.
+```
+
+Then check **behaviour**, which no schema check can prove — it needs a real
+token: an internal caller still reads what it always could, and a label-only
+guest reads only labelled artifacts.
+
+### If it goes wrong
+
+The failure mode is **fail-closed, not a leak**: a wrong predicate matches
+nothing, so remote callers see an empty brain while the CLI (BYPASSRLS) still
+works. An empty brain is the symptom.
+
+```bash
+psql "$GBRAIN_DATABASE_URL" -v ON_ERROR_STOP=1 -f ops/kb-vps/v129-rollback.sql
+psql "$GBRAIN_DATABASE_URL" -v ON_ERROR_STOP=1 \
+     -f ops/kb-vps/v129-verify.sql --set expect=v125
+```
+
+This is a **schema-only** rollback and is safe with the v129 code still
+deployed — `sourceScopeOpts` stands down when RLS engages, and the restored
+policy reads the same GUC. Try it before reverting code; it is faster and
+reversible. A label-only guest correctly sees nothing afterwards, because the
+feature is off.
+
+Two things it deliberately does not do:
+
+- **Leaves `config.version` at 129.** The runner only applies migrations with
+  `version > current`, so a later `gbrain migrate` cannot silently undo the
+  rollback. The cost is that migrate will not roll you forward either — that is
+  what `v129-reapply.sql` is for.
+- **Keeps `spaces`, `page_spaces` and the triggers.** Nothing reads them while
+  rolled back, they are expensive to rebuild, and keeping them means rolling
+  forward needs no second backfill and leaves no window where a page is
+  unlabelled.
+
+One thing to know: v125 scoped only the near endpoint of a link. v129 requires
+both endpoints plus the origin, so rolling back **re-widens link reads** to the
+near-endpoint rule. That is what shipped before, but you are giving it back.
