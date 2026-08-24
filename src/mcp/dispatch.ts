@@ -335,6 +335,57 @@ export function buildOperationContext(
  * Returns a `ToolResult` with the same shape both MCP transports need:
  * `{ content: [{ type: 'text', text }], isError?: boolean }`.
  */
+/**
+ * Cached read of every source id, for `sourceScopeOpts`'s RLS stand-down.
+ *
+ * Uncached this fired once per RLS-wrapped call. That is invisible for a single
+ * `get_page`, and pathological for the web graph path: with no `export_graph`
+ * tool it issues one `get_links` per page — ~466 calls for the current corpus —
+ * so this was ~466 redundant round trips inside one page load.
+ *
+ * `sources` changes only when an operator adds or removes one, so a short TTL
+ * is ample and a stale read is harmless in the direction that matters: this
+ * list only NEUTRALISES the app-layer source predicate, it is never a grant.
+ * The caller's actual grant is the GUC the v129 policies read, which is
+ * resolved per request and never cached. A missed brand-new source means one
+ * caller briefly keeps the app-layer filter — degrading closed, not open.
+ *
+ * Failure yields `undefined`: the app filter stays in force and a label-only
+ * caller sees an empty corpus rather than a widened one. Failures are NOT
+ * cached, so a transient blip does not persist for the whole TTL.
+ */
+const SOURCE_IDS_TTL_MS = 30_000;
+
+/**
+ * Keyed on the ENGINE, not module-global. A module-global cache would hand one
+ * brain's source list to another whenever a single process serves more than one
+ * (mounts, tests, any future multi-brain host) — and since this list decides
+ * whether the app-layer source predicate stands down, that is the wrong thing
+ * to get wrong. A WeakMap also means a discarded engine takes its entry with it.
+ */
+const sourceIdsCache = new WeakMap<BrainEngine, { ids: string[]; at: number }>();
+
+/** Test seam: drop cached source lists. */
+export function _clearSourceIdsCache(engine?: BrainEngine): void {
+  if (engine) sourceIdsCache.delete(engine);
+  // A WeakMap cannot be cleared wholesale; tests that need a full reset pass
+  // their engine. Callers with no handle simply let GC do it.
+}
+
+async function readAllSourceIds(engine: BrainEngine): Promise<string[] | undefined> {
+  const now = Date.now();
+  const hit = sourceIdsCache.get(engine);
+  if (hit && now - hit.at < SOURCE_IDS_TTL_MS) return hit.ids;
+  try {
+    const rows = await engine.executeRaw<{ id: string }>('SELECT id FROM sources');
+    const ids = rows.map((r) => r.id).filter((id) => typeof id === 'string' && id.length > 0);
+    sourceIdsCache.set(engine, { ids, at: now });
+    return ids;
+  } catch {
+    return undefined; // not cached — a blip must not persist for the whole TTL
+  }
+}
+
 export async function dispatchToolCall(
   engine: BrainEngine,
   name: string,
@@ -397,15 +448,7 @@ export async function dispatchToolCall(
     // instead. Best-effort: on failure we pass nothing, the app filter stays
     // in force, and a label-only caller sees an empty corpus. That degrades
     // closed, never open.
-    let rlsAllSources: string[] | undefined;
-    if (rlsWrapped) {
-      try {
-        const rows = await engine.executeRaw<{ id: string }>('SELECT id FROM sources');
-        rlsAllSources = rows.map((r) => r.id).filter((id) => typeof id === 'string' && id.length > 0);
-      } catch {
-        rlsAllSources = undefined;
-      }
-    }
+    const rlsAllSources = rlsWrapped ? await readAllSourceIds(engine) : undefined;
     const result = rlsWrapped
       ? await engine.withRlsScope(
           resolveRlsAllowedSources(ctx),
