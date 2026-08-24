@@ -1,5 +1,42 @@
 # TODOS
 
+## Per-artifact access labels — follow-ups (filed v0.43.0.23)
+
+- [ ] **P1 — audit `RLS_WRAPPED_READ_OPS` op by op.** Only ten read ops run under the
+  NOBYPASSRLS role. Everything else (`traverse_graph`, `recall`, `think`, `find_experts`,
+  the chronicle reads) runs on the BYPASSRLS path with the app-layer source filter as its
+  ONLY enforcement — and that filter cannot express a per-artifact label. Those ops are
+  fail-CLOSED for a label-only caller today (a label never matches a `source_id`, so they
+  return nothing), so this is a completeness gap, not a leak. But "returns nothing" is
+  indistinguishable from "is broken" to a guest, and the gap widens with every op added.
+  Extending the list means granting `gbrain_request` SELECT on whatever tables each op
+  touches and adding a Postgres-backed isolation test per op — the isolation tests are the
+  deliverable, not the allowlist edit.
+
+- [ ] **P2 — no `space_add` op.** Creating a space is currently hand-written SQL
+  (`INSERT INTO spaces …`) because the only seeded rows come from the source mirror trigger
+  plus `public`. `classify_page` deliberately refuses an unknown space rather than minting
+  one, so an operator cannot open a new audience without DB access. Wants a `users_admin` op
+  with the same id grammar as `GOV_SPACES`.
+
+- [ ] **P2 — `[last-retrieved] write-back failed: permission denied for table pages`.**
+  Harmless (best-effort, swallowed) but it fires on EVERY RLS-scoped read, because
+  `gbrain_request` holds SELECT only. Either grant the narrow UPDATE, or skip the write-back
+  when `engine.rlsScoped` is set. Currently just log noise that will train operators to
+  ignore permission errors.
+
+- [ ] **P3 — governance `GET /v1/admin/spaces` read-through.** `knowledge-system-web`
+  parses `GOV_SPACES` itself and now duplicates governance's `id[:label[:class]]` grammar to
+  read the class. Deliberate — reading through would couple the grant editor to lockstep
+  deploys of both services — but it is duplicated parsing of a security-relevant value, and
+  the two can drift. Pinned on both sides by tests over the cases where they could disagree.
+
+- [ ] **P3 — passage-level access is NOT supported, by design.** Labels are per-artifact, so
+  an artifact that is 90% shareable with two sensitive paragraphs has no correct label. The
+  answer is to SPLIT it: if an artifact has mixed sensitivity it is not atomic. Recorded so
+  the decision is not silently relitigated. `content_chunks` is structurally where a
+  passage-level label would live if that ever changes.
+
 ## MCP stdio session hygiene (filed v0.43.0.18)
 
 - [ ] **P2 — `gbrain serve` (stdio) should not depend on stdin EOF alone to exit.**

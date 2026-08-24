@@ -262,6 +262,19 @@ The whole loop is described in [`docs/architecture/topologies.md`](docs/architec
 
 **Eval framework.** `gbrain eval longmemeval` runs the public [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval) benchmark against your hybrid retrieval. `gbrain eval export` + `gbrain eval replay` capture real queries and replay them against code changes (set `GBRAIN_CONTRIBUTOR_MODE=1`). `gbrain eval cross-modal` cross-checks an output against the task using three different-provider frontier models. `gbrain eval retrieval-quality` runs NamedThingBench, which hard-gates the named-thing retrieval families (title-substring, alias-synonym, generic-to-named, multi-chunk-dilution) so a regression in "find the page this query names" fails CI loudly. Full methodology in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](docs/eval/SEARCH_MODE_METHODOLOGY.md).
 
+**Per-artifact access (v0.43.0.23).** Sharing used to be all-or-nothing: the smallest thing you
+could grant was a whole source, so showing an outside collaborator one folder meant handing over the
+brain. Access is now a property of the ARTIFACT — each page carries a set of space labels, a grant
+carries a set, and you see the intersection. `gbrain classify <slug> --add <space>` is the steward
+act; `gbrain page-spaces <slug>` reads it back. Enforcement is a row-level-security predicate in
+Postgres, not an application filter, so an op that forgets to filter still cannot over-return. Links
+respect it in both directions: an edge pointing at an artifact you cannot read does not exist for
+you, so a shared page does not leak the titles of its unshared neighbours. Labels live in a table an
+admin controls, never in frontmatter — otherwise any agent with write access could reclassify the
+corpus. Migration 129 ships DARK: every page is seeded with its own source as a label, so existing
+grants resolve to exactly what they did before and nothing changes until you classify something.
+Operator runbook (verify / rollback / re-apply) in [`ops/kb-vps/`](ops/kb-vps/).
+
 **Brain consistency.** `gbrain eval suspected-contradictions` samples retrieval pairs, layered date pre-filter, query-conditioned LLM judge, persistent cache. Surfaces conflicts between takes + facts the agent has written. Wired into the daily dream cycle.
 
 **Agent-authored schema (v0.40.7.0).** Your brain has a shape — what page types exist (`person`, `meeting`, `paper`, `case`, `lab-result`), what they link to (`attended`, `authored`, `prescribed-by`), what facts get extracted automatically. The default ships with 27 universal types, but your brain's actual shape is not the default shape. Agents can now evolve that shape on your behalf via 33 `gbrain schema` CLI verbs + a schema surface over MCP: `schema_apply_mutations` (batched, admin scope, NOT localOnly so remote agents reach it over HTTPS), `schema_fork_pack` to obtain a writable pack in the first place, and `schema_validate_pack` / `schema_show_pack` / `schema_diff_packs` to inspect before committing. Activating a pack stays a local, human step by design. Atomic file locks, audit log with the agent's identity, chunked UPDATE backfill in 1000-row batches that never wedge concurrent writers. The brain stops being a pile of notes and becomes something with structure. **Why it matters:** [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator). **5-minute walkthrough:** [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md). **Agent skill:** [`skills/schema-author/SKILL.md`](skills/schema-author/SKILL.md).
