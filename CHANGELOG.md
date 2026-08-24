@@ -2,6 +2,48 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.23] - 2026-08-23
+
+### Added
+
+- **Per-artifact access labels.** The unit of access moves from the source to
+  the artifact, so a folder of a wiki can be shared with an external guest
+  without granting the whole brain. Migration 129 adds `spaces` + `page_spaces`
+  and rewrites the row-level-security predicate to a per-artifact label
+  intersection.
+
+  **Ships dark.** The backfill seeds each page's label set with its own
+  `source_id` and registers every source as a space, so an existing grant
+  resolves to exactly the previous result set. Nothing changes for anyone until
+  a steward classifies something. Two triggers guarantee no page can exist
+  unlabelled, whichever write path created it.
+
+- **`classify_page` / `get_page_spaces`** — the only sanctioned write path to an
+  artifact's label set, deliberately kept off `put_page`, `add_tag` and
+  ingestion: authority over what an artifact says and authority over who may
+  read it have to be different authorities. Guarded by read-the-artifact and
+  hold-the-target-space, plus a guard that refuses to leave an artifact with no
+  labels (which would make it unreachable by every scoped caller).
+
+- **Deploy runbook** for the migration — `ops/kb-vps/v129-{verify,rollback,reapply}.sql`
+  and a README section. Verify exits non-zero on the first failed check so it can
+  gate a deploy; rollback restores the previous predicate without a code revert.
+
+### Changed
+
+- Link reads now require BOTH endpoints (and the origin, when set) to be visible.
+  An edge into an artifact the caller cannot read no longer exists for them.
+- `list_pages` joins the DB-scoped read set, so an enumeration cannot return more
+  than the caller's grant.
+
+### Fixed
+
+- The app-layer source filter stood between a label-based grant and the rows it
+  allowed, so such a caller read nothing at all. It now defers when the database
+  is demonstrably enforcing the same grant, keyed on the engine rather than on
+  the request, so engines without row-level security keep the app filter as their
+  sole enforcement.
+
 ## [0.43.0.22] - 2026-08-20
 
 **A machine-managed mirror can no longer diverge.** Sync stops pulling
