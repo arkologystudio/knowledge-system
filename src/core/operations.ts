@@ -310,6 +310,15 @@ export interface OperationContext {
    */
   auth?: AuthInfo;
   /**
+   * v129: every source id in the brain, resolved once per request by the MCP
+   * dispatcher BEFORE it drops to the RLS role. Consumed only by
+   * `sourceScopeOpts` when `engine.rlsScoped` is set, to neutralise the
+   * app-layer source predicate without tripping the engines' "no scope means
+   * source 'default'" fallthrough. Never a grant, never an authorisation input
+   * — the caller's actual grant is the GUC the v129 policies read.
+   */
+  rlsAllSources?: string[];
+  /**
    * True when the caller is remote/untrusted (MCP over stdio/HTTP, or any agent-facing entry point).
    * False for local CLI invocations by the owner of the machine.
    *
@@ -439,6 +448,35 @@ export interface OperationContext {
  * same precedence ladder — drift between sites is the bug class.
  */
 export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sourceIds?: string[] } {
+  // v129: when the DATABASE is enforcing this request (ctx.engine.rlsScoped —
+  // set only by the Postgres withRlsScope after the role drop + GUC), stand
+  // down. The grant's vocabulary is now SPACE ids, which may be per-artifact
+  // labels rather than source ids; ANDing `source_id = ANY(['habitat'])`
+  // against pages whose source is 'default' matches nothing and silently blanks
+  // a legitimate guest — the corpus looks empty rather than filtered.
+  //
+  // This is not a loosening: the v129 policies enforce the SAME grant array,
+  // per artifact, one layer down and inside the transaction, and they are
+  // fail-closed on an empty/unset GUC. Dropping a filter that can no longer
+  // express the grant is what makes the DB predicate authoritative rather than
+  // double-applied in two different vocabularies.
+  //
+  // Deliberately keyed on the ENGINE, not on ctx.remote or the op name: the
+  // flag exists only when RLS demonstrably engaged, so PGLite (pass-through
+  // withRlsScope), unwrapped ops, write ops, and the trusted CLI path all keep
+  // the app-layer filter as their sole enforcement, unchanged.
+  //
+  // We return EVERY source id rather than `{}`. An empty fragment does NOT mean
+  // "no filter" to the engines: 26 read methods per engine end in
+  // `opts?.sourceId ?? 'default'`, so an unscoped call silently narrows to the
+  // literal source 'default' and returns nothing for any other source. Handing
+  // back the full source list keeps those methods on their `sourceIds` array
+  // branch, where the predicate is a tautology and the v129 policies below do
+  // the actual per-artifact work. The list is resolved once per request in the
+  // dispatcher, BEFORE the role drop, since gbrain_request cannot widen it.
+  if (ctx.engine?.rlsScoped === true && ctx.rlsAllSources && ctx.rlsAllSources.length > 0) {
+    return { sourceIds: ctx.rlsAllSources };
+  }
   const allowed = ctx.auth?.allowedSources;
   // Treat an empty `allowedSources: []` as "no federated read scope" — the
   // op-handler defers to scalar `ctx.sourceId` below. An attacker-controlled
@@ -6211,6 +6249,292 @@ const pat_revoke: Operation = {
   cliHints: { name: 'pat-revoke' },
 };
 
+/**
+ * v129 per-artifact access labels — steward surface.
+ *
+ * `page_spaces` is the artifact's access control list, and these two ops are the
+ * ONLY sanctioned way to write it. Deliberately NOT reachable through put_page,
+ * commit_page, add_tag, or ingestion: the authority over what an artifact SAYS
+ * and the authority over WHO MAY READ IT have to be different authorities, or
+ * a routine frontmatter pass by any write-scoped agent silently reclassifies
+ * the corpus.
+ *
+ * Authority rule enforced below:
+ *   (1) users_admin scope           — the credential is a steward credential
+ *   (2) the caller can READ the page — you cannot share what you cannot see
+ *   (3) every target space is one the caller already holds — you cannot push an
+ *       artifact into an audience you are not part of
+ *
+ * (2)+(3) are the capability-safe half: a Habitat steward cannot expose Zoa
+ * material (fails 2) and cannot file anything into `zoa` (fails 3). Trusted
+ * local CLI callers (ctx.remote === false — the machine's owner) skip 2 and 3,
+ * matching the trust boundary the rest of the codebase uses.
+ *
+ * DEFERRED, tracked: the plan's stricter rule is "hold role=admin on the target
+ * space" against principal_source_grants. AuthInfo carries no principal id today
+ * (only clientId + scopes + allowedSources), so there is nothing to join on.
+ * When the governance introspection response's `principal` is threaded into
+ * AuthInfo, tighten (3) from "holds the space" to "holds admin on the space" —
+ * that is a narrowing, so it cannot retro-widen anything granted meanwhile.
+ */
+const get_page_spaces: Operation = {
+  name: 'get_page_spaces',
+  description:
+    'Read the access labels (spaces) carried by one artifact. The steward read ' +
+    'path behind the classification UI. users_admin-scoped because the label ' +
+    'set is itself sensitive — it names the audiences an artifact belongs to.',
+  params: {
+    slug: { type: 'string', required: true, description: 'Page slug.' },
+  },
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    const page = await resolveClassifiablePage(ctx, slug);
+    const rows = await ctx.engine.executeRaw<{ space_id: string; granted_at: string }>(
+      'SELECT space_id, granted_at FROM page_spaces WHERE page_id = $1 ORDER BY space_id',
+      [page.id],
+    );
+    return {
+      slug,
+      page_id: page.id,
+      spaces: rows.map((r) => r.space_id),
+      granted_at: Object.fromEntries(rows.map((r) => [r.space_id, r.granted_at])),
+    };
+  },
+  cliHints: { name: 'page-spaces', positional: ['slug'] },
+};
+
+const classify_page: Operation = {
+  name: 'classify_page',
+  description:
+    'Set the access labels (spaces) on one artifact — the steward act that ' +
+    'decides who may retrieve it. Add and/or remove space ids; idempotent on ' +
+    'both. Refuses to leave an artifact with zero labels (that would make it ' +
+    'invisible to every scoped caller, including its own stewards). Returns the ' +
+    'resulting label set.',
+  params: {
+    slug: { type: 'string', required: true, description: 'Page slug to classify.' },
+    add: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Space ids to attach. Each must already exist (create spaces deliberately, not as a side effect of classifying).',
+    },
+    remove: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Space ids to detach.',
+    },
+  },
+  mutating: true,
+  scope: 'users_admin',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    const add = normaliseSpaceList(p.add, 'add');
+    const remove = normaliseSpaceList(p.remove, 'remove');
+
+    if (add.length === 0 && remove.length === 0) {
+      throw new OperationError(
+        'invalid_params',
+        'classify_page needs at least one of add[] or remove[]',
+        'Pass add: ["habitat"] to share an artifact, or remove: [...] to withdraw it. Use get_page_spaces to read the current labels.',
+      );
+    }
+    const both = add.filter((s) => remove.includes(s));
+    if (both.length > 0) {
+      throw new OperationError(
+        'invalid_params',
+        `space(s) appear in both add and remove: ${both.join(', ')}`,
+        'Decide one direction per space — the result would depend on apply order otherwise.',
+      );
+    }
+
+    const page = await resolveClassifiablePage(ctx, slug);
+    await assertSpacesExist(ctx, [...add, ...remove]);
+    // You may only file an artifact into an audience you belong to. Checked on
+    // `add` only: withdrawing an artifact from a space is always safe, and
+    // blocking it would strand content in an audience nobody present can clear.
+    await assertCallerHoldsSpaces(ctx, add);
+
+    const current = await ctx.engine.executeRaw<{ space_id: string }>(
+      'SELECT space_id FROM page_spaces WHERE page_id = $1 ORDER BY space_id',
+      [page.id],
+    );
+    const before = current.map((r) => r.space_id);
+    const after = before.filter((s) => !remove.includes(s));
+    for (const s of add) if (!after.includes(s)) after.push(s);
+    after.sort();
+
+    // The empty label set is the fail-closed default for a NEW page, never a
+    // state a steward should be able to reach by subtraction — an artifact with
+    // no labels is unreachable by every scoped caller and only resurfaces via a
+    // BYPASSRLS path. Refuse rather than silently orphan it.
+    if (after.length === 0) {
+      throw new OperationError(
+        'invalid_params',
+        `removing ${remove.join(', ')} would leave '${slug}' with no access labels, making it unreachable by every scoped caller`,
+        'Add the label the artifact should keep in the same call, or move it to an internal space instead of stripping it bare.',
+      );
+    }
+
+    if (ctx.dryRun) {
+      return { dry_run: true, action: 'classify_page', slug, page_id: page.id, before, after };
+    }
+
+    if (remove.length > 0) {
+      await ctx.engine.executeRaw(
+        'DELETE FROM page_spaces WHERE page_id = $1 AND space_id = ANY($2::text[])',
+        [page.id, remove],
+      );
+    }
+    for (const spaceId of add) {
+      await ctx.engine.executeRaw(
+        'INSERT INTO page_spaces (page_id, space_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [page.id, spaceId],
+      );
+    }
+
+    const verified = await ctx.engine.executeRaw<{ space_id: string }>(
+      'SELECT space_id FROM page_spaces WHERE page_id = $1 ORDER BY space_id',
+      [page.id],
+    );
+    return {
+      status: 'ok',
+      slug,
+      page_id: page.id,
+      before,
+      spaces: verified.map((r) => r.space_id),
+      added: add.filter((s) => !before.includes(s)),
+      removed: remove.filter((s) => before.includes(s)),
+    };
+  },
+  cliHints: { name: 'classify', positional: ['slug'] },
+};
+
+/** Space ids share the source-id grammar (governance SPACE_ID_RE). */
+const SPACE_ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
+
+function normaliseSpaceList(raw: unknown, field: string): string[] {
+  if (raw === undefined || raw === null) return [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  const out: string[] = [];
+  for (const item of list) {
+    if (typeof item !== 'string') {
+      throw new OperationError('invalid_params', `${field}[] must contain strings`, 'Pass space ids as strings.');
+    }
+    const id = item.trim();
+    if (id.length === 0) continue;
+    if (!SPACE_ID_RE.test(id)) {
+      throw new OperationError(
+        'invalid_params',
+        `'${id}' is not a valid space id`,
+        'Space ids match [a-z0-9][a-z0-9_-]* — same grammar as source ids.',
+      );
+    }
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Resolve the page, enforcing "you cannot share what you cannot see".
+ *
+ * classify_page is a WRITE op, so the dispatcher does not wrap it in the RLS
+ * read role (RLS_WRAPPED_READ_OPS is read-only) — it runs BYPASSRLS. The
+ * visibility check therefore has to be made explicitly here, in the same terms
+ * the v129 policies use, rather than inherited from the database.
+ */
+async function resolveClassifiablePage(
+  ctx: OperationContext,
+  slug: string,
+): Promise<{ id: number }> {
+  if (!slug || typeof slug !== 'string') {
+    throw new OperationError('invalid_params', 'slug is required', 'Pass the page slug to classify.');
+  }
+  const scope = sourceScopeOpts(ctx);
+  const params: unknown[] = [slug];
+  let sourceClause = '';
+  if (scope.sourceIds && scope.sourceIds.length > 0) {
+    params.push(scope.sourceIds);
+    sourceClause = ` AND p.source_id = ANY($${params.length}::text[])`;
+  } else if (scope.sourceId) {
+    params.push(scope.sourceId);
+    sourceClause = ` AND p.source_id = $${params.length}`;
+  }
+
+  // Remote callers additionally have to hold one of the artifact's own labels.
+  // A source-level clearance is not enough once artifacts inside one source
+  // differ — that gap is the whole reason v129 exists.
+  let labelClause = '';
+  if (ctx.remote !== false) {
+    const held = callerSpaces(ctx);
+    if (held.length === 0) {
+      throw new OperationError(
+        'permission_denied',
+        'caller holds no spaces, so no artifact is classifiable',
+        'Request a grant on the space this artifact belongs to.',
+      );
+    }
+    params.push(held);
+    labelClause =
+      ` AND EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = p.id` +
+      ` AND ps.space_id = ANY($${params.length}::text[]))`;
+  }
+
+  const rows = await ctx.engine.executeRaw<{ id: number }>(
+    `SELECT p.id FROM pages p
+      WHERE p.slug = $1 AND p.deleted_at IS NULL${sourceClause}${labelClause}
+      LIMIT 1`,
+    params,
+  );
+  if (rows.length === 0) {
+    // Deliberately not_found, never permission_denied: a caller who may not read
+    // the artifact must not learn it exists. Same reasoning as the silent
+    // edge-drop in the v129 links policy.
+    throw new OperationError('not_found', `page '${slug}' not found`, 'Check the slug, or the artifact may be outside your grant.');
+  }
+  return { id: Number(rows[0].id) };
+}
+
+/** The space ids the caller holds, via the same ladder the read path uses. */
+function callerSpaces(ctx: OperationContext): string[] {
+  const scope = sourceScopeOpts(ctx);
+  if (scope.sourceIds && scope.sourceIds.length > 0) return scope.sourceIds;
+  if (scope.sourceId) return [scope.sourceId];
+  return [];
+}
+
+async function assertSpacesExist(ctx: OperationContext, spaceIds: readonly string[]): Promise<void> {
+  if (spaceIds.length === 0) return;
+  const unique = Array.from(new Set(spaceIds));
+  const rows = await ctx.engine.executeRaw<{ id: string }>(
+    'SELECT id FROM spaces WHERE id = ANY($1::text[])',
+    [unique],
+  );
+  const known = new Set(rows.map((r) => r.id));
+  const missing = unique.filter((s) => !known.has(s));
+  if (missing.length > 0) {
+    throw new OperationError(
+      'invalid_params',
+      `unknown space(s): ${missing.join(', ')}`,
+      'Create the space first. Spaces are created deliberately, not as a side effect of classifying an artifact — a typo would otherwise mint a private audience of one and look like it worked.',
+    );
+  }
+}
+
+async function assertCallerHoldsSpaces(ctx: OperationContext, spaceIds: readonly string[]): Promise<void> {
+  if (spaceIds.length === 0) return;
+  if (ctx.remote === false) return; // trusted local CLI — the machine's owner.
+  const held = new Set(callerSpaces(ctx));
+  const outside = spaceIds.filter((s) => !held.has(s));
+  if (outside.length > 0) {
+    throw new OperationError(
+      'permission_denied',
+      `cannot classify into space(s) outside your grant: ${outside.join(', ')}`,
+      'You can only file an artifact into an audience you belong to. Ask for a grant on that space first.',
+    );
+  }
+}
+
 export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, commit_page, delete_page, list_pages,
@@ -6264,6 +6588,10 @@ export const operations: Operation[] = [
   // Knowledge System KS-A: principal identity + per-space grant provisioning
   // (users_admin-scoped). Feeds mintPrincipalToken / issuePersonalAccessToken.
   principals_add, grant_add, grant_revoke, pat_issue, pat_revoke,
+  // v129: per-artifact access labels. The ONLY sanctioned write path to
+  // page_spaces — see the block comment above classify_page for why this is
+  // kept off put_page / add_tag / ingestion.
+  classify_page, get_page_spaces,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.42.x (#2390): Life Chronicle timeline reads

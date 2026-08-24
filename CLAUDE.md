@@ -56,9 +56,16 @@ Per-file detail is in `docs/architecture/KEY_FILES.md`.
 - **Trust is fail-closed.** `OperationContext.remote` is REQUIRED on the type. Anything not
   strictly `false` is treated as remote/untrusted (`ctx.remote === false` for trusted-only
   sites; `ctx.remote !== false` for untrust-unless-explicit-false). Don't default it falsy.
-- **Source isolation.** Every read-side op routes through `sourceScopeOpts(ctx)`; precedence
-  is federated array (`ctx.auth.allowedSources`) > scalar (`ctx.sourceId`) > nothing. Don't
-  hand-roll source filtering — a missed thread is a cross-source data leak.
+- **Scope isolation.** Every read-side op routes through `sourceScopeOpts(ctx)`; precedence is
+  DB-enforcing (`ctx.engine.rlsScoped`) > federated array (`ctx.auth.allowedSources`) > scalar
+  (`ctx.sourceId`) > nothing. Don't hand-roll source filtering — a missed thread is a leak.
+  A grant names SPACES, which since v129 may be per-artifact labels rather than source ids, so
+  when RLS is demonstrably engaged the app filter stands down and the DB predicate is
+  authoritative — filtering `source_id` against a label matches nothing and blanks a legitimate
+  caller. Keyed on the ENGINE, never `ctx.remote`/op name: PGLite's `withRlsScope` is a
+  pass-through, never sets the flag, and keeps the app filter as its sole enforcement. Note an
+  empty scope fragment does NOT mean "no filter" — 26 read methods per engine read it as the
+  literal source `default`, so the stand-down returns every source id instead.
 - **JSONB: never `JSON.stringify` into a `::jsonb` cast.** postgres.js double-encodes it (a jsonb
   string scalar); PGLite hides the bug. This bites BOTH spellings — the template form
   (`${JSON.stringify(x)}::jsonb`) AND the positional form (`executeRaw(\`…$N::jsonb\`, [JSON.stringify(x)])`,

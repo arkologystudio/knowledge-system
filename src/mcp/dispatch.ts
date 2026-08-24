@@ -51,6 +51,13 @@ const RLS_WRAPPED_READ_OPS: ReadonlySet<string> = new Set([
   'get_timeline',
   'list_link_sources',
   'search_by_image',
+  // v129: enumeration. The web UI builds its ENTIRE roster from list_pages
+  // (loadRoster in knowledge-system-web/lib/source/http-source.ts), so without
+  // DB-level scoping here a guest holding only per-artifact labels sees an
+  // empty knowledge base — the app-layer source filter cannot express a label
+  // grant. Reads only `pages` (+ `tags` for the tag filter), both already
+  // granted to gbrain_request by v125.
+  'list_pages',
 ]);
 
 /**
@@ -381,10 +388,28 @@ export async function dispatchToolCall(
     // today's pooled behavior; PGLite's `withRlsScope` is a pass-through no-op.
     // The app-layer `sourceScopeOpts` ladder stays primary — this is
     // defense-in-depth beneath it.
-    const result = (ctx.remote === true && RLS_WRAPPED_READ_OPS.has(op.name))
+    const rlsWrapped = ctx.remote === true && RLS_WRAPPED_READ_OPS.has(op.name);
+    // v129: resolve the brain's source list BEFORE dropping to gbrain_request
+    // (that role cannot widen it, and reading `sources` under it would be
+    // scoped too). `sourceScopeOpts` uses this to neutralise the app-layer
+    // source predicate once the DB is enforcing — see the comment there for why
+    // an empty scope fragment would silently narrow to source 'default'
+    // instead. Best-effort: on failure we pass nothing, the app filter stays
+    // in force, and a label-only caller sees an empty corpus. That degrades
+    // closed, never open.
+    let rlsAllSources: string[] | undefined;
+    if (rlsWrapped) {
+      try {
+        const rows = await engine.executeRaw<{ id: string }>('SELECT id FROM sources');
+        rlsAllSources = rows.map((r) => r.id).filter((id) => typeof id === 'string' && id.length > 0);
+      } catch {
+        rlsAllSources = undefined;
+      }
+    }
+    const result = rlsWrapped
       ? await engine.withRlsScope(
           resolveRlsAllowedSources(ctx),
-          (scopedEngine) => op.handler({ ...ctx, engine: scopedEngine }, safeParams),
+          (scopedEngine) => op.handler({ ...ctx, engine: scopedEngine, rlsAllSources }, safeParams),
         )
       : await op.handler(ctx, safeParams);
     const out: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };

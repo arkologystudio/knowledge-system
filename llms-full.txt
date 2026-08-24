@@ -205,9 +205,16 @@ Per-file detail is in `docs/architecture/KEY_FILES.md`.
 - **Trust is fail-closed.** `OperationContext.remote` is REQUIRED on the type. Anything not
   strictly `false` is treated as remote/untrusted (`ctx.remote === false` for trusted-only
   sites; `ctx.remote !== false` for untrust-unless-explicit-false). Don't default it falsy.
-- **Source isolation.** Every read-side op routes through `sourceScopeOpts(ctx)`; precedence
-  is federated array (`ctx.auth.allowedSources`) > scalar (`ctx.sourceId`) > nothing. Don't
-  hand-roll source filtering — a missed thread is a cross-source data leak.
+- **Scope isolation.** Every read-side op routes through `sourceScopeOpts(ctx)`; precedence is
+  DB-enforcing (`ctx.engine.rlsScoped`) > federated array (`ctx.auth.allowedSources`) > scalar
+  (`ctx.sourceId`) > nothing. Don't hand-roll source filtering — a missed thread is a leak.
+  A grant names SPACES, which since v129 may be per-artifact labels rather than source ids, so
+  when RLS is demonstrably engaged the app filter stands down and the DB predicate is
+  authoritative — filtering `source_id` against a label matches nothing and blanks a legitimate
+  caller. Keyed on the ENGINE, never `ctx.remote`/op name: PGLite's `withRlsScope` is a
+  pass-through, never sets the flag, and keeps the app filter as its sole enforcement. Note an
+  empty scope fragment does NOT mean "no filter" — 26 read methods per engine read it as the
+  literal source `default`, so the stand-down returns every source id instead.
 - **JSONB: never `JSON.stringify` into a `::jsonb` cast.** postgres.js double-encodes it (a jsonb
   string scalar); PGLite hides the bug. This bites BOTH spellings — the template form
   (`${JSON.stringify(x)}::jsonb`) AND the positional form (`executeRaw(\`…$N::jsonb\`, [JSON.stringify(x)])`,
@@ -1755,6 +1762,19 @@ The whole loop is described in [`docs/architecture/topologies.md`](docs/architec
 **43 curated skills.** Routing lives in [`skills/RESOLVER.md`](skills/RESOLVER.md). Covers signal capture, ingest (idea / media / meeting), enrichment, querying, brain ops, citation fixing, daily task management, cron scheduling, reports, voice, soul audit, skill creation, eval framework, and migrations. Skills are markdown files (tool-agnostic), packaged as a single skillpack the installer drops into your agent workspace.
 
 **Eval framework.** `gbrain eval longmemeval` runs the public [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval) benchmark against your hybrid retrieval. `gbrain eval export` + `gbrain eval replay` capture real queries and replay them against code changes (set `GBRAIN_CONTRIBUTOR_MODE=1`). `gbrain eval cross-modal` cross-checks an output against the task using three different-provider frontier models. `gbrain eval retrieval-quality` runs NamedThingBench, which hard-gates the named-thing retrieval families (title-substring, alias-synonym, generic-to-named, multi-chunk-dilution) so a regression in "find the page this query names" fails CI loudly. Full methodology in [`docs/eval/SEARCH_MODE_METHODOLOGY.md`](docs/eval/SEARCH_MODE_METHODOLOGY.md).
+
+**Per-artifact access (v0.43.0.23).** Sharing used to be all-or-nothing: the smallest thing you
+could grant was a whole source, so showing an outside collaborator one folder meant handing over the
+brain. Access is now a property of the ARTIFACT — each page carries a set of space labels, a grant
+carries a set, and you see the intersection. `gbrain classify <slug> --add <space>` is the steward
+act; `gbrain page-spaces <slug>` reads it back. Enforcement is a row-level-security predicate in
+Postgres, not an application filter, so an op that forgets to filter still cannot over-return. Links
+respect it in both directions: an edge pointing at an artifact you cannot read does not exist for
+you, so a shared page does not leak the titles of its unshared neighbours. Labels live in a table an
+admin controls, never in frontmatter — otherwise any agent with write access could reclassify the
+corpus. Migration 129 ships DARK: every page is seeded with its own source as a label, so existing
+grants resolve to exactly what they did before and nothing changes until you classify something.
+Operator runbook (verify / rollback / re-apply) in [`ops/kb-vps/`](ops/kb-vps/).
 
 **Brain consistency.** `gbrain eval suspected-contradictions` samples retrieval pairs, layered date pre-filter, query-conditioned LLM judge, persistent cache. Surfaces conflicts between takes + facts the agent has written. Wired into the daily dream cycle.
 
