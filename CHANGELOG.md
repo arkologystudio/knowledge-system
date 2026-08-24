@@ -2,6 +2,22 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.24] - 2026-08-23
+
+### Fixed
+
+- **Cache the source-id read behind the RLS scope stand-down.** It fired once
+  per RLS-wrapped call. Invisible for a single read; pathological for a graph
+  load, which issues one call per page and so paid hundreds of redundant round
+  trips inside one request.
+
+  Keyed on the ENGINE rather than module-global: a global cache would hand one
+  brain's source list to another whenever a process serves more than one, and
+  that list decides whether the app-layer source predicate stands down. A
+  failed read is deliberately NOT cached, so a transient blip cannot pin the
+  app-layer filter on for the whole TTL — and the failure direction degrades
+  closed, never open.
+
 ## [0.43.0.23] - 2026-08-23
 
 ### Added
