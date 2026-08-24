@@ -58,6 +58,11 @@ const RLS_WRAPPED_READ_OPS: ReadonlySet<string> = new Set([
   // grant. Reads only `pages` (+ `tags` for the tag filter), both already
   // granted to gbrain_request by v125.
   'list_pages',
+  // v0.43.0.25: bulk graph read. MUST be wrapped — it returns the whole node and
+  // edge set in one payload, so the DB predicate is the only thing standing
+  // between a scoped caller and the entire graph. Reads `pages`, `links` and
+  // `tags`, all granted to gbrain_request by v125.
+  'export_graph',
 ]);
 
 /**
