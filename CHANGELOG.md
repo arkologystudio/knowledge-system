@@ -2,6 +2,28 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.25] - 2026-08-23
+
+### Added
+
+- **`export_graph` — the whole graph in one call.** Without it a client wanting
+  the graph had to enumerate the corpus and then call `get_links` once per page:
+  ~471 round trips for a 466-page brain, each with its own token check and
+  transaction. Worse than slow, it was LOSSY — the web client's fallback
+  swallows per-page failures, so a slow endpoint quietly produced an
+  under-connected graph that looked plausible. Measured on a real brain: 697 of
+  2437 edges surviving.
+
+  Two queries replace all of it. Scoped like any other read: on the RLS
+  allowlist, so the database filters both nodes and edges for a remote caller.
+  An edge is returned only when BOTH endpoints are visible, so a shared artifact
+  cannot disclose the existence or title of an unshared neighbour it links to.
+  `limit` is a denial-of-service bound rather than pagination — a caller that
+  hits it gets `truncated: true` and should not render the result as a whole
+  graph.
+
+  CLI: `gbrain export-graph`.
+
 ## [0.43.0.24] - 2026-08-23
 
 ### Fixed

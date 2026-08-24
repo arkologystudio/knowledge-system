@@ -6535,6 +6535,155 @@ async function assertCallerHoldsSpaces(ctx: OperationContext, spaceIds: readonly
   }
 }
 
+/**
+ * v0.43.0.25: bulk graph read.
+ *
+ * WHY: without this, a client that wants the whole graph has to enumerate the
+ * corpus with `list_pages` and then call `get_links` ONCE PER PAGE. For a
+ * 466-page brain that is ~471 HTTPS round trips for one page load, each with
+ * its own token check and RLS transaction. The knowledge-system-web graph view
+ * did exactly that, took tens of seconds, and silently LOST edges: its fallback
+ * swallows per-page failures (`catch { failures++ }`), so a slow endpoint
+ * quietly produced an under-connected graph that looked plausible. Measured on
+ * the live brain: 697 of 2437 edges surviving.
+ *
+ * Two queries replace all of it.
+ *
+ * SCOPING: no source predicate is applied here on purpose. This op is on the
+ * `RLS_WRAPPED_READ_OPS` allowlist, so for a remote caller the DATABASE filters
+ * both queries — `pages` by the caller's spaces, and `links` by the v129 policy
+ * requiring BOTH endpoints (and the origin) to be visible. That last part is
+ * what makes the edge list safe to hand over wholesale: an edge into an artifact
+ * the caller cannot read does not exist for them, so a shared page cannot leak
+ * the titles or even the existence of its unshared neighbours.
+ *
+ * For a TRUSTED local caller (`ctx.remote === false`, the CLI) RLS does not
+ * engage, and `sourceScopeOpts` supplies the scalar/federated source filter
+ * instead — same as every other read op.
+ *
+ * The `limit` is a denial-of-service bound, not a pagination API. A caller that
+ * hits it gets `truncated: true` and should keep using the per-page path rather
+ * than silently render a partial graph — the exact failure this op exists to
+ * remove.
+ */
+const export_graph: Operation = {
+  name: 'export_graph',
+  description:
+    'Bulk graph read: every visible page as a node and every visible link as an ' +
+    'edge, in one call. Replaces enumerate-then-get_links-per-page (~1 call per ' +
+    'page). Scoped like any other read — for a remote caller the database filters ' +
+    'both nodes and edges, and an edge is only returned when BOTH endpoints are ' +
+    'visible, so it cannot disclose an unreadable neighbour. Returns ' +
+    '{nodes:[{id,title,type,project,tags,degree}], edges:[{source,target}], truncated}.',
+  params: {
+    limit: {
+      type: 'number',
+      description:
+        'Max nodes to return (default 5000, max 20000). A DoS bound, not pagination: ' +
+        'if `truncated` comes back true, the graph is incomplete — do not render it as whole.',
+    },
+    include_tags: {
+      type: 'boolean',
+      description: 'Include each node\'s tags. Default true. Pass false to halve the payload.',
+    },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    const limit = Math.max(1, Math.min(20000, (p.limit as number) ?? 5000));
+    const includeTags = (p.include_tags as boolean) !== false;
+    const scope = sourceScopeOpts(ctx);
+
+    // Node query. The source predicate is a no-op under RLS (sourceScopeOpts
+    // hands back every source id once the DB is enforcing) and the real filter
+    // for a trusted local caller.
+    const nodeParams: unknown[] = [];
+    let sourceClause = '';
+    if (scope.sourceIds && scope.sourceIds.length > 0) {
+      nodeParams.push(scope.sourceIds);
+      sourceClause = ` AND p.source_id = ANY($${nodeParams.length}::text[])`;
+    } else if (scope.sourceId) {
+      nodeParams.push(scope.sourceId);
+      sourceClause = ` AND p.source_id = $${nodeParams.length}`;
+    }
+    nodeParams.push(limit);
+
+    const nodeRows = await ctx.engine.executeRaw<{
+      slug: string; title: string; type: string; tags: string[] | null;
+    }>(
+      `SELECT p.slug, p.title, p.type,
+              ${includeTags
+                ? `COALESCE((SELECT array_agg(t.tag ORDER BY t.tag) FROM tags t WHERE t.page_id = p.id), ARRAY[]::text[])`
+                : `ARRAY[]::text[]`} AS tags
+         FROM pages p
+        WHERE p.deleted_at IS NULL${sourceClause}
+        ORDER BY p.slug
+        LIMIT $${nodeParams.length}`,
+      nodeParams,
+    );
+
+    // Edge query. Joined through `pages` on BOTH ends so the v129 links policy
+    // and the page policy agree, and so a link to a soft-deleted page is
+    // dropped rather than dangling.
+    const edgeParams: unknown[] = [];
+    let edgeSourceClause = '';
+    if (scope.sourceIds && scope.sourceIds.length > 0) {
+      edgeParams.push(scope.sourceIds);
+      edgeSourceClause =
+        ` AND f.source_id = ANY($${edgeParams.length}::text[])` +
+        ` AND t.source_id = ANY($${edgeParams.length}::text[])`;
+    } else if (scope.sourceId) {
+      edgeParams.push(scope.sourceId);
+      edgeSourceClause = ` AND f.source_id = $${edgeParams.length} AND t.source_id = $${edgeParams.length}`;
+    }
+
+    const edgeRows = await ctx.engine.executeRaw<{ source: string; target: string }>(
+      `SELECT DISTINCT f.slug AS source, t.slug AS target
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.deleted_at IS NULL AND t.deleted_at IS NULL
+          AND f.slug <> t.slug${edgeSourceClause}`,
+      edgeParams,
+    );
+
+    // Drop edges whose endpoints fell outside the node set (the LIMIT, or a
+    // page the caller cannot see). Rendering an edge to a node that is not in
+    // the payload is what produces phantom nodes in a force graph.
+    const present = new Set(nodeRows.map((n) => n.slug));
+    const edges = edgeRows.filter((e) => present.has(e.source) && present.has(e.target));
+
+    const degree = new Map<string, number>();
+    for (const e of edges) {
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+
+    return {
+      nodes: nodeRows.map((n) => ({
+        id: n.slug,
+        title: n.title,
+        type: n.type,
+        project: deriveProjectFromSlug(n.slug),
+        tags: n.tags ?? [],
+        degree: degree.get(n.slug) ?? 0,
+      })),
+      edges,
+      truncated: nodeRows.length >= limit,
+    };
+  },
+  cliHints: { name: 'export-graph' },
+};
+
+/**
+ * `projects/<name>/…` → `<name>`. Mirrors the web client's `deriveProject` so
+ * both sides agree on the facet; the client falls back to its own derivation
+ * when this is null, so the two never disagree destructively.
+ */
+function deriveProjectFromSlug(slug: string): string | null {
+  const m = /^projects\/([^/]+)\//.exec(slug);
+  return m ? m[1] : null;
+}
+
 export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, commit_page, delete_page, list_pages,
@@ -6592,6 +6741,8 @@ export const operations: Operation[] = [
   // page_spaces — see the block comment above classify_page for why this is
   // kept off put_page / add_tag / ingestion.
   classify_page, get_page_spaces,
+  // v0.43.0.25: bulk graph read — replaces ~1 call per page.
+  export_graph,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.42.x (#2390): Life Chronicle timeline reads
