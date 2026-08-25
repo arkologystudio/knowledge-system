@@ -875,6 +875,8 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
           token,
           clientId: name,
           clientName: name,
+          // The bound human, for write attribution (see git-identity.ts).
+          ...(typeof row.principal_id === 'number' ? { principalId: row.principal_id } : {}),
           scopes,
           // A minted token carries its real short expiry; a PAT (expires_at
           // NULL) is revocable-immortal, surfaced as a 1yr-forward marker to

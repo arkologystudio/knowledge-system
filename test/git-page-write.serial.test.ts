@@ -85,6 +85,40 @@ describe('gitFirstPageWrite', () => {
     expect(message).toContain('Knowledge-Source: default');
   });
 
+  test('authorIdentity stamps the commit; unmapped writes keep the repo identity', async () => {
+    // The OAuth/HTTP transport shares one server process, so identity has to
+    // ride the write rather than the environment. Without this the commit is
+    // authored by whatever account the daemon runs as (root, in production).
+    const withIdentity = await gitFirstPageWrite(engine, {
+      mode: 'apply',
+      selfPin: true,
+      sourceId: 'default',
+      slug: 'wiki/concepts/attributed',
+      content: page('Attributed to a human.'),
+      actor: 'mcp:oauth:hab_cl_test',
+      commitMessage: 'ingest: attributed write',
+      authorIdentity: { name: 'Che Coelho', email: 'checoelho@gmail.com' },
+    });
+    expect(withIdentity.pushed).toBe(true);
+    expect(git(checkout, ['log', '-1', '--format=%an <%ae>'])).toBe('Che Coelho <checoelho@gmail.com>');
+    // Committer too — leaving it as the daemon still shows the daemon in %cn.
+    expect(git(checkout, ['log', '-1', '--format=%cn <%ce>'])).toBe('Che Coelho <checoelho@gmail.com>');
+    // Identity is orthogonal to the audit trailer, which still records the actor.
+    expect(git(checkout, ['log', '-1', '--format=%B'])).toContain('Knowledge-Actor: mcp:oauth:hab_cl_test');
+
+    // No identity resolved → the pre-existing repo/environment identity stands.
+    await gitFirstPageWrite(engine, {
+      mode: 'apply',
+      selfPin: true,
+      sourceId: 'default',
+      slug: 'wiki/concepts/unattributed',
+      content: page('No mapping for this client.'),
+      actor: 'mcp:oauth:hab_cl_unmapped',
+      commitMessage: 'ingest: unattributed write',
+    });
+    expect(git(checkout, ['log', '-1', '--format=%an <%ae>'])).toBe('GBrain Test <gbrain-test@example.invalid>');
+  });
+
   test('apply is rejected when content differs from the preview', async () => {
     const preview = await gitFirstPageWrite(engine, {
       mode: 'preview', sourceId: 'default', slug: 'wiki/concepts/a', content: page('A'), actor: 'mcp:test',

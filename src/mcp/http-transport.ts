@@ -191,7 +191,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
     const hash = hashToken(token);
     try {
       const [row] = await sql`
-        SELECT id, name, permissions FROM access_tokens
+        SELECT id, name, permissions, principal_id FROM access_tokens
         WHERE token_hash = ${hash} AND revoked_at IS NULL
       `;
       if (!row) return { ok: false };
@@ -212,10 +212,13 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         : ['world'];
       // #1336: honor the operator-set source grant stored on the token.
       const { sourceId, allowedSources } = parseLegacyTokenScope(perms?.source_id);
+      const principalId = (row as { principal_id?: unknown }).principal_id;
       const auth: AuthInfo = {
         token,
         clientId: rowId,
         clientName: rowName,
+        // The bound human, for write attribution (see git-identity.ts).
+        ...(typeof principalId === 'number' ? { principalId } : {}),
         scopes: [],
         sourceId,
         ...(allowedSources ? { allowedSources } : {}),

@@ -199,6 +199,42 @@ dirty, if a pull conflicts, or if the slug matches the protected list. The Git
 push completes before the derived index is updated. Keep `put_page` for trusted
 local ingestion pipelines or compatibility clients that deliberately accept
 DB-first semantics.
+
+### Commit authorship
+
+The writer shells out to `git commit`, so with no identity in the server's
+environment git falls back to `user@host` — every agent write lands as
+`root <root@your-host>` if the service runs as root. Identity resolves in three
+steps, most authoritative first.
+
+**1. The credential's principal (no configuration needed).** A PAT or minted
+token carries a `principal_id`, and `principals` already holds that person's
+subject and display name, so writes are authored by the human behind the
+credential and stay correct as credentials rotate:
+
+```bash
+gbrain principals add --kind human --subject ada@example.com --display-name 'Ada Lovelace'
+gbrain pat issue --principal <id> --source wiki
+```
+
+**2. An operator-declared mapping,** for client-credentials OAuth clients that
+have no principal behind them:
+
+```bash
+gbrain config set writer.git_identity.<client_id> 'Ada Lovelace <ada@example.com>'
+gbrain config set writer.git_identity.default 'Knowledge System <kb@example.com>'
+```
+
+The per-client key wins over `.default`.
+
+**3. Nothing.** A caller matching neither commits under whatever identity the
+process environment carries, so the SSH/stdio transport can keep injecting
+`GIT_AUTHOR_*` into its command instead.
+
+Both configured sources are server-side facts about the credential — a caller
+never names its own author, because a client that could do so could forge
+history under someone else's name. The `Knowledge-Actor` commit trailer is
+unaffected: it records the calling principal either way.
 | `admin` | Client management, token revocation, sweep, local-only ops |
 
 ## Legacy Bearer Token Setup

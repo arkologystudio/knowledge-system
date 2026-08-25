@@ -12,6 +12,7 @@ import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
 import { writePageThrough } from './write-through.ts';
 import { gitFirstPageWrite, GitPageWriteError } from './git-page-write.ts';
+import { resolveGitIdentity } from './git-identity.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
 import { validateRid, resolveLocators } from './rid.ts';
 import { expandQuery } from './search/expansion.ts';
@@ -260,6 +261,13 @@ export interface AuthInfo {
    * on every request — see PR #586 review note D14=B).
    */
   clientName?: string;
+  /**
+   * The human this credential is bound to (`access_tokens.principal_id`), when
+   * it has one. Client-credentials OAuth clients have no principal. Consumed by
+   * `resolveGitIdentity` so agent writes are authored by the person rather than
+   * by the account the server process runs as.
+   */
+  principalId?: number;
   scopes: string[];
   expiresAt?: number;
   /** Credential authority. Governance-minted opaque tokens use a `gtok_*`
@@ -988,6 +996,10 @@ const put_page: Operation = {
       // Same derivation the schema-mutation path uses, so the audit trail reads
       // consistently across every actor-stamped write.
       const actor = ctx.auth?.clientId ? `mcp:${ctx.auth.clientId.slice(0, 8)}` : (ctx.remote === false ? 'cli' : 'mcp');
+      // Author the commit as the human behind the credential, not the daemon
+      // account. Undefined for an unmapped client — the environment identity
+      // stands, which is how the stdio transport is already configured.
+      const authorIdentity = await resolveGitIdentity(ctx.engine, ctx.auth);
       try {
         const res = await gitFirstPageWrite(ctx.engine, {
           mode: 'apply',
@@ -997,6 +1009,7 @@ const put_page: Operation = {
           content: p.content as string,
           commitMessage: `brain(put_page): ${slug}`,
           actor,
+          ...(authorIdentity ? { authorIdentity } : {}),
           protectedSlugs: protectedRaw.split(',').map((x: string) => x.trim()).filter(Boolean),
         });
         gitFirst = { committed: true, head_after: res.head_after, path: res.path };
@@ -1363,6 +1376,8 @@ const commit_page: Operation = {
       : ctx.auth?.clientId
         ? `mcp:${ctx.auth.clientId.slice(0, 12)}`
         : 'local-cli';
+    // See put_page above: operator-declared identity for the calling principal.
+    const authorIdentity = await resolveGitIdentity(ctx.engine, ctx.auth);
 
     try {
       const gitResult = await gitFirstPageWrite(ctx.engine, {
@@ -1374,6 +1389,7 @@ const commit_page: Operation = {
         expectedContentSha256: typeof p.expected_content_sha256 === 'string' ? p.expected_content_sha256 : undefined,
         commitMessage: typeof p.commit_message === 'string' ? p.commit_message : undefined,
         actor,
+        ...(authorIdentity ? { authorIdentity } : {}),
         protectedSlugs,
       });
 

@@ -2,6 +2,38 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.26] - 2026-08-25
+
+### Fixed
+
+- **Agent writes are authored by the human, not by the server's unix account.**
+  The git-first writer shells out to `git commit`, so with no identity in the
+  server environment git fell back to its implicit `user@host` guess. On a host
+  running the MCP as root, every agent write landed as `root <root@host>` — the
+  `Knowledge-Actor` trailer still recorded who wrote it, but `git log`,
+  `git blame`, and forge contribution graphs all read the author field and saw
+  the daemon. On one production wiki that was 25 of 181 commits.
+
+  The stdio transport could always be fixed from outside, by exporting
+  `GIT_AUTHOR_*` into the SSH command. The HTTP/OAuth transport could not: one
+  long-lived process serves every client, so identity has to be resolved per
+  request from the calling credential.
+
+  Identity now resolves in three steps, most authoritative first. A PAT or
+  minted token carries `access_tokens.principal_id`, and `principals` already
+  holds that person's subject and display name — so the common case needs no
+  configuration and stays correct as credentials rotate, because it binds to the
+  person rather than to a credential id. Client-credentials OAuth clients, which
+  have no principal behind them, fall back to an operator-declared mapping
+  (`writer.git_identity.<client_id>`, then `writer.git_identity.default`). A
+  caller matching neither commits under whatever identity the process
+  environment carries — unchanged prior behaviour, never an error.
+
+  Both sources are server-side facts about the credential. A caller never names
+  its own author: a client that could do so could forge history under someone
+  else's name. Author and committer are both pinned, since leaving the committer
+  as the daemon still surfaces it in `%cn` and in forge UIs.
+
 ## [0.43.0.25] - 2026-08-23
 
 ### Added

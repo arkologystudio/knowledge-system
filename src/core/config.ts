@@ -911,6 +911,12 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // `writer.mode.<sourceId>`) only applies to UNMANAGED sources.
   'writer.managed_sources',
   'writer.mode',
+  // Git author identity for agent writes (see src/core/git-identity.ts).
+  // `writer.git_identity.<client_id>` maps an authenticated OAuth/bearer client
+  // to `Name <email>`; `.default` catches clients without their own entry.
+  // Operator-declared on purpose — a caller that could name its own author
+  // could forge history under someone else's name.
+  'writer.git_identity.default',
   // Skill-nag suppression (#2180): brain-resident pack install nag off-switch.
   'skillpack.nag_disabled',
   // Self-upgrade (v0.42; file plane, read on the hot path)
@@ -960,6 +966,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   // silently accepted and silently leaving the source unmanaged. Only the
   // genuinely open-ended per-source namespace is prefixed.
   'writer.mode.',       // writer.mode.<sourceId>
+  'writer.git_identity.', // writer.git_identity.<client_id>
 ];
 
 export function saveConfig(config: GBrainConfig): void {

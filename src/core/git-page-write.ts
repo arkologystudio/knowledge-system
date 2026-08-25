@@ -35,6 +35,7 @@ import {
 import { unifiedDiff } from './skillpack/diff-text.ts';
 import { acquireRepoLock } from './repo-lock.ts';
 import { resolveSourceRepoPath, isManagedSource } from './writer-mode.ts';
+import { gitIdentityEnv, type GitIdentity } from './git-identity.ts';
 
 const MAX_CONTENT_BYTES = 5_000_000;
 const MAX_DIFF_CHARS = 40_000;
@@ -64,6 +65,13 @@ export interface GitPageWriteInput {
   commitMessage?: string;
   actor: string;
   protectedSlugs?: readonly string[];
+  /**
+   * Operator-declared git author for this write, resolved from the calling
+   * principal (see `git-identity.ts`). Undefined leaves the process
+   * environment's identity in place, which is what the stdio transport wants:
+   * the operator injects `GIT_AUTHOR_*` into the SSH command there.
+   */
+  authorIdentity?: GitIdentity;
   /**
    * Single-shot write with no preview round-trip (the `put_page` git-first path).
    *
@@ -178,12 +186,17 @@ async function serializeForRepo<T>(repoPath: string, fn: () => Promise<T>): Prom
   }
 }
 
-function git(repoPath: string, args: readonly string[], timeout = 120_000): string {
+function git(
+  repoPath: string,
+  args: readonly string[],
+  timeout = 120_000,
+  extraEnv: Record<string, string> = {},
+): string {
   return execFileSync('git', ['-C', repoPath, ...args], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout,
-    env: { ...process.env, ...GIT_ENV_AUTH },
+    env: { ...process.env, ...GIT_ENV_AUTH, ...extraEnv },
   }).trim();
 }
 
@@ -368,7 +381,12 @@ export async function gitFirstPageWrite(
       atomicWrite(filePath, input.content);
       try {
         git(repoPath, ['add', '--', `${slug}.md`], 30_000);
-        git(repoPath, ['commit', '-m', commitMessage(input.commitMessage ?? '', input.actor, input.sourceId)], 60_000);
+        git(
+          repoPath,
+          ['commit', '-m', commitMessage(input.commitMessage ?? '', input.actor, input.sourceId)],
+          60_000,
+          gitIdentityEnv(input.authorIdentity),
+        );
       } catch (e) {
         try { git(repoPath, ['reset', '--mixed', 'HEAD'], 10_000); } catch { /* best effort */ }
         try { git(repoPath, ['restore', '--source=HEAD', '--', `${slug}.md`], 10_000); } catch {
