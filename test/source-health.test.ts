@@ -56,10 +56,24 @@ function makeGitRepo(commitDate: Date, registry: string[]): { dir: string; head:
 
 let engine: PGLiteEngine;
 
+/**
+ * The embedding column is created as `vector(__EMBEDDING_DIMS__)`, templated at
+ * schema-creation time from the PROCESS-GLOBAL gateway config. Other test files
+ * sharing this bun process call `configureGateway`, so the dimension this
+ * engine ends up with is not knowable at authoring time — it is whatever the
+ * global happened to hold when our `beforeAll` ran. Hard-coding a width here
+ * makes the file pass or fail on which shard it lands in (v0.43.0.26: LPT
+ * repacking moved ~50 files into this shard and the hard-coded 1536 started
+ * colliding with the 1280 default). Read the real width instead; this suite is
+ * about coverage arithmetic, not about any particular embedding size.
+ */
+let embeddingDims = 1536;
+
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  embeddingDims = Number(await engine.getConfig('embedding_dimensions')) || embeddingDims;
 }, 30000);
 
 afterAll(async () => {
@@ -240,7 +254,7 @@ describe('computeAllSourceMetrics', () => {
     await engine.putPage('a', { type: 'note', title: 'a', compiled_truth: 'a' });
     await engine.putPage('b', { type: 'note', title: 'b', compiled_truth: 'b' });
     await engine.upsertChunks('a', [
-      { chunk_index: 0, chunk_text: 'one', chunk_source: 'compiled_truth', token_count: 1, embedding: new Float32Array(1536) },
+      { chunk_index: 0, chunk_text: 'one', chunk_source: 'compiled_truth', token_count: 1, embedding: new Float32Array(embeddingDims) },
       { chunk_index: 1, chunk_text: 'two', chunk_source: 'compiled_truth', token_count: 1, embedding: undefined },
     ]);
     await engine.upsertChunks('b', [
