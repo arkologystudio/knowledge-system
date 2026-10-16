@@ -40,6 +40,13 @@ export interface EmbeddingTouchpoint {
    */
   max_batch_tokens?: number;
   /**
+   * Per-sub-batch embed wall-clock (ms) for this recipe. Local CPU backends
+   * (ollama, llama-server) need far longer than the hosted 60s default: a
+   * batch of long transcript chunks on a 4-vCPU box can run for minutes.
+   * `GBRAIN_AI_EMBED_TIMEOUT_MS` still wins when set.
+   */
+  default_timeout_ms?: number;
+  /**
    * Expected character density for this provider's tokenizer (chars per
    * token). OpenAI tiktoken averages ~4 on English text; Voyage averages
    * ~1 on mixed content (code/JSON/CJK). Defaults to 4 if omitted.

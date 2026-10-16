@@ -1,4 +1,5 @@
 import type { Recipe } from '../types.ts';
+import { LOCAL_EMBED_MAX_BATCH_TOKENS, LOCAL_EMBED_TIMEOUT_MS } from './local-defaults.ts';
 import { probeLlamaServer } from '../probes.ts';
 
 /**
@@ -34,9 +35,15 @@ export const llamaServer: Recipe = {
       default_dims: 0, // forces explicit --embedding-dimensions
       cost_per_1m_tokens_usd: 0,
       price_last_verified: '2026-05-10',
-      // llama-server's batch capacity is set by `--ctx-size` at launch
-      // time; no static cap to declare. v0.32 (#779).
-      no_batch_cap: true,
+      // Not a server-side cap (that depends on the loaded model / launch
+      // flags) but a CPU latency budget: without it the gateway sends a
+      // whole 100-chunk page of long transcript chunks in one request,
+      // which a 4-vCPU box can't finish inside any sane timeout. ~8k tokens
+      // keeps one request to well under a minute on CPU. Override with
+      // GBRAIN_EMBED_MAX_BATCH_TOKENS.
+      max_batch_tokens: LOCAL_EMBED_MAX_BATCH_TOKENS,
+      // Local inference: allow slow CPU sub-batches (GBRAIN_AI_EMBED_TIMEOUT_MS wins).
+      default_timeout_ms: LOCAL_EMBED_TIMEOUT_MS,
     },
   },
   /**

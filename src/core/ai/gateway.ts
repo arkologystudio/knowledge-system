@@ -75,6 +75,35 @@ function resolveAiTimeoutMs(envVar: string, fallback: number): number {
 const AI_CHAT_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_CHAT_TIMEOUT_MS', 300_000);
 /** embed sub-batch (per SDK call, NOT per whole import). */
 const AI_EMBED_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_EMBED_TIMEOUT_MS', 60_000);
+
+/**
+ * Per-sub-batch embed timeout for a recipe. An explicit
+ * GBRAIN_AI_EMBED_TIMEOUT_MS always wins; otherwise the recipe's
+ * `default_timeout_ms` (local CPU recipes declare a long one), else 60s.
+ *
+ * @internal exported for tests.
+ */
+export function resolveEmbedTimeoutMs(recipe: Recipe): number {
+  const envSet = process.env.GBRAIN_AI_EMBED_TIMEOUT_MS !== undefined;
+  if (envSet) return AI_EMBED_TIMEOUT_MS;
+  return recipe.touchpoints?.embedding?.default_timeout_ms ?? AI_EMBED_TIMEOUT_MS;
+}
+
+/**
+ * Per-request embed token budget for a recipe. GBRAIN_EMBED_MAX_BATCH_TOKENS
+ * (a positive integer) overrides the recipe's `max_batch_tokens`, so an
+ * operator on a slow CPU box can shrink requests without a release.
+ *
+ * @internal exported for tests.
+ */
+export function resolveEmbedMaxBatchTokens(recipe: Recipe): number | undefined {
+  const raw = process.env.GBRAIN_EMBED_MAX_BATCH_TOKENS;
+  if (raw !== undefined) {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n > 0) return n;
+  }
+  return recipe.touchpoints?.embedding?.max_batch_tokens;
+}
 /** multimodal per request. */
 const AI_MULTIMODAL_TIMEOUT_MS = resolveAiTimeoutMs('GBRAIN_AI_MULTIMODAL_TIMEOUT_MS', 60_000);
 
@@ -705,11 +734,14 @@ export function diagnoseEmbedding(modelOverride?: string): EmbeddingDiagnosis {
   }
 
   // Openai-compat recipes with empty models list require a user-provided model.
+  // The id lives in the configured `provider:model` string itself (e.g.
+  // `llama-server:bge-m3`), so only fail when that id is empty.
   const isUserProvided = (tp as any).user_provided_models === true;
   if (
     Array.isArray(tp.models) &&
     tp.models.length === 0 &&
-    (recipe.id === 'litellm' || isUserProvided)
+    (recipe.id === 'litellm' || isUserProvided) &&
+    !parsed.modelId?.trim()
   ) {
     return {
       ok: false,
@@ -1149,8 +1181,24 @@ const zeroEntropyCompatFetch = (async (input: RequestInfo | URL, init?: RequestI
  * fetch (voyage, zeroentropyai, azure) never reach this shim: the
  * `compat.fetch ??` precedence in instantiateEmbedding wins.
  */
+/**
+ * Bun's `fetch` carries its own hard 300s request timeout (verified on Bun
+ * 1.3.9: `TimeoutError` at 300.0s with no signal). It fires regardless of the
+ * gateway's abortSignal, so a slow local CPU embed batch was cut off at 300s
+ * per attempt — and with the AI SDK's retries, ~10 minutes — no matter what
+ * GBRAIN_AI_EMBED_TIMEOUT_MS said. Disable it so the gateway's explicit
+ * per-sub-batch signal (resolveEmbedTimeoutMs) is the one real bound.
+ * `timeout` is a Bun extension; Node ignores the unknown key.
+ *
+ * @internal exported for tests.
+ */
+export function withoutRuntimeFetchTimeout(init?: RequestInit): RequestInit {
+  return { ...(init ?? {}), timeout: false } as RequestInit;
+}
+
 const openAICompatAsymmetricFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const threadedInputType = __embedInputTypeStore.getStore();
+  init = withoutRuntimeFetchTimeout(init);
   if (threadedInputType === undefined) return fetch(input as any, init);
   // Inject only on the string-URL + string-body shape the AI SDK actually
   // sends. A Request-shaped input may carry its body on the Request object
@@ -1395,7 +1443,7 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const expected = effectiveDims;
 
   const embedding = recipe.touchpoints?.embedding;
-  const maxBatchTokens = embedding?.max_batch_tokens;
+  const maxBatchTokens = resolveEmbedMaxBatchTokens(recipe);
   const charsPerToken = embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
 
   // Pre-split is gated on max_batch_tokens. Recipes without it (e.g. OpenAI)
@@ -1566,7 +1614,7 @@ async function embedSubBatch(
       // once at embed() top would cap a whole multi-batch import; this is the
       // per-SDK-call scope). Composes with a caller signal (Fix 3's 6s query
       // deadline) — shorter wins.
-      abortSignal: withDefaultTimeout(opts?.abortSignal, AI_EMBED_TIMEOUT_MS),
+      abortSignal: withDefaultTimeout(opts?.abortSignal, resolveEmbedTimeoutMs(recipe)),
       ...(opts?.maxRetries !== undefined && { maxRetries: opts.maxRetries }),
     });
     // Carry the threaded input_type across the SDK boundary via
