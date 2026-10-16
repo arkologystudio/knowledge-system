@@ -2,6 +2,28 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.28] - 2026-10-16
+
+### Added
+
+- **A brain can tell connected agents how to work with it.** The MCP server now
+  returns operator-set `instructions` in its `initialize` result, which clients
+  such as the Claude apps add to the model's context whenever the connector is
+  attached. Point `mcp.instructions_page` at a page (for example a house-style
+  guide) and its text is served, so the instructions live in the wiki and the
+  organisation edits them like any other note; or set `mcp.instructions` to an
+  inline string. Values are cached for a minute, capped in length, and never
+  break `initialize`: unset or unreadable means no instructions, as before.
+
+### To take advantage of v0.43.0.28
+
+```
+gbrain config set mcp.instructions_page <slug>   # or: gbrain config set mcp.instructions "<text>"
+```
+
+Restart `gbrain serve --http` (or the stdio server) to pick up the first value;
+later edits to the page are served within a minute.
+
 ## [0.43.0.26] - 2026-08-25
 
 ### Fixed

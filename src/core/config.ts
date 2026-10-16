@@ -901,6 +901,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // the advisor exposes operational diagnostics (version/jobs/key presence),
   // not prose skills. Default OFF; read-only over MCP.
   'mcp.publish_advisor',
+  // MCP server instructions served in the initialize result (see
+  // src/core/mcp-instructions.ts): a page slug, or an inline fallback string.
+  'mcp.instructions_page',
+  'mcp.instructions',
   // Git-first remote page writes. Disabled unless the operator opts in;
   // protected_slugs is a comma-separated exact/glob list (e.g. voice/*).
   'writer.commit_page.enabled',
