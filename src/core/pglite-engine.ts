@@ -1047,6 +1047,10 @@ export class PGLiteEngine implements BrainEngine {
          frontmatter = EXCLUDED.frontmatter,
          content_hash = EXCLUDED.content_hash,
          updated_at = now(),
+         -- Writing a page makes it live: a re-import (e.g. a reverted git rm)
+         -- or put_page onto a soft-deleted slug resurrects it rather than
+         -- updating content nobody can see.
+         deleted_at = NULL,
          effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
          effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
          import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
@@ -1116,6 +1120,22 @@ export class PGLiteEngine implements BrainEngine {
     const m = new Map<string, string>();
     for (const r of rows) m.set(r.source_path, r.slug);
     return m;
+  }
+
+  async softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `softDeletePages: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const { rows } = await this.db.query<{ slug: string }>(
+      `UPDATE pages SET deleted_at = now()
+        WHERE slug = ANY($1::text[]) AND source_id = $2 AND deleted_at IS NULL
+        RETURNING slug`,
+      [slugs, opts.sourceId],
+    );
+    return rows.map(r => r.slug);
   }
 
   async softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null> {

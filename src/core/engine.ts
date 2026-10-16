@@ -833,6 +833,16 @@ export interface BrainEngine {
    */
   softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null>;
   /**
+   * Batch soft-delete: `deleted_at = now()` for every currently-active slug in
+   * `slugs` within one source. Returns the slugs actually flipped (already
+   * soft-deleted / unknown slugs are omitted). Sync uses this when a page's
+   * backing file is removed, so a mistaken `git rm` stays recoverable via
+   * `restore_page` until the autopilot purge window passes.
+   *
+   * SINGLE-BATCH PRIMITIVE: caller chunks to `<= DELETE_BATCH_SIZE`.
+   */
+  softDeletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]>;
+  /**
    * v0.26.5 — clear `deleted_at` on a soft-deleted page. Returns true iff a
    * row was restored. False if the slug is unknown OR the page is not
    * currently soft-deleted (idempotent-as-false).
