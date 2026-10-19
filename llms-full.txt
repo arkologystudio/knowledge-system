@@ -4159,9 +4159,26 @@ If the slug has no inbound or outbound links, try a different one or run extract
 again.
 
 **If extract finds nothing:** Your pages may not use entity-reference syntax. The
-extractor matches `[Name](people/slug)`, `[Name](../people/slug.md)`, and bare
-`people/slug` references. If your brain uses a different format, the auto-link
-heuristics won't find them — file an issue with a sample page.
+extractor matches:
+
+- `[Name](people/slug)` / `[Name](../people/slug.md)` and bare `people/slug` text
+  for the built-in entity folders (people, companies, meetings, concepts, …);
+- `[[any/folder/page]]` wikilinks and relative `[label](../any/folder/page.md)`
+  links into **any** folder, when the target page exists (resolved from the
+  linking page's folder up to the brain root, raw or slugified);
+- bare `[[page-name]]` wikilinks when exactly one page has that basename
+  (default). `gbrain config set link_resolution.global_basename true` links
+  ambiguous basenames to every match; `false` turns basename matching off.
+
+If your brain uses a different format, file an issue with a sample page.
+
+**Remote (MCP) writes don't link inline.** A `put_page` from an MCP client
+returns `auto_links: { skipped: "remote", hint }` — for safety, untrusted
+content never creates edges on the write path. Its edges are built by the next
+`gbrain extract --stale`, which the autopilot/dream cycle runs as its `extract`
+phase. A brain with no autopilot must schedule it (e.g. a systemd timer running
+`gbrain extract --stale` every few minutes); `gbrain doctor` reports the backlog
+as `links_extraction_lag`.
 
 ---
 

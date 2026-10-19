@@ -38,6 +38,49 @@ A **dimension** change still requires the wipe-and-reinit (PGLite) or
 column-alter (Postgres) recipe below — the on-disk `vector(N)` width
 genuinely has to change.
 
+## Renaming the provider for the SAME model (no re-embed)
+
+The signature is `<provider:model>:<dims>`, so it changes when only the
+*provider prefix* changes — even if the same server keeps serving the same
+weights. The common case: a brain that reached a local llama.cpp server
+through the `ollama` recipe (`embedding_model: ollama:bge-m3` +
+`OLLAMA_BASE_URL=http://127.0.0.1:8080/v1`, the workaround used before
+v0.43.0.27 made the `llama-server` recipe usable) moving to
+`llama-server:bge-m3`. The vectors are identical — same server, same model,
+same pooling — but `gbrain embed --stale` would re-embed every page.
+
+Rewrite the stamped signatures alongside the config change instead.
+Example for a 1024-dim `bge-m3` (substitute your model id and dims):
+
+```bash
+# 0. Upgrade the engine first (>= v0.43.0.27), then stop every writer that
+#    can embed: sync/autopilot timers, minion workers, the MCP server.
+
+# 1. Preview — every signed page should carry the old signature.
+psql "$DATABASE_URL" -c "SELECT embedding_signature, count(*) FROM pages GROUP BY 1"
+
+# 2. Rewrite signatures + the DB-plane model name in one transaction.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+UPDATE pages SET embedding_signature = 'llama-server:bge-m3:1024'
+ WHERE embedding_signature = 'ollama:bge-m3:1024';
+UPDATE config SET value = 'llama-server:bge-m3' WHERE key = 'embedding_model';
+COMMIT;
+SQL
+
+# 3. File plane (~/.gbrain/config.json): "embedding_model": "llama-server:bge-m3"
+#    (embedding_dimensions unchanged). In each service's environment replace
+#    OLLAMA_BASE_URL with LLAMA_SERVER_BASE_URL pointing at the SAME server
+#    (e.g. :8080 for sync/embed, :8081 for a query-only instance).
+
+# 4. Verify before restarting writers: nothing is stale.
+gbrain embed --stale --dry-run   # expect 0 pages / 0 chunks
+gbrain doctor                    # embedding config consistent, no dim mismatch
+```
+
+Rollback is the same SQL with the strings swapped plus the old config.
+`content_chunks.model` is informational only and can be left as-is.
+
 ## Why we don't do this automatically
 
 Switching dimensions requires:

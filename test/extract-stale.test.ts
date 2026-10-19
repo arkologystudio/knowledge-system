@@ -188,7 +188,8 @@ describe('gbrain extract --stale', () => {
     await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) advises [Acme](companies/acme).'));
     // Microsecond-precision updated_at, recent (after LINK_EXTRACTOR_VERSION_TS) so the
     // version arm doesn't fire — the edited arm is what must clear.
-    await engine.executeRaw(`UPDATE pages SET updated_at = '2026-06-02 08:18:58.999166+00'`);
+    const afterVersion = new Date(Date.parse(LINK_EXTRACTOR_VERSION_TS) + 86_400_000).toISOString().slice(0, 19).replace('T', ' ');
+    await engine.executeRaw(`UPDATE pages SET updated_at = '${afterVersion}.999166+00'`);
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(2);
 
     await runExtract(engine, ['--stale']);
@@ -207,6 +208,23 @@ describe('gbrain extract --stale', () => {
       `SELECT links_extracted_at >= updated_at AS eq FROM pages WHERE slug = 'companies/acme'`,
     );
     expect(usRows[0]?.eq).toBe(true);
+  });
+
+  test('a page edited BEFORE the extractor version clears after one --stale run (no re-extract loop)', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
+    await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) advises [Acme](companies/acme).'));
+    // Content older than LINK_EXTRACTOR_VERSION_TS: the version arm flags it.
+    await engine.executeRaw(`UPDATE pages SET updated_at = '2020-01-01 00:00:00.123456+00', links_extracted_at = NULL`);
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(2);
+
+    await runExtract(engine, ['--stale']);
+    // Pre-fix the stamp was the old updated_at (< versionTs) so this stayed 2
+    // and every run re-extracted the page again.
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+
+    // A later edit still re-flags it.
+    await engine.executeRaw(`UPDATE pages SET updated_at = now() + interval '1 minute' WHERE slug = 'companies/acme'`);
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(1);
   });
 
   test('CDX-4 (D2): a link-flush throw aborts the sweep and leaves pages UNSTAMPED', async () => {

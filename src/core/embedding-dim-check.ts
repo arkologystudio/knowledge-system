@@ -284,7 +284,7 @@ export function resolveSchemaEmbeddingDim(opts: ResolveSchemaEmbeddingDimOpts): 
           `Pick a recipe with an embedding touchpoint (gbrain providers list).`,
       };
     }
-    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_dimensions);
+    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_dimensions, tp.user_provided_models);
   } catch (err) {
     return { ok: false, error: err instanceof AIConfigError ? err.message : String(err) };
   }
@@ -335,7 +335,7 @@ export function resolveSchemaMultimodalDim(opts: ResolveSchemaMultimodalDimOpts)
           `Pick a multimodal-capable model from this provider.`,
       };
     }
-    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_multimodal_dimensions);
+    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_multimodal_dimensions, tp.user_provided_models);
   } catch (err) {
     return { ok: false, error: err instanceof AIConfigError ? err.message : String(err) };
   }
@@ -358,6 +358,11 @@ export function resolveSchemaMultimodalDim(opts: ResolveSchemaMultimodalDimOpts)
  *      knows their backend)
  *   2. provider-specific dim.ts allow-lists (for known Matryoshka providers)
  *   3. fall through to "this model only emits default_dims" rejection
+ *
+ * Recipes with `user_provided_models` (llama-server, litellm-proxy) serve
+ * whatever model the operator launched, so the recipe can't know its width:
+ * they declare `default_dims: 0` and any positive dim within the pgvector
+ * column cap is accepted. Without an explicit dim they fail with a hint.
  */
 function validateDimAgainstTouchpoint(
   modelId: string,
@@ -365,8 +370,18 @@ function validateDimAgainstTouchpoint(
   defaultDims: number,
   dimsOptions: number[] | undefined,
   requestedDims: number | undefined,
+  userProvidedModels?: boolean,
 ): ResolveSchemaDimResult {
   const dim = requestedDims ?? defaultDims;
+
+  if (userProvidedModels && requestedDims === undefined && defaultDims <= 0) {
+    return {
+      ok: false,
+      error:
+        `Provider "${recipe.id}" serves a user-provided model, so its vector width is unknown. ` +
+        `Pass --embedding-dimensions <N> matching the model "${modelId}" was launched with.`,
+    };
+  }
 
   if (!Number.isInteger(dim) || dim <= 0) {
     return {
@@ -383,7 +398,7 @@ function validateDimAgainstTouchpoint(
     };
   }
 
-  if (requestedDims !== undefined && requestedDims !== defaultDims) {
+  if (requestedDims !== undefined && requestedDims !== defaultDims && !userProvidedModels) {
     // User asked for a non-default dim. Walk the precedence chain.
     const customDimOk = isCustomDimValidForProvider(recipe, modelId, requestedDims, dimsOptions);
     if (!customDimOk.valid) {

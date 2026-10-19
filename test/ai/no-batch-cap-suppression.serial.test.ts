@@ -28,14 +28,15 @@ describe('v0.32 #779: no_batch_cap suppresses the missing-max_batch_tokens warni
     resetGateway();
   });
 
-  test('Ollama, LiteLLM, llama-server all declare no_batch_cap: true', () => {
-    for (const id of ['ollama', 'litellm', 'llama-server']) {
+  test('dynamic-cap recipes either opt out (no_batch_cap) or declare a budget', () => {
+    // LiteLLM's capacity depends on the backend: explicit opt-out.
+    expect(getRecipe('litellm')!.touchpoints.embedding?.no_batch_cap).toBe(true);
+    // v0.43.0.27: local CPU recipes declare a latency budget instead, which
+    // also satisfies the warning (it only fires when max_batch_tokens is unset).
+    for (const id of ['ollama', 'llama-server']) {
       const r = getRecipe(id);
       expect(r, `${id} not registered`).toBeDefined();
-      expect(
-        r!.touchpoints.embedding?.no_batch_cap,
-        `${id} should declare no_batch_cap: true`,
-      ).toBe(true);
+      expect(r!.touchpoints.embedding?.max_batch_tokens, `${id} should declare max_batch_tokens`).toBeGreaterThan(0);
     }
   });
 

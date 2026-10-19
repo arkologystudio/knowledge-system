@@ -36,7 +36,7 @@ import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import {
   extractPageLinks, parseTimelineEntries, inferLinkType, makeResolver,
-  extractFrontmatterLinks, isGlobalBasenameEnabled, LINK_EXTRACTOR_VERSION_TS,
+  extractFrontmatterLinks, resolveBasenameMode, type BasenameMode, LINK_EXTRACTOR_VERSION_TS,
   WIKILINK_BASENAME_LINK_TYPE,
   buildBasenameIndex, queryBasenameIndex, stripCodeBlocks,
   type UnresolvedFrontmatterRef, type LinkCandidate,
@@ -317,11 +317,12 @@ export function resolveBasenameMatchesFromSlugs(
  */
 export function resolveSlugAll(
   fileDir: string, relTarget: string, allSlugs: Set<string>,
-  opts: { globalBasename?: boolean } = {},
+  opts: { globalBasename?: boolean; basenameMode?: BasenameMode } = {},
 ): string[] {
   const direct = resolveSlug(fileDir, relTarget, allSlugs);
   if (direct !== null) return [direct];
-  if (!opts.globalBasename) return [];
+  const mode: BasenameMode = opts.basenameMode ?? (opts.globalBasename ? 'all' : 'off');
+  if (mode === 'off') return [];
   // Strip .md suffix + dirname so `[[struktura]]` (relTarget=`struktura.md`)
   // and `[[notes/struktura]]` (relTarget=`notes/struktura.md`) both query
   // for the basename `struktura`.
@@ -329,7 +330,9 @@ export function resolveSlugAll(
   const basename = targetNoExt.includes('/')
     ? targetNoExt.slice(targetNoExt.lastIndexOf('/') + 1)
     : targetNoExt;
-  return resolveBasenameMatchesFromSlugs(basename, allSlugs);
+  const matches = resolveBasenameMatchesFromSlugs(basename, allSlugs);
+  // 'unique': an ambiguous basename links nowhere rather than everywhere.
+  return mode === 'unique' && matches.length !== 1 ? [] : matches;
 }
 
 /**
@@ -378,7 +381,7 @@ function parseFrontmatterFromContent(content: string, relPath: string): Record<s
  */
 export async function extractLinksFromFile(
   content: string, relPath: string, allSlugs: Set<string>,
-  opts?: { includeFrontmatter?: boolean; globalBasename?: boolean },
+  opts?: { includeFrontmatter?: boolean; globalBasename?: boolean; basenameMode?: BasenameMode },
 ): Promise<ExtractedLink[]> {
   const links: ExtractedLink[] = [];
   const slug = pathToSlug(relPath);
@@ -387,7 +390,8 @@ export async function extractLinksFromFile(
   // Issue #972: globalBasename routes bare `[[name]]` wikilinks through
   // basename lookup against allSlugs when the ancestor walk fails. Off
   // by default for back-compat with the v0.10.1 ancestor-only behavior.
-  const globalBasename = opts?.globalBasename ?? false;
+  const basenameMode: BasenameMode = opts?.basenameMode ?? (opts?.globalBasename ? 'all' : 'off');
+  const globalBasename = basenameMode !== 'off';
 
   // Issue #972 (codex [P2]): strip code fences before scanning so a
   // `[[name]]` inside a code block doesn't create an FS edge. Mirrors the
@@ -395,7 +399,7 @@ export async function extractLinksFromFile(
   const scanContent = stripCodeBlocks(content);
 
   for (const { name, relTarget } of extractMarkdownLinks(scanContent)) {
-    const resolvedSlugs = resolveSlugAll(fileDir, relTarget, allSlugs, { globalBasename });
+    const resolvedSlugs = resolveSlugAll(fileDir, relTarget, allSlugs, { basenameMode });
     if (resolvedSlugs.length === 0) continue;
     // Single hit on the ancestor path → emit one edge with the inferred
     // verb type. Multiple hits (only possible when globalBasename is on
@@ -969,7 +973,7 @@ async function extractForSlugs(
   let pagesProcessed = 0;
 
   // Issue #972: read the basename flag once per extract run.
-  const globalBasename = await isGlobalBasenameEnabled(engine);
+  const basenameMode = await resolveBasenameMode(engine);
 
   const linkBatch: LinkBatchInput[] = [];
   const timelineBatch: TimelineBatchInput[] = [];
@@ -1027,7 +1031,7 @@ async function extractForSlugs(
         const content = readFileSync(fullPath, 'utf-8');
 
         if (doLinks) {
-          const links = await extractLinksFromFile(content, relPath, allSlugs, { globalBasename });
+          const links = await extractLinksFromFile(content, relPath, allSlugs, { basenameMode });
           for (const link of links) {
             if (dryRun) {
               if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
@@ -1082,7 +1086,7 @@ async function extractLinksFromDir(
   // Issue #972: read once before the walk so the per-file calls don't
   // re-query the DB. globalBasename = true emits one edge per basename
   // match for bare wikilinks like `[[struktura]]`.
-  const globalBasename = await isGlobalBasenameEnabled(engine);
+  const basenameMode = await resolveBasenameMode(engine);
 
   // Progress stream on stderr (separate from the action-events --json writes
   // to stdout, which tests grep for). Rate-gated; respects global --quiet /
@@ -1122,7 +1126,7 @@ async function extractLinksFromDir(
       if (isAborted(signal)) return;
       try {
         const content = readFileSync(file.path, 'utf-8');
-        const links = await extractLinksFromFile(content, file.relPath, allSlugs, { globalBasename });
+        const links = await extractLinksFromFile(content, file.relPath, allSlugs, { basenameMode });
         for (const link of links) {
           if (dryRunSeen) {
             const key = `${link.from_slug}::${link.to_slug}::${link.link_type}`;
@@ -1236,14 +1240,14 @@ export async function extractLinksForSlugs(
     ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
     : undefined;
   // Issue #972: same flag as the standalone extract path.
-  const globalBasename = await isGlobalBasenameEnabled(engine);
+  const basenameMode = await resolveBasenameMode(engine);
   let created = 0;
   for (const slug of slugs) {
     const filePath = join(repoPath, slug + '.md');
     if (!existsSync(filePath)) continue;
     try {
       const content = readFileSync(filePath, 'utf-8');
-      for (const link of await extractLinksFromFile(content, slug + '.md', allSlugs, { globalBasename })) {
+      for (const link of await extractLinksFromFile(content, slug + '.md', allSlugs, { basenameMode })) {
         try { await engine.addLink(link.from_slug, link.to_slug, link.context, link.link_type, link.link_source, undefined, undefined, linkOpts); created++; } catch { /* skip */ } // gbrain-allow-direct-insert: gbrain extract single-row fallback when batch path declines a row
       }
     } catch { /* skip */ }
@@ -1312,7 +1316,7 @@ async function extractLinksFromDB(
   const unresolved: UnresolvedFrontmatterRef[] = [];
   // Issue #972: opt-in global-basename wikilink resolution. Read once
   // per extract run; threaded into each extractPageLinks call.
-  const globalBasename = await isGlobalBasenameEnabled(engine);
+  const basenameMode = await resolveBasenameMode(engine);
   // v0.32.8: listAllPageRefs enumerates (slug, source_id) so we can thread
   // sourceId to getPage AND build a cross-source resolution map for link
   // disambiguation. Pre-fix used getAllSlugs() which collapsed
@@ -1393,7 +1397,7 @@ async function extractLinksFromDB(
     // basename lookup; off by default for back-compat.
     const extracted = await extractPageLinks(
       slug, fullContent, page.frontmatter, page.type, resolver,
-      { skipFrontmatter: !includeFrontmatter, globalBasename },
+      { skipFrontmatter: !includeFrontmatter, basenameMode },
     );
     unresolved.push(...extracted.unresolved);
 
@@ -1616,9 +1620,19 @@ async function extractStaleFromDB(
   // Batch mode = pg_trgm + exact only, NO per-name search fallback. The
   // resolution map sees ALL sources so qualified cross-source wikilinks resolve
   // even when --source-id scopes the stale SCAN.
-  const resolver = makeResolver(engine, { mode: 'batch' });
-  const nullResolver = { resolve: async () => null as string | null };
-  const activeResolver = includeFrontmatter ? resolver : nullResolver;
+  //
+  // One resolver PER SOURCE: wikilink path/basename resolution must stay
+  // inside the linking page's source (issue #972 codex [P1]). Frontmatter
+  // stays gated by --include-frontmatter via `skipFrontmatter` — the old
+  // synthetic null resolver also disabled every wikilink resolution here, so
+  // `extract --stale` (what timers run) never resolved `[[name]]` at all.
+  const resolvers = new Map<string, ReturnType<typeof makeResolver>>();
+  const resolverFor = (sourceId: string) => {
+    let r = resolvers.get(sourceId);
+    if (!r) { r = makeResolver(engine, { mode: 'batch', sourceId }); resolvers.set(sourceId, r); }
+    return r;
+  };
+  const basenameMode = await resolveBasenameMode(engine);
   const allRefs = await engine.listAllPageRefs();
   const allSlugs = new Set<string>();
   const slugToSources = new Map<string, string[]>();
@@ -1650,7 +1664,8 @@ async function extractStaleFromDB(
     for (const page of rows) {
       const fullContent = page.compiled_truth + '\n' + page.timeline;
       const extracted = await extractPageLinks(
-        page.slug, fullContent, page.frontmatter, page.type, activeResolver,
+        page.slug, fullContent, page.frontmatter, page.type, resolverFor(page.source_id),
+        { skipFrontmatter: !includeFrontmatter, basenameMode },
       );
       for (const c of extracted.candidates) {
         const r = resolveCandidateSources(c, page.slug, page.source_id, allSlugs, slugToSources);
@@ -1675,7 +1690,17 @@ async function extractStaleFromDB(
       // `page.updated_at.toISOString()` — the JS Date is ms-truncated, so the
       // µs-precision DB updated_at stayed strictly greater and the page never
       // cleared on Postgres. Stamping the exact value makes them equal.
-      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: page.updated_at_iso });
+      //
+      // Floor the stamp at versionTs. A page last edited BEFORE the current
+      // extractor version would otherwise be stamped below it, stay stale on
+      // the version arm (`links_extracted_at < versionTs`) and re-extract on
+      // every run forever — i.e. every LINK_EXTRACTOR_VERSION_TS bump turned
+      // each timer tick into a whole-brain re-extraction. Comparing at ms
+      // precision is safe: µs only ever push updated_at further above.
+      const extractedAt = Date.parse(page.updated_at_iso) >= Date.parse(versionTs)
+        ? page.updated_at_iso
+        : versionTs;
+      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt });
     }
 
     // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so

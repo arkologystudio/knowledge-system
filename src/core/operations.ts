@@ -19,7 +19,7 @@ import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
 import type { HybridSearchMeta } from './types.ts';
-import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
+import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, resolveBasenameMode, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
 import { isFactsBackstopEligible } from './facts/eligibility.ts';
 import { stripTakesFence } from './takes-fence.ts';
 import { stripFactsFence } from './facts-fence.ts';
@@ -823,7 +823,7 @@ const get_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
+  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. Remote (MCP) writes skip that inline step for safety (auto_links.skipped = "remote"): their links appear after the next `gbrain extract --stale` / autopilot extract phase. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
@@ -1159,9 +1159,9 @@ const put_page: Operation = {
     let autoLinks:
       | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }
       | { error: string }
-      | { skipped: 'remote' }
+      | { skipped: 'remote'; hint: string }
       | undefined;
-    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote' } | undefined;
+    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote'; hint: string } | undefined;
     // Trusted-workspace path (v0.23 dream cycle) re-enables auto-link/timeline
     // even though ctx.remote=true, because the allow-list bounds the slug and
     // the synthesis prompt is itself the trusted dispatcher. Without this,
@@ -1172,8 +1172,11 @@ const put_page: Operation = {
       && Array.isArray(ctx.allowedSlugPrefixes)
       && ctx.allowedSlugPrefixes.length > 0;
     if (ctx.remote !== false && !trustedWorkspace) {
-      autoLinks = { skipped: 'remote' };
-      autoTimeline = { skipped: 'remote' };
+      // Tell the agent where its edges WILL come from, so a missing graph
+      // reads as "pending", not "broken".
+      const hint = REMOTE_AUTO_LINK_HINT;
+      autoLinks = { skipped: 'remote', hint };
+      autoTimeline = { skipped: 'remote', hint };
     } else if (result.parsedPage) {
       try {
         const enabled = await isAutoLinkEnabled(ctx.engine);
@@ -1467,11 +1470,12 @@ async function runAutoLink(
   // Issue #972 (codex [P1]): pass sourceId so basename resolution stays
   // within this page's source — no cross-source basename edges.
   const resolver = makeResolver(engine, { mode: 'live', sourceId: opts?.sourceId });
-  // Issue #972: opt-in bare-wikilink basename resolution. Off by default.
-  const globalBasename = await isGlobalBasenameEnabled(engine);
+  // Bare-wikilink basename resolution: unique-match by default (#972 'all'
+  // is the opt-in); exact paths in any folder always resolve.
+  const basenameMode = await resolveBasenameMode(engine);
   const { candidates, unresolved } = await extractPageLinks(
     slug, fullContent, parsed.frontmatter, parsed.type, resolver,
-    { globalBasename },
+    { basenameMode },
   );
 
   // Resolve which targets exist (skip refs to non-existent pages to avoid FK
@@ -1609,9 +1613,19 @@ async function runAutoLink(
   return { ...result, unresolved };
 }
 
+/**
+ * Remote (MCP) writes never run auto-link/auto-timeline inline (see the
+ * SECURITY note in put_page). Their edges and timeline rows are built by the
+ * next link-extraction pass over stale pages.
+ */
+export const REMOTE_AUTO_LINK_HINT =
+  'Graph links and timeline entries for remote writes are built by the next extraction pass ' +
+  '(`gbrain extract --stale`, which the autopilot/dream cycle runs as its extract phase), not inline. ' +
+  'On a brain with no autopilot, schedule `gbrain extract --stale`; `gbrain doctor` reports the lag as links_extraction_lag.';
+
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
+  description: 'Soft-delete a page. On a machine-managed (git-first) source the backing file is first removed with git rm, committed and pushed; a push failure fails the delete. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
   params: {
     slug: { type: 'string', required: true },
   },
@@ -1623,6 +1637,89 @@ const delete_page: Operation = {
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
     // intended row instead of always targeting (default, slug).
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+
+    // ── Git-first gate ────────────────────────────────────────────────────
+    // On a machine-managed source the repository is the truth: tombstoning
+    // only the index row leaves the file in git, and the next full sync (or
+    // any edit) re-imports it. So `git rm` + commit + PUSH first, then
+    // soft-delete. A push failure fails the delete with the index untouched —
+    // the same ordering put_page uses, in the other direction.
+    const writerSourceId = ctx.sourceId ?? 'default';
+    const isSandboxSubagent = ctx.viaSubagent === true
+      && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
+    let gitFirst: { committed: boolean; head_after?: string; path?: string } | undefined;
+    if (!isSandboxSubagent) {
+      const { resolveWriterMode, WriterModeError } = await import('./writer-mode.ts');
+      let writerMode: import('./writer-mode.ts').WriterResolution;
+      try {
+        writerMode = await resolveWriterMode(ctx.engine, writerSourceId);
+      } catch (e) {
+        if (e instanceof WriterModeError) {
+          throw new OperationError(
+            'invalid_request',
+            `writer mode is misconfigured for source '${writerSourceId}': ${e.message}`,
+            'An operator must correct writer.managed_sources / writer.mode on the brain host.',
+          );
+        }
+        throw e;
+      }
+      if (writerMode.mode === 'git-first') {
+        // Same capability gate as a git-first put_page / commit_page: this
+        // pushes to origin.
+        if (ctx.remote !== false) {
+          const enabled = await ctx.engine.getConfig('writer.commit_page.enabled');
+          if (enabled !== 'true') {
+            throw new OperationError(
+              'permission_denied',
+              `remote deletes on machine-managed source '${writerSourceId}' are disabled`,
+              'An operator must set writer.commit_page.enabled=true on the brain host — a git-first delete_page commits and pushes to the source repository.',
+            );
+          }
+          if (!ctx.sourceId) {
+            throw new OperationError(
+              'permission_denied',
+              'remote deletes on a machine-managed source require an OAuth client scoped to one write source',
+            );
+          }
+        }
+        const rows = await ctx.engine.executeRaw<{ source_path: string | null }>(
+          'SELECT source_path FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL',
+          [writerSourceId, slug],
+        );
+        if (rows.length > 0) {
+          const { gitFirstPageDelete, GitPageWriteError, gitFailureCode, isRetryableGitFailure } = await import('./git-page-write.ts');
+          const protectedRaw = (await ctx.engine.getConfig('writer.commit_page.protected_slugs')) ?? '';
+          const actor = ctx.auth?.clientId ? `mcp:${ctx.auth.clientId.slice(0, 8)}` : (ctx.remote === false ? 'cli' : 'mcp');
+          const authorIdentity = await resolveGitIdentity(ctx.engine, ctx.auth);
+          try {
+            const res = await gitFirstPageDelete(ctx.engine, {
+              sourceId: writerSourceId,
+              slug,
+              relPath: rows[0].source_path,
+              actor,
+              ...(authorIdentity ? { authorIdentity } : {}),
+              protectedSlugs: protectedRaw.split(',').map((x: string) => x.trim()).filter(Boolean),
+            });
+            gitFirst = { committed: true, head_after: res.head_after, path: res.path };
+          } catch (e) {
+            // File already absent from git: the invariant holds, tombstone the row.
+            if (e instanceof GitPageWriteError && e.code === 'nothing_to_commit') {
+              gitFirst = { committed: false };
+            } else {
+              const detail = e instanceof Error ? e.message : String(e);
+              throw new OperationError(
+                gitFailureCode(e),
+                `git-first delete failed for '${slug}' on machine-managed source '${writerSourceId}': ${detail}`,
+                isRetryableGitFailure(e)
+                  ? 'The repository was momentarily unavailable. Retry the same delete.'
+                  : undefined,
+              );
+            }
+          }
+        }
+      }
+    }
+
     // v0.26.5: rewired from hard-delete to soft-delete. The hard-delete primitive
     // (engine.deletePage) is now reserved for purgeDeletedPages and explicit
     // tests. softDeletePage returns null when the slug is unknown OR already
@@ -1637,7 +1734,12 @@ const delete_page: Operation = {
       }
       return { status: 'already_soft_deleted', slug, deleted_at: existing.deleted_at };
     }
-    return { status: 'soft_deleted', slug, recoverable_until: 'now + 72h via restore_page' };
+    return {
+      status: 'soft_deleted',
+      slug,
+      recoverable_until: 'now + 72h via restore_page',
+      ...(gitFirst ? { git: gitFirst } : {}),
+    };
   },
   cliHints: { name: 'delete', positional: ['slug'] },
 };

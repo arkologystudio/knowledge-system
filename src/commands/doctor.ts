@@ -34,7 +34,8 @@ import { fileURLToPath } from 'url';
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import {
   extractEntityRefs,
-  isGlobalBasenameEnabled,
+  resolveBasenameMode,
+  linkPathCandidates,
   buildBasenameIndex,
   queryBasenameIndex,
 } from '../core/link-extraction.ts';
@@ -490,6 +491,44 @@ export async function childTableOrphansCheck(engine: BrainEngine): Promise<Check
  * complete, and that must be visible before the portal (KS-B/KS-E) serves any
  * client-confidential source.
  */
+/**
+ * Privileges the request role needs on read-support objects outside the
+ * 11 covered corpus tables. Returns human-readable gaps (empty = healthy).
+ * Objects that don't exist on this schema are skipped, not reported.
+ */
+export async function missingRequestRoleGrants(engine: BrainEngine): Promise<string[]> {
+  const rows = await engine.executeRaw<{
+    seq_select: boolean | null; seq_usage: boolean | null;
+    takes_select: boolean | null; takes_policy: boolean;
+    page_aliases: boolean | null; slug_aliases: boolean | null;
+  }>(
+    `SELECT
+       CASE WHEN to_regclass('public.page_generation_clock_seq') IS NULL THEN NULL
+            ELSE has_sequence_privilege('gbrain_request', 'page_generation_clock_seq', 'SELECT') END AS seq_select,
+       CASE WHEN to_regclass('public.page_generation_clock_seq') IS NULL THEN NULL
+            ELSE has_sequence_privilege('gbrain_request', 'page_generation_clock_seq', 'USAGE') END AS seq_usage,
+       CASE WHEN to_regclass('public.takes') IS NULL THEN NULL
+            ELSE has_table_privilege('gbrain_request', 'takes', 'SELECT') END AS takes_select,
+       (to_regclass('public.takes') IS NULL OR EXISTS (
+          SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'takes'
+            AND policyname = 'ks_source_isolation')) AS takes_policy,
+       CASE WHEN to_regclass('public.page_aliases') IS NULL THEN NULL
+            ELSE has_table_privilege('gbrain_request', 'page_aliases', 'SELECT') END AS page_aliases,
+       CASE WHEN to_regclass('public.slug_aliases') IS NULL THEN NULL
+            ELSE has_table_privilege('gbrain_request', 'slug_aliases', 'SELECT') END AS slug_aliases`,
+  );
+  const r = rows[0];
+  if (!r) return [];
+  const gaps: string[] = [];
+  if (r.seq_select === false) gaps.push('SELECT on page_generation_clock_seq');
+  if (r.seq_usage === false) gaps.push('USAGE on page_generation_clock_seq');
+  if (r.takes_select === false) gaps.push('SELECT on takes');
+  if (r.takes_policy === false) gaps.push('ks_source_isolation policy on takes');
+  if (r.page_aliases === false) gaps.push('SELECT on page_aliases');
+  if (r.slug_aliases === false) gaps.push('SELECT on slug_aliases');
+  return gaps;
+}
+
 export async function checkRlsEnforcement(engine: BrainEngine): Promise<Check> {
   const COVERED_TABLES = [
     'pages', 'content_chunks', 'artifacts', 'links', 'timeline_entries',
@@ -531,6 +570,21 @@ export async function checkRlsEnforcement(engine: BrainEngine): Promise<Check> {
         message:
           `RLS partially provisioned: gbrain_request exists but only ${present}/${COVERED_TABLES.length} ` +
           'covered-table policies are present. Re-run migration v125 (`gbrain apply-migrations --yes`) to heal.',
+      };
+    }
+    // Support objects the remote read paths touch beyond the 11 corpus
+    // tables (v126/v127/v130). A missing grant here does not leak anything —
+    // it fails closed with "permission denied" on the remote query path —
+    // but it breaks search/takes for every scoped caller, so surface it.
+    const gaps = await missingRequestRoleGrants(engine);
+    if (gaps.length > 0) {
+      return {
+        name: 'rls_enforcement',
+        status: 'warn',
+        message:
+          `RLS active, but gbrain_request is missing: ${gaps.join(', ')}. Remote query/takes paths ` +
+          'that touch these fail with "permission denied". Run `gbrain apply-migrations --yes` ' +
+          '(v126/v127/v130) to heal.',
       };
     }
     return {
@@ -1191,7 +1245,10 @@ export async function checkLinkResolutionOpportunity(
 ): Promise<Check> {
   const name = 'link_resolution_opportunity';
   try {
-    if (await isGlobalBasenameEnabled(engine)) {
+    // 'unique' (the default) already links every unambiguous bare wikilink;
+    // what 'all' would ADD is the ambiguous ones, so that is what we count.
+    const mode = await resolveBasenameMode(engine);
+    if (mode === 'all') {
       return { name, status: 'ok', message: 'global_basename mode already enabled' };
     }
     const allSlugs = await engine.getAllSlugs();
@@ -1206,6 +1263,7 @@ export async function checkLinkResolutionOpportunity(
 
     let bareCount = 0;
     let wouldResolveCount = 0;
+    let anyMatchCount = 0;
     const distinctTargets = new Set<string>();
 
     // Issue #972 (codex [P2] perf): batch-load the most-recent N pages in ONE
@@ -1213,8 +1271,8 @@ export async function checkLinkResolutionOpportunity(
     // full N-page walk hit the 60s budget every run on large brains and
     // returned a perpetual partial; this bounds the work to a fixed sample.
     const SAMPLE_LIMIT = 1000;
-    const sampled = await engine.executeRaw<{ compiled_truth: string | null; timeline: string | null }>(
-      `SELECT compiled_truth, timeline FROM pages WHERE deleted_at IS NULL ORDER BY id DESC LIMIT ${SAMPLE_LIMIT}`,
+    const sampled = await engine.executeRaw<{ slug: string; compiled_truth: string | null; timeline: string | null }>(
+      `SELECT slug, compiled_truth, timeline FROM pages WHERE deleted_at IS NULL ORDER BY id DESC LIMIT ${SAMPLE_LIMIT}`,
     );
     const totalPages = allSlugs.size;
     const sampledNote = totalPages > SAMPLE_LIMIT
@@ -1228,12 +1286,17 @@ export async function checkLinkResolutionOpportunity(
         const content = (row.compiled_truth ?? '') + '\n' + (row.timeline ?? '');
         for (const e of extractEntityRefs(content)) {
           if (!e.needsResolution) continue;
+          // An exact path in any folder resolves in every mode.
+          if (linkPathCandidates(row.slug, e.slug).some((c) => allSlugs.has(c))) continue;
           bareCount++;
           // Issue #972 (codex): match on the wikilink TARGET (e.slug), not
           // the display alias (e.name), via the shared query so the doctor
           // estimate equals what extraction actually resolves.
-          const matches = queryBasenameIndex(basenameIndex, e.slug);
-          if (matches.length > 0) {
+          const tail = e.slug.includes('/') ? e.slug.slice(e.slug.lastIndexOf('/') + 1) : e.slug;
+          const matches = queryBasenameIndex(basenameIndex, tail);
+          if (matches.length > 0) anyMatchCount++;
+          const gained = mode === 'unique' ? matches.length > 1 : matches.length > 0;
+          if (gained) {
             wouldResolveCount++;
             for (const m of matches) distinctTargets.add(m);
           }
@@ -1250,7 +1313,9 @@ export async function checkLinkResolutionOpportunity(
       return {
         name,
         status: 'ok',
-        message: `${bareCount} bare wikilink(s) found, but none have basename matches in the brain.`,
+        message: mode === 'unique' && anyMatchCount > 0
+          ? `${bareCount} bare wikilink(s) found; ${anyMatchCount} already resolve (default unique mode) and none are ambiguous.`
+          : `${bareCount} bare wikilink(s) found, but none have basename matches in the brain.`,
       };
     }
     const ratio = wouldResolveCount / bareCount;
@@ -1260,8 +1325,9 @@ export async function checkLinkResolutionOpportunity(
         name,
         status: 'warn',
         message:
-          `${wouldResolveCount} of ${bareCount} bare wikilinks (${pct}%) would resolve to ` +
-          `${distinctTargets.size} distinct page(s) under global_basename mode${sampledNote}. ` +
+          `${wouldResolveCount} of ${bareCount} bare wikilinks (${pct}%) ` +
+          (mode === 'unique' ? 'are ambiguous (several pages share the basename) and ' : '') +
+          `would resolve to ${distinctTargets.size} distinct page(s) under global_basename mode${sampledNote}. ` +
           `Enable with: gbrain config set link_resolution.global_basename true`,
       };
     }
