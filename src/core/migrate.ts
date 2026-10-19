@@ -6490,6 +6490,67 @@ export const MIGRATIONS: Migration[] = [
       return (meta[0]?.n ?? 0) === 2;
     },
   },
+  {
+    version: 130,
+    name: 'rls_takes_and_clock_grants',
+    // Two more objects the remote (gbrain_request) read paths touch that the
+    // v125–v127 grants missed — found when the Arkology/Octopi brains moved to
+    // local embeddings and remote queries started failing with
+    // "permission denied":
+    //
+    //   - `takes`: read by takes_list / takes_search / takes_scorecard / think
+    //     and the hybrid search's take-enrichment. No grant at all, and the v35
+    //     auto-RLS backfill had already enabled RLS on it, so a grant alone
+    //     would return zero rows. The policy follows the page's labels
+    //     (page_spaces), the same predicate v129 put on every page-hanging
+    //     table, so a take is visible exactly when its page is.
+    //   - `page_generation_clock_seq`: v126 granted SELECT (enough to read
+    //     last_value) but not USAGE, which currval()/nextval() require; the
+    //     pages generation trigger calls nextval().
+    //
+    // Same posture as v126: idempotent, Postgres-only, a no-op when the role
+    // was never provisioned. Editing v125/v126 would not repair existing nodes.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind !== 'postgres') return;
+      await engine.runMigration(130, `
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'gbrain_request') THEN
+            GRANT USAGE, SELECT ON SEQUENCE page_generation_clock_seq TO gbrain_request;
+
+            IF to_regclass('public.takes') IS NOT NULL THEN
+              GRANT SELECT ON TABLE takes TO gbrain_request;
+              ALTER TABLE takes ENABLE ROW LEVEL SECURITY;
+              DROP POLICY IF EXISTS ks_source_isolation ON takes;
+              CREATE POLICY ks_source_isolation ON takes FOR SELECT TO gbrain_request
+                USING (EXISTS (SELECT 1 FROM page_spaces ps WHERE ps.page_id = takes.page_id
+                          AND ps.space_id = ANY(NULLIF(current_setting('app.allowed_sources', true), '')::text[])));
+            END IF;
+          END IF;
+        END $$;
+      `);
+    },
+    verify: async (engine) => {
+      if (engine.kind !== 'postgres') return true;
+      const role = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'gbrain_request'`,
+      );
+      if ((role[0]?.n ?? 0) === 0) return true;
+      const rows = await engine.executeRaw<{ seq_ok: boolean; takes_ok: boolean }>(
+        `SELECT
+           has_sequence_privilege('gbrain_request', 'page_generation_clock_seq', 'USAGE') AS seq_ok,
+           (to_regclass('public.takes') IS NULL OR (
+              has_table_privilege('gbrain_request', 'takes', 'SELECT')
+              AND EXISTS (SELECT 1 FROM pg_policies
+                           WHERE schemaname = 'public' AND tablename = 'takes'
+                             AND policyname = 'ks_source_isolation')
+           )) AS takes_ok`,
+      );
+      return rows[0]?.seq_ok === true && rows[0]?.takes_ok === true;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

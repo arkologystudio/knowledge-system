@@ -86,13 +86,23 @@ export interface EmbedBatchOptions {
  * progress callbacks fire incrementally on large imports. The gateway owns
  * adaptive batch splitting and per-recipe token-budget logic; this paginator
  * is purely about progress-callback granularity.
+ *
+ * GBRAIN_EMBED_BATCH_SIZE (positive integer) overrides the page size, e.g.
+ * to get finer progress on a slow local CPU backend.
  */
-const BATCH_SIZE = 100;
+const DEFAULT_BATCH_SIZE = 100;
+export function resolveEmbedBatchSize(): number {
+  const raw = process.env.GBRAIN_EMBED_BATCH_SIZE;
+  if (raw === undefined) return DEFAULT_BATCH_SIZE;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : DEFAULT_BATCH_SIZE;
+}
 export async function embedBatch(
   texts: string[],
   options: EmbedBatchOptions = {},
 ): Promise<Float32Array[]> {
   if (!texts || texts.length === 0) return [];
+  const BATCH_SIZE = resolveEmbedBatchSize();
   // Build the gateway-call passthrough once; undefined fields stay undefined
   // so non-opt-in callers see unchanged pre-v0.33.4 behavior.
   const gwOpts = {

@@ -31,6 +31,49 @@ All notable changes to GBrain will be documented in this file.
   `auto_timeline` return `{ skipped: "remote", hint }` naming
   `gbrain extract --stale` / the autopilot extract phase; documented in
   `docs/GBRAIN_VERIFY.md`.
+## [0.43.0.27] - 2026-10-16
+
+### Fixed
+
+Five defects found moving the Arkology and Octopi brains off hosted embeddings
+onto local CPU llama.cpp.
+
+- **The `llama-server` recipe is usable.** `--embedding-dimensions` was rejected
+  for every value: the recipe declares `default_dims: 0` (the operator picks the
+  model), so any explicit dim fell through to "this model only emits its default
+  vector size". Recipes with `user_provided_models` now accept any positive dim
+  up to the pgvector column cap, and fail with a hint when none is given.
+- **`llama-server:<id>` is no longer diagnosed as "model unset".**
+  `diagnoseEmbedding` failed every empty-models recipe without looking at the
+  configured string, which already carries the id.
+- **Long documents embed on CPU.** Local recipes had no token budget, so a whole
+  100-chunk page of long transcript chunks went to the server as one request.
+  `ollama` and `llama-server` now declare `max_batch_tokens` (8192), engaging the
+  existing pre-split path, and a 10-minute per-sub-batch timeout. Separately,
+  Bun's `fetch` has a hidden 300s request timeout (`TimeoutError` at 300.0s,
+  verified on Bun 1.3.9) that fired regardless of `GBRAIN_AI_EMBED_TIMEOUT_MS`;
+  with the SDK's retries that was the ~10-minute cutoff that blocked sync. The
+  openai-compat embed path now disables it, so the gateway's own signal is the
+  one bound. New knobs: `GBRAIN_EMBED_MAX_BATCH_TOKENS` (per-request budget, any
+  recipe) and `GBRAIN_EMBED_BATCH_SIZE` (embedBatch page size).
+  `GBRAIN_AI_EMBED_TIMEOUT_MS`, when set, still wins over the recipe default.
+- **Deletions propagate in git-first mode.** `delete_page` on a machine-managed
+  source now `git rm`s the file, commits and pushes before tombstoning the row
+  (push failure fails the delete; same gate as a git-first `put_page`). Full
+  sync on a managed source now also tombstones live markdown pages with no
+  backing file even when `source_path` is NULL — the shape of every page a
+  git-first `put_page` indexed, which the reconcile used to spare forever.
+  Sync deletes (incremental and full) are now soft, so a mistaken `git rm` is
+  recoverable via `restore_page` until the purge window; writing a page onto a
+  soft-deleted slug (re-import, `put_page`) resurrects it.
+- **Remote reads of `takes` work under RLS.** Migration v130 grants
+  `gbrain_request` SELECT on `takes` (with a page-label policy, so a take is
+  visible exactly when its page is) and USAGE on `page_generation_clock_seq`.
+  `doctor`'s `rls_enforcement` check now reports missing support-object grants.
+
+See `docs/embedding-migrations.md` → "Renaming the provider for the SAME model"
+for moving an `ollama:<model>` workaround to `llama-server:<model>` without
+re-embedding.
 
 ## [0.43.0.26] - 2026-08-25
 
