@@ -1651,80 +1651,84 @@ async function extractStaleFromDB(
   let linksCreated = 0, timelineCreated = 0, pagesProcessed = 0;
   let budgetHit = false;
 
-  for (;;) {
-    const rows = await engine.listStalePagesForExtraction({
-      batchSize: STALE_BATCH_SIZE, afterPageId, sourceId: sourceIdFilter, versionTs,
-    });
-    if (rows.length === 0) break;
+  // try/finally: a flush throw (CDX-4) must still deregister the reporter from
+  // the process-level signal coordinator, or it leaks for the process lifetime.
+  try {
+    for (;;) {
+      const rows = await engine.listStalePagesForExtraction({
+        batchSize: STALE_BATCH_SIZE, afterPageId, sourceId: sourceIdFilter, versionTs,
+      });
+      if (rows.length === 0) break;
 
-    const linkRows: LinkBatchInput[] = [];
-    const timelineRows: TimelineBatchInput[] = [];
-    const processedRefs: Array<{ slug: string; source_id: string; extractedAt: string }> = [];
+      const linkRows: LinkBatchInput[] = [];
+      const timelineRows: TimelineBatchInput[] = [];
+      const processedRefs: Array<{ slug: string; source_id: string; extractedAt: string }> = [];
 
-    for (const page of rows) {
-      const fullContent = page.compiled_truth + '\n' + page.timeline;
-      const extracted = await extractPageLinks(
-        page.slug, fullContent, page.frontmatter, page.type, resolverFor(page.source_id),
-        { skipFrontmatter: !includeFrontmatter, basenameMode },
-      );
-      for (const c of extracted.candidates) {
-        const r = resolveCandidateSources(c, page.slug, page.source_id, allSlugs, slugToSources);
-        if (!r) continue;
-        linkRows.push({
-          from_slug: r.fromSlug, to_slug: c.targetSlug, link_type: c.linkType,
-          context: c.context, link_source: c.linkSource, origin_slug: c.originSlug,
-          origin_field: c.originField, from_source_id: r.fromSourceId,
-          to_source_id: r.toSourceId, origin_source_id: page.source_id,
-        });
+      for (const page of rows) {
+        const fullContent = page.compiled_truth + '\n' + page.timeline;
+        const extracted = await extractPageLinks(
+          page.slug, fullContent, page.frontmatter, page.type, resolverFor(page.source_id),
+          { skipFrontmatter: !includeFrontmatter, basenameMode },
+        );
+        for (const c of extracted.candidates) {
+          const r = resolveCandidateSources(c, page.slug, page.source_id, allSlugs, slugToSources);
+          if (!r) continue;
+          linkRows.push({
+            from_slug: r.fromSlug, to_slug: c.targetSlug, link_type: c.linkType,
+            context: c.context, link_source: c.linkSource, origin_slug: c.originSlug,
+            origin_field: c.originField, from_source_id: r.fromSourceId,
+            to_source_id: r.toSourceId, origin_source_id: page.source_id,
+          });
+        }
+        for (const entry of parseTimelineEntries(fullContent)) {
+          timelineRows.push({ slug: page.slug, date: entry.date, summary: entry.summary, detail: entry.detail || '', source_id: page.source_id });
+        }
+        // EVERY processed page is stamped (incl. zero-link pages). D4 race fix:
+        // stamp with the row's READ updated_at, NOT now() — a concurrent edit
+        // landing between this SELECT and the stamp advances updated_at past the
+        // stamped value, so the page stays stale and re-extracts next run instead
+        // of being marked fresh-with-stale-content.
+        //
+        // #1768: stamp the FULL-µs `updated_at_iso` (projected via to_char), NOT
+        // `page.updated_at.toISOString()` — the JS Date is ms-truncated, so the
+        // µs-precision DB updated_at stayed strictly greater and the page never
+        // cleared on Postgres. Stamping the exact value makes them equal.
+        //
+        // Floor the stamp at versionTs. A page last edited BEFORE the current
+        // extractor version would otherwise be stamped below it, stay stale on
+        // the version arm (`links_extracted_at < versionTs`) and re-extract on
+        // every run forever — i.e. every LINK_EXTRACTOR_VERSION_TS bump turned
+        // each timer tick into a whole-brain re-extraction. Comparing at ms
+        // precision is safe: µs only ever push updated_at further above.
+        const extractedAt = Date.parse(page.updated_at_iso) >= Date.parse(versionTs)
+          ? page.updated_at_iso
+          : versionTs;
+        processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt });
       }
-      for (const entry of parseTimelineEntries(fullContent)) {
-        timelineRows.push({ slug: page.slug, date: entry.date, summary: entry.summary, detail: entry.detail || '', source_id: page.source_id });
+
+      // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so
+      // the batch's pages stay unstamped and re-extract next run. addLinksBatch is
+      // ON CONFLICT DO NOTHING + timeline dedups, so partial-chunk writes are
+      // idempotent on re-extraction.
+      for (let i = 0; i < linkRows.length; i += BATCH_SIZE) {
+        linksCreated += await engine.addLinksBatch(linkRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' }); // gbrain-allow-direct-insert: gbrain extract --stale — canonical link reconciliation from markdown body
       }
-      // EVERY processed page is stamped (incl. zero-link pages). D4 race fix:
-      // stamp with the row's READ updated_at, NOT now() — a concurrent edit
-      // landing between this SELECT and the stamp advances updated_at past the
-      // stamped value, so the page stays stale and re-extracts next run instead
-      // of being marked fresh-with-stale-content.
-      //
-      // #1768: stamp the FULL-µs `updated_at_iso` (projected via to_char), NOT
-      // `page.updated_at.toISOString()` — the JS Date is ms-truncated, so the
-      // µs-precision DB updated_at stayed strictly greater and the page never
-      // cleared on Postgres. Stamping the exact value makes them equal.
-      //
-      // Floor the stamp at versionTs. A page last edited BEFORE the current
-      // extractor version would otherwise be stamped below it, stay stale on
-      // the version arm (`links_extracted_at < versionTs`) and re-extract on
-      // every run forever — i.e. every LINK_EXTRACTOR_VERSION_TS bump turned
-      // each timer tick into a whole-brain re-extraction. Comparing at ms
-      // precision is safe: µs only ever push updated_at further above.
-      const extractedAt = Date.parse(page.updated_at_iso) >= Date.parse(versionTs)
-        ? page.updated_at_iso
-        : versionTs;
-      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt });
-    }
+      for (let i = 0; i < timelineRows.length; i += BATCH_SIZE) {
+        timelineCreated += await engine.addTimelineEntriesBatch(timelineRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' });
+      }
+      // Stamp LAST, directly (not the swallowing stampExtracted) so a stamp
+      // failure surfaces instead of looping forever.
+      await engine.markPagesExtractedBatch(processedRefs, new Date().toISOString());
 
-    // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so
-    // the batch's pages stay unstamped and re-extract next run. addLinksBatch is
-    // ON CONFLICT DO NOTHING + timeline dedups, so partial-chunk writes are
-    // idempotent on re-extraction.
-    for (let i = 0; i < linkRows.length; i += BATCH_SIZE) {
-      linksCreated += await engine.addLinksBatch(linkRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' }); // gbrain-allow-direct-insert: gbrain extract --stale — canonical link reconciliation from markdown body
-    }
-    for (let i = 0; i < timelineRows.length; i += BATCH_SIZE) {
-      timelineCreated += await engine.addTimelineEntriesBatch(timelineRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' });
-    }
-    // Stamp LAST, directly (not the swallowing stampExtracted) so a stamp
-    // failure surfaces instead of looping forever.
-    await engine.markPagesExtractedBatch(processedRefs, new Date().toISOString());
+      pagesProcessed += rows.length;
+      progress.tick(rows.length);
+      afterPageId = rows[rows.length - 1]!.id;
 
-    pagesProcessed += rows.length;
-    progress.tick(rows.length);
-    afterPageId = rows[rows.length - 1]!.id;
-
-    if (!catchUp && Date.now() - startMs > STALE_TIME_BUDGET_MS) { budgetHit = true; break; }
+      if (!catchUp && Date.now() - startMs > STALE_TIME_BUDGET_MS) { budgetHit = true; break; }
+    }
+  } finally {
+    progress.finish();
   }
-
-  progress.finish();
   const staleRemaining = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs });
 
   if (!jsonMode) {

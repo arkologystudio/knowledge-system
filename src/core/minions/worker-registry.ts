@@ -143,21 +143,38 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
 }
 
 /**
+ * Parse `ps -o etime=` output (`[[dd-]hh:]mm:ss`) to elapsed milliseconds.
+ * Returns null on anything unrecognised. Exported for tests.
+ */
+export function parseEtimeMs(raw: string): number | null {
+  const m = /^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$/.exec(raw.trim());
+  if (!m) return null;
+  const [, dd, hh, mm, ss] = m;
+  const secs = Number(dd ?? 0) * 86400 + Number(hh ?? 0) * 3600 + Number(mm) * 60 + Number(ss);
+  return secs * 1000;
+}
+
+/**
  * Best-effort process start time (epoch ms) via `ps`. Used for the PID-reuse
  * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
  * us report an unrelated process's niceness (Codex #8). Returns null when
  * undeterminable — callers must NOT treat null as "reused".
+ *
+ * Derived from elapsed time (`etime`, portable across procps and BSD ps), not
+ * `lstart`: `lstart` is a zone-less wall-clock string rendered in ps's local
+ * zone, so parsing it in a process whose TZ differs (e.g. `bun test`, which
+ * forces UTC) shifted the start time by the UTC offset and hid live workers.
  */
 function processStartMs(pid: number): number | null {
   try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
-    return Number.isNaN(t) ? null : t;
+    const elapsed = parseEtimeMs(out);
+    return elapsed === null ? null : Date.now() - elapsed;
   } catch {
     return null;
   }
