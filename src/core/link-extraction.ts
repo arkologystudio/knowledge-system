@@ -14,6 +14,8 @@
 import type { BrainEngine } from './engine.ts';
 import type { PageType } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
+import { posix as posixPath } from 'path';
+import { slugifyPath } from './sync.ts';
 
 /**
  * v0.42.7 — link-extraction version stamp. Bump this ISO timestamp whenever the
@@ -28,7 +30,7 @@ import { ensureWellFormed } from './text-safe.ts';
  * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
  * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
  */
-export const LINK_EXTRACTOR_VERSION_TS = '2026-05-31T00:00:00Z';
+export const LINK_EXTRACTOR_VERSION_TS = '2026-10-19T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -160,6 +162,15 @@ const WIKILINK_GENERIC_RE = /\[\[([^|\]#\n[]+?)(?:#[^|\]]*?)?(?:\|([^\]]+?))?\]\
  * would emit a stray basename ref for the inner `[[acme]]`. Mask the whole
  * span out of the 2c scan so a wikilink inside a markdown label is inert.
  */
+/**
+ * A relative markdown link to a `.md` file in ANY folder, e.g.
+ * `[Weekly](../notes/weekly.md)`. ENTITY_REF_RE only accepts DIR_PATTERN
+ * folders; this catches the rest, tagged `needsResolution` so the target is
+ * kept only when it names a real page (resolved relative to the linking
+ * page, then up its ancestors — the same walk the FS extractor uses).
+ */
+const MARKDOWN_GENERIC_MD_RE = /\[([^\]\n]+)\]\(((?!<)[^)\s]+?\.md)(?:#[^)\s]*)?\)/g;
+
 const MARKDOWN_LABEL_WIKILINK_RE = /\[[^\]\n]*\[\[[^\]\n]+\]\][^\]\n]*\]\([^)\n]+\)/g;
 
 /**
@@ -382,7 +393,55 @@ export function extractEntityRefs(content: string): EntityRef[] {
     refs.push({ name: displayName, slug, dir, needsResolution: true });
   }
 
+  // 3. Relative `.md` markdown links outside DIR_PATTERN folders. Pass-1
+  //    spans are masked so a DIR_PATTERN link is never emitted twice.
+  const mdGenericMasked = maskRanges(stripped, [...markdownRanges, ...labelWikilinkRanges]);
+  const mdGenericPattern = new RegExp(MARKDOWN_GENERIC_MD_RE.source, MARKDOWN_GENERIC_MD_RE.flags);
+  while ((match = mdGenericPattern.exec(mdGenericMasked)) !== null) {
+    const target = match[2].trim();
+    if (!target || target.includes('://') || target.startsWith('/')) continue;
+    const slug = target.slice(0, -3);
+    const dir = slug.includes('/') ? slug.split('/')[0] : '';
+    refs.push({ name: match[1].trim(), slug, dir, needsResolution: true });
+  }
+
   return refs;
+}
+
+/**
+ * How a wikilink / markdown target that is not in a DIR_PATTERN folder is
+ * resolved, after the exact-path check (which always runs):
+ *   - 'off'    — exact path only.
+ *   - 'unique' — plus a basename match when exactly ONE page has that
+ *                basename (Obsidian's own rule). Default.
+ *   - 'all'    — plus every basename match (issue #972 opt-in).
+ */
+export type BasenameMode = 'off' | 'unique' | 'all';
+
+/**
+ * Candidate slugs for a link `target` written on page `fromSlug`, in the
+ * order they should be tried: relative to the page's folder, then each
+ * ancestor up to the brain root. Mirrors the FS extractor's `resolveSlug`.
+ * Each candidate is also offered in slugified form (`Notes/My Note` →
+ * `notes/my-note`), since that is how sync names files.
+ */
+export function linkPathCandidates(fromSlug: string, target: string): string[] {
+  const clean = target.replace(/\.md$/i, '').replace(/^\.\//, '');
+  const fileDir = fromSlug.includes('/') ? fromSlug.slice(0, fromSlug.lastIndexOf('/')) : '';
+  const parts = fileDir.split('/').filter(Boolean);
+  const out: string[] = [];
+  const add = (p: string) => {
+    const norm = posixPath.normalize(p);
+    if (!norm || norm === '.' || norm.startsWith('..')) return;
+    if (!out.includes(norm)) out.push(norm);
+    const slugified = slugifyPath(norm).toLowerCase();
+    if (slugified && !out.includes(slugified)) out.push(slugified);
+  };
+  for (let strip = 0; strip <= parts.length; strip++) {
+    const base = parts.slice(0, parts.length - strip).join('/');
+    add(base ? `${base}/${clean}` : clean);
+  }
+  return out;
 }
 
 /**
@@ -468,9 +527,11 @@ export async function extractPageLinks(
   frontmatter: Record<string, unknown>,
   pageType: PageType,
   resolver: SlugResolver,
-  opts: { globalBasename?: boolean; skipFrontmatter?: boolean } = {},
+  opts: { globalBasename?: boolean; basenameMode?: BasenameMode; skipFrontmatter?: boolean } = {},
 ): Promise<PageLinksResult> {
   const candidates: LinkCandidate[] = [];
+  // Legacy callers pass the boolean; `globalBasename: true` is 'all'.
+  const basenameMode: BasenameMode = opts.basenameMode ?? (opts.globalBasename ? 'all' : 'off');
 
   // 1. Markdown entity refs.
   for (const ref of extractEntityRefs(content)) {
@@ -482,14 +543,40 @@ export async function extractPageLinks(
     // pre-v0.40.8.2 behavior of dropping bare wikilinks outside
     // DIR_PATTERN.
     if (ref.needsResolution) {
-      if (!opts.globalBasename || typeof resolver.resolveBasenameMatches !== 'function') {
+      // Exact path first, in any folder: `[[notes/x]]` or `[y](../sources/y.md)`
+      // naming a real page is an ordinary link, no ambiguity — so it is
+      // always on and typed like any markdown edge. DIR_PATTERN was only
+      // ever a proxy for "this is a page"; existence is the real test.
+      if (typeof resolver.slugExists === 'function') {
+        let exact: string | null = null;
+        for (const cand of linkPathCandidates(slug, ref.slug)) {
+          if (await resolver.slugExists(cand)) { exact = cand; break; }
+        }
+        if (exact) {
+          if (exact !== slug) {
+            const idx = content.indexOf(ref.slug);
+            const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+            candidates.push({
+              targetSlug: exact,
+              linkType: inferLinkType(pageType, context, content, exact),
+              context,
+              linkSource: 'markdown',
+            });
+          }
+          continue;
+        }
+      }
+      if (basenameMode === 'off' || typeof resolver.resolveBasenameMatches !== 'function') {
         continue;
       }
       // Issue #972 (codex): resolve by the wikilink TARGET (ref.slug — the
       // text inside `[[...]]` before any `|`), NOT the display alias
       // (ref.name = match[2]). `[[struktura|the project]]` must resolve
       // `struktura`, not "the project". The display text is for context only.
-      const matches = await resolver.resolveBasenameMatches(ref.slug);
+      const tail = ref.slug.includes('/') ? ref.slug.slice(ref.slug.lastIndexOf('/') + 1) : ref.slug;
+      const allMatches = await resolver.resolveBasenameMatches(tail);
+      // 'unique': an ambiguous basename links nowhere rather than everywhere.
+      const matches = basenameMode === 'unique' && allMatches.length !== 1 ? [] : allMatches;
       if (matches.length === 0) continue;
       const idx = content.indexOf(ref.slug);
       const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
@@ -819,6 +906,13 @@ export interface SlugResolver {
    * a single extract run (build the index once, reuse it).
    */
   resolveBasenameMatches?(name: string): Promise<string[]>;
+  /**
+   * True when `slug` names an existing page (in the resolver's source).
+   * Lets a link to ANY folder (`[[notes/x]]`, `[x](../sources/y.md)`)
+   * resolve by exact path rather than only DIR_PATTERN folders.
+   * Optional; resolvers without it skip the exact-path check.
+   */
+  slugExists?(slug: string): Promise<boolean>;
 }
 
 /**
@@ -900,6 +994,7 @@ export function makeResolver(
   // `[[Fast-Weigh]]` matches a page slugged `companies/fast-weigh` as
   // well as `notes/Fast-Weigh`.
   let basenameIndex: Map<string, string[]> | null = null;
+  let slugSet: Set<string> = new Set();
   async function ensureBasenameIndex(): Promise<Map<string, string[]>> {
     if (basenameIndex !== null) return basenameIndex;
     const idx = new Map<string, string[]>();
@@ -914,6 +1009,7 @@ export function makeResolver(
       // same-tail page in a DIFFERENT source and create a cross-source edge.
       // #972 is "global basename across folders," not "cross-source federation."
       const all = await engine.getAllSlugs(opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+      slugSet = new Set(all);
       // Issue #972 (codex [P2] DRY): one shared index builder for all surfaces.
       basenameIndex = buildBasenameIndex(all);
       return basenameIndex;
@@ -930,6 +1026,11 @@ export function makeResolver(
       // Issue #972 (codex [P2] DRY): shared query so resolver + FS + doctor
       // return the same matches in the same stable order.
       return queryBasenameIndex(await ensureBasenameIndex(), name);
+    },
+
+    async slugExists(slug: string): Promise<boolean> {
+      await ensureBasenameIndex();
+      return slugSet.has(slug);
     },
 
     async resolve(name: string, dirHint?: string | string[]): Promise<string | null> {
@@ -1201,29 +1302,46 @@ export async function isAutoTimelineEnabled(engine: BrainEngine): Promise<boolea
 }
 
 /**
- * Read the `link_resolution.global_basename` config flag. Defaults to
- * FALSE (opt-in only; existing brains keep ancestor-walk resolution).
+ * Read the `link_resolution.global_basename` setting as a BasenameMode.
  *
- * When TRUE: bare wikilinks like `[[struktura]]` (no DIR_PATTERN prefix)
- * that don't resolve via the existing path are matched against every
- * page's basename. Each unique match emits a graph edge tagged
- * `linkType: 'wikilink_basename'`. Multiple matches emit multiple edges.
+ *   - `true` / `all` (and 1/yes/on) → 'all': every basename match emits an
+ *     edge tagged `wikilink_basename` (the issue #972 opt-in).
+ *   - `false` / `off` (and 0/no)    → 'off': exact paths only.
+ *   - unset / `unique`              → 'unique': a bare `[[name]]` links when
+ *     exactly one page has that basename. Default since v0.43.0.28 — before,
+ *     unset meant 'off' and Obsidian-style vaults got no edges for bare links.
  *
- * Resolution order (highest → lowest):
- *   1. Env var `GBRAIN_LINK_RESOLUTION_GLOBAL_BASENAME=1` (operator override)
- *   2. DB plane via `engine.getConfig('link_resolution.global_basename')`
- *   3. Default false
+ * Resolution order: env `GBRAIN_LINK_RESOLUTION_GLOBAL_BASENAME`, then the DB
+ * config key, then the default. Unrecognised values fall through.
  *
  * Closes https://github.com/garrytan/gbrain/issues/972.
  */
-export async function isGlobalBasenameEnabled(engine: BrainEngine): Promise<boolean> {
+export async function resolveBasenameMode(engine: BrainEngine): Promise<BasenameMode> {
+  const parse = (raw: string): BasenameMode | null => {
+    const v = raw.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on', 'all'].includes(v)) return 'all';
+    if (['0', 'false', 'no', 'off'].includes(v)) return 'off';
+    if (v === 'unique') return 'unique';
+    return null;
+  };
   const envVal = process.env.GBRAIN_LINK_RESOLUTION_GLOBAL_BASENAME;
   if (envVal != null) {
-    const normalized = envVal.trim().toLowerCase();
-    return ['1', 'true', 'yes', 'on'].includes(normalized);
+    const m = parse(envVal);
+    if (m) return m;
   }
   const val = await engine.getConfig('link_resolution.global_basename');
-  if (val == null) return false;
-  const normalized = val.trim().toLowerCase();
-  return ['1', 'true', 'yes', 'on'].includes(normalized);
+  if (val != null) {
+    const m = parse(val);
+    if (m) return m;
+  }
+  return 'unique';
+}
+
+/**
+ * True only for the explicit all-matches mode (`global_basename = true`).
+ * Kept for callers that ask "is the #972 opt-in on"; extraction itself
+ * uses `resolveBasenameMode`.
+ */
+export async function isGlobalBasenameEnabled(engine: BrainEngine): Promise<boolean> {
+  return (await resolveBasenameMode(engine)) === 'all';
 }

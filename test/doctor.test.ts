@@ -1233,6 +1233,8 @@ describe('issue #972 — link_resolution_opportunity check', () => {
   });
 
   test('≥5 would-resolve AND ≥20% ratio → warn with paste-ready hint', async () => {
+    // Basename matching explicitly off: every match is a would-resolve.
+    await engine.setConfig('link_resolution.global_basename', 'false');
     // 5 distinct bare wikilinks, all resolving = 100% ratio.
     await engine.putPage('projects/struktura', {
       type: 'project', title: 'Struktura', compiled_truth: '', timeline: '',
@@ -1264,6 +1266,8 @@ describe('issue #972 — link_resolution_opportunity check', () => {
   });
 
   test('<5 would-resolve → ok without warning (below threshold)', async () => {
+    // Basename matching explicitly off: every match is a would-resolve.
+    await engine.setConfig('link_resolution.global_basename', 'false');
     // Only 2 bare wikilinks resolve → below the 5-link floor.
     await engine.putPage('projects/struktura', {
       type: 'project', title: 'Struktura', compiled_truth: '', timeline: '',
@@ -1282,6 +1286,8 @@ describe('issue #972 — link_resolution_opportunity check', () => {
   });
 
   test('counts slugified-only matches (shared matcher, codex #972 DRY)', async () => {
+    // Basename matching explicitly off: every match is a would-resolve.
+    await engine.setConfig('link_resolution.global_basename', 'false');
     // `[[Fast Weigh]]` (space) only resolves to `companies/fast-weigh` via the
     // slugified key. Pre-consolidation the doctor index keyed raw+lower only
     // and would have reported "none have basename matches"; the shared matcher
@@ -1298,6 +1304,40 @@ describe('issue #972 — link_resolution_opportunity check', () => {
     expect(check.message).toContain('1/1');
     expect(check.message).toContain('would resolve');
     expect(check.message).not.toContain('none have basename matches');
+  });
+
+  test('default (unique) mode: unambiguous bare links already resolve → ok', async () => {
+    for (const n of ['a1', 'a2', 'a3', 'a4', 'a5']) {
+      await engine.putPage(`projects/${n}`, { type: 'project', title: n, compiled_truth: '', timeline: '' });
+    }
+    await engine.putPage('concepts/hub', {
+      type: 'concept', title: 'Hub', compiled_truth: 'See [[a1]] [[a2]] [[a3]] [[a4]] [[a5]].', timeline: '',
+    });
+    const check = await checkLinkResolutionOpportunity(engine);
+    expect(check.status).toBe('ok');
+    expect(check.message).toContain('already resolve');
+  });
+
+  test('default (unique) mode: ≥5 AMBIGUOUS bare links → warn with the `true` hint', async () => {
+    for (const n of ['b1', 'b2', 'b3', 'b4', 'b5']) {
+      await engine.putPage(`projects/${n}`, { type: 'project', title: n, compiled_truth: '', timeline: '' });
+      await engine.putPage(`archive/${n}`, { type: 'note', title: n, compiled_truth: '', timeline: '' });
+    }
+    await engine.putPage('concepts/hub', {
+      type: 'concept', title: 'Hub', compiled_truth: 'See [[b1]] [[b2]] [[b3]] [[b4]] [[b5]].', timeline: '',
+    });
+    const check = await checkLinkResolutionOpportunity(engine);
+    expect(check.status).toBe('warn');
+    expect(check.message).toContain('ambiguous');
+    expect(check.message).toContain('gbrain config set link_resolution.global_basename true');
+  });
+
+  test('exact paths in any folder are not counted as bare wikilinks', async () => {
+    await engine.setConfig('link_resolution.global_basename', 'false');
+    await engine.putPage('notes/x', { type: 'note', title: 'x', compiled_truth: '', timeline: '' });
+    await engine.putPage('concepts/hub', { type: 'concept', title: 'Hub', compiled_truth: 'See [[notes/x]].', timeline: '' });
+    const check = await checkLinkResolutionOpportunity(engine);
+    expect(check.message).toContain('No bare wikilinks');
   });
 
   test('check is wired into runDoctor AND doctorReportRemote (source-grep)', async () => {

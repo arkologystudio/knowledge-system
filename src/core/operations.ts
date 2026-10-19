@@ -19,7 +19,7 @@ import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
 import type { HybridSearchMeta } from './types.ts';
-import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
+import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, resolveBasenameMode, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
 import { isFactsBackstopEligible } from './facts/eligibility.ts';
 import { stripTakesFence } from './takes-fence.ts';
 import { stripFactsFence } from './facts-fence.ts';
@@ -823,7 +823,7 @@ const get_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
+  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. Remote (MCP) writes skip that inline step for safety (auto_links.skipped = "remote"): their links appear after the next `gbrain extract --stale` / autopilot extract phase. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
@@ -1159,9 +1159,9 @@ const put_page: Operation = {
     let autoLinks:
       | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }
       | { error: string }
-      | { skipped: 'remote' }
+      | { skipped: 'remote'; hint: string }
       | undefined;
-    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote' } | undefined;
+    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote'; hint: string } | undefined;
     // Trusted-workspace path (v0.23 dream cycle) re-enables auto-link/timeline
     // even though ctx.remote=true, because the allow-list bounds the slug and
     // the synthesis prompt is itself the trusted dispatcher. Without this,
@@ -1172,8 +1172,11 @@ const put_page: Operation = {
       && Array.isArray(ctx.allowedSlugPrefixes)
       && ctx.allowedSlugPrefixes.length > 0;
     if (ctx.remote !== false && !trustedWorkspace) {
-      autoLinks = { skipped: 'remote' };
-      autoTimeline = { skipped: 'remote' };
+      // Tell the agent where its edges WILL come from, so a missing graph
+      // reads as "pending", not "broken".
+      const hint = REMOTE_AUTO_LINK_HINT;
+      autoLinks = { skipped: 'remote', hint };
+      autoTimeline = { skipped: 'remote', hint };
     } else if (result.parsedPage) {
       try {
         const enabled = await isAutoLinkEnabled(ctx.engine);
@@ -1467,11 +1470,12 @@ async function runAutoLink(
   // Issue #972 (codex [P1]): pass sourceId so basename resolution stays
   // within this page's source — no cross-source basename edges.
   const resolver = makeResolver(engine, { mode: 'live', sourceId: opts?.sourceId });
-  // Issue #972: opt-in bare-wikilink basename resolution. Off by default.
-  const globalBasename = await isGlobalBasenameEnabled(engine);
+  // Bare-wikilink basename resolution: unique-match by default (#972 'all'
+  // is the opt-in); exact paths in any folder always resolve.
+  const basenameMode = await resolveBasenameMode(engine);
   const { candidates, unresolved } = await extractPageLinks(
     slug, fullContent, parsed.frontmatter, parsed.type, resolver,
-    { globalBasename },
+    { basenameMode },
   );
 
   // Resolve which targets exist (skip refs to non-existent pages to avoid FK
@@ -1608,6 +1612,16 @@ async function runAutoLink(
 
   return { ...result, unresolved };
 }
+
+/**
+ * Remote (MCP) writes never run auto-link/auto-timeline inline (see the
+ * SECURITY note in put_page). Their edges and timeline rows are built by the
+ * next link-extraction pass over stale pages.
+ */
+export const REMOTE_AUTO_LINK_HINT =
+  'Graph links and timeline entries for remote writes are built by the next extraction pass ' +
+  '(`gbrain extract --stale`, which the autopilot/dream cycle runs as its extract phase), not inline. ' +
+  'On a brain with no autopilot, schedule `gbrain extract --stale`; `gbrain doctor` reports the lag as links_extraction_lag.';
 
 const delete_page: Operation = {
   name: 'delete_page',

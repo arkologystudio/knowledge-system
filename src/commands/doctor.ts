@@ -34,7 +34,8 @@ import { fileURLToPath } from 'url';
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import {
   extractEntityRefs,
-  isGlobalBasenameEnabled,
+  resolveBasenameMode,
+  linkPathCandidates,
   buildBasenameIndex,
   queryBasenameIndex,
 } from '../core/link-extraction.ts';
@@ -1244,7 +1245,10 @@ export async function checkLinkResolutionOpportunity(
 ): Promise<Check> {
   const name = 'link_resolution_opportunity';
   try {
-    if (await isGlobalBasenameEnabled(engine)) {
+    // 'unique' (the default) already links every unambiguous bare wikilink;
+    // what 'all' would ADD is the ambiguous ones, so that is what we count.
+    const mode = await resolveBasenameMode(engine);
+    if (mode === 'all') {
       return { name, status: 'ok', message: 'global_basename mode already enabled' };
     }
     const allSlugs = await engine.getAllSlugs();
@@ -1259,6 +1263,7 @@ export async function checkLinkResolutionOpportunity(
 
     let bareCount = 0;
     let wouldResolveCount = 0;
+    let anyMatchCount = 0;
     const distinctTargets = new Set<string>();
 
     // Issue #972 (codex [P2] perf): batch-load the most-recent N pages in ONE
@@ -1266,8 +1271,8 @@ export async function checkLinkResolutionOpportunity(
     // full N-page walk hit the 60s budget every run on large brains and
     // returned a perpetual partial; this bounds the work to a fixed sample.
     const SAMPLE_LIMIT = 1000;
-    const sampled = await engine.executeRaw<{ compiled_truth: string | null; timeline: string | null }>(
-      `SELECT compiled_truth, timeline FROM pages WHERE deleted_at IS NULL ORDER BY id DESC LIMIT ${SAMPLE_LIMIT}`,
+    const sampled = await engine.executeRaw<{ slug: string; compiled_truth: string | null; timeline: string | null }>(
+      `SELECT slug, compiled_truth, timeline FROM pages WHERE deleted_at IS NULL ORDER BY id DESC LIMIT ${SAMPLE_LIMIT}`,
     );
     const totalPages = allSlugs.size;
     const sampledNote = totalPages > SAMPLE_LIMIT
@@ -1281,12 +1286,17 @@ export async function checkLinkResolutionOpportunity(
         const content = (row.compiled_truth ?? '') + '\n' + (row.timeline ?? '');
         for (const e of extractEntityRefs(content)) {
           if (!e.needsResolution) continue;
+          // An exact path in any folder resolves in every mode.
+          if (linkPathCandidates(row.slug, e.slug).some((c) => allSlugs.has(c))) continue;
           bareCount++;
           // Issue #972 (codex): match on the wikilink TARGET (e.slug), not
           // the display alias (e.name), via the shared query so the doctor
           // estimate equals what extraction actually resolves.
-          const matches = queryBasenameIndex(basenameIndex, e.slug);
-          if (matches.length > 0) {
+          const tail = e.slug.includes('/') ? e.slug.slice(e.slug.lastIndexOf('/') + 1) : e.slug;
+          const matches = queryBasenameIndex(basenameIndex, tail);
+          if (matches.length > 0) anyMatchCount++;
+          const gained = mode === 'unique' ? matches.length > 1 : matches.length > 0;
+          if (gained) {
             wouldResolveCount++;
             for (const m of matches) distinctTargets.add(m);
           }
@@ -1303,7 +1313,9 @@ export async function checkLinkResolutionOpportunity(
       return {
         name,
         status: 'ok',
-        message: `${bareCount} bare wikilink(s) found, but none have basename matches in the brain.`,
+        message: mode === 'unique' && anyMatchCount > 0
+          ? `${bareCount} bare wikilink(s) found; ${anyMatchCount} already resolve (default unique mode) and none are ambiguous.`
+          : `${bareCount} bare wikilink(s) found, but none have basename matches in the brain.`,
       };
     }
     const ratio = wouldResolveCount / bareCount;
@@ -1313,8 +1325,9 @@ export async function checkLinkResolutionOpportunity(
         name,
         status: 'warn',
         message:
-          `${wouldResolveCount} of ${bareCount} bare wikilinks (${pct}%) would resolve to ` +
-          `${distinctTargets.size} distinct page(s) under global_basename mode${sampledNote}. ` +
+          `${wouldResolveCount} of ${bareCount} bare wikilinks (${pct}%) ` +
+          (mode === 'unique' ? 'are ambiguous (several pages share the basename) and ' : '') +
+          `would resolve to ${distinctTargets.size} distinct page(s) under global_basename mode${sampledNote}. ` +
           `Enable with: gbrain config set link_resolution.global_basename true`,
       };
     }
