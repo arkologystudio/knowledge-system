@@ -12,10 +12,23 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runEvalTrajectory } from '../src/commands/eval-trajectory.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
+  // Hermetic against cross-file gateway state: initSchema() sizes the vector
+  // columns from the gateway, and beforeAll runs BEFORE the legacy preload's
+  // per-test re-pin. If an earlier file in the shard left the gateway on the
+  // ZE/1280 default, the 1536-d fixtures below fail with "expected 1280
+  // dimensions, not 1536" (seen in CI shard 9). Same fix as
+  // consolidate-valid-until.test.ts.
+  resetGateway();
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: { OPENAI_API_KEY: 'sk-fake' },
+  });
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -23,6 +36,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  resetGateway();
 });
 
 beforeEach(async () => {
