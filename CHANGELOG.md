@@ -2,6 +2,36 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.28] - 2026-10-19
+
+### Fixed
+
+- **Wikilinks into any folder become graph edges.** The DB extraction paths
+  (`put_page` auto-link, `extract --source db`, `extract --stale`) only
+  accepted `[[path]]` and `[label](path.md)` links whose folder was in a fixed
+  list (people, companies, meetings, concepts, …), so wikis using `notes/`,
+  `sources/` or `wiki/` got no edges — while the filesystem extractor linked
+  them fine. A link outside that list now resolves when the target page exists
+  (from the linking page's folder up to the root, raw or slugified) and is
+  stored as an ordinary markdown edge. Bare-text `people/slug` matching keeps
+  the folder list.
+- **Bare `[[page-name]]` links resolve by default when unambiguous.**
+  `link_resolution.global_basename` is now three-state: unset/`unique` (new
+  default) links when exactly one page has that basename; `true` keeps the
+  all-matches behaviour; `false` turns basename matching off.
+- **`extract --stale` resolved no bare wikilinks.** Without
+  `--include-frontmatter` it used a null resolver, which also disabled
+  basename resolution even with `global_basename=true`. It now uses a real
+  per-source resolver.
+- **A `LINK_EXTRACTOR_VERSION_TS` bump made `extract --stale` loop.** Pages
+  edited before the version were stamped below it and re-extracted on every
+  run. The stamp is now floored at the version. This release bumps the version,
+  so every page is re-extracted once (regex only, no LLM calls).
+- **Remote `put_page` says where its links come from.** `auto_links` /
+  `auto_timeline` return `{ skipped: "remote", hint }` naming
+  `gbrain extract --stale` / the autopilot extract phase; documented in
+  `docs/GBRAIN_VERIFY.md`.
+
 ## [0.43.0.26] - 2026-08-25
 
 ### Fixed
