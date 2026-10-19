@@ -17,6 +17,7 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { randomBytes, createHash } from 'crypto';
 import { safeHexEqual } from '../core/timing-safe.ts';
+import { resolveMcpInstructions } from '../core/mcp-instructions.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -1631,10 +1632,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // for legacy tokens or when the JOIN row's client_name is NULL.
     const agentName = authInfo.clientName ?? authInfo.clientId;
 
-    // Create a fresh MCP server per request (stateless)
+    // Create a fresh MCP server per request (stateless). Operator-set
+    // instructions (mcp.instructions_page / mcp.instructions) ride along in the
+    // initialize result so connected clients load the brain's house style.
+    const instructions = await resolveMcpInstructions(engine);
     const server = new Server(
       { name: 'gbrain', version: VERSION },
-      { capabilities: { tools: {} } },
+      { capabilities: { tools: {} }, ...(instructions ? { instructions } : {}) },
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async () => {
