@@ -172,7 +172,8 @@ describe('issue #972 — DB-source (gbrain extract links --source db)', () => {
     expect(strk!.link_type).toBe('wikilink_basename');
   });
 
-  test('flag OFF → no basename edges via DB path (back-compat)', async () => {
+  test('flag explicitly false → no basename edges via DB path', async () => {
+    await engine.setConfig('link_resolution.global_basename', 'false');
     await engine.putPage('projects/struktura', {
       type: 'project', title: 'Struktura',
       compiled_truth: '', timeline: '',
@@ -231,13 +232,14 @@ describe('issue #972 — put_page auto-link', () => {
     expect(strk!.link_type).toBe('wikilink_basename');
   });
 
-  test('flag OFF → put_page does NOT emit basename edge (back-compat)', async () => {
+  test('flag explicitly false → put_page does NOT emit basename edge', async () => {
     await engine.putPage('projects/struktura', {
       type: 'project', title: 'Struktura',
       compiled_truth: '', timeline: '',
     });
 
-    // Default-off (no setConfig)
+    // Unset now means 'unique'; 'false' is the explicit off switch.
+    await engine.setConfig('link_resolution.global_basename', 'false');
 
     const { operations } = await import('../../src/core/operations.ts');
     const putPage = operations.find(op => op.name === 'put_page')!;
