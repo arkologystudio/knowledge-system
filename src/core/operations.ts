@@ -1611,7 +1611,7 @@ async function runAutoLink(
 
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
+  description: 'Soft-delete a page. On a machine-managed (git-first) source the backing file is first removed with git rm, committed and pushed; a push failure fails the delete. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
   params: {
     slug: { type: 'string', required: true },
   },
@@ -1623,6 +1623,89 @@ const delete_page: Operation = {
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
     // intended row instead of always targeting (default, slug).
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+
+    // ── Git-first gate ────────────────────────────────────────────────────
+    // On a machine-managed source the repository is the truth: tombstoning
+    // only the index row leaves the file in git, and the next full sync (or
+    // any edit) re-imports it. So `git rm` + commit + PUSH first, then
+    // soft-delete. A push failure fails the delete with the index untouched —
+    // the same ordering put_page uses, in the other direction.
+    const writerSourceId = ctx.sourceId ?? 'default';
+    const isSandboxSubagent = ctx.viaSubagent === true
+      && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
+    let gitFirst: { committed: boolean; head_after?: string; path?: string } | undefined;
+    if (!isSandboxSubagent) {
+      const { resolveWriterMode, WriterModeError } = await import('./writer-mode.ts');
+      let writerMode: import('./writer-mode.ts').WriterResolution;
+      try {
+        writerMode = await resolveWriterMode(ctx.engine, writerSourceId);
+      } catch (e) {
+        if (e instanceof WriterModeError) {
+          throw new OperationError(
+            'invalid_request',
+            `writer mode is misconfigured for source '${writerSourceId}': ${e.message}`,
+            'An operator must correct writer.managed_sources / writer.mode on the brain host.',
+          );
+        }
+        throw e;
+      }
+      if (writerMode.mode === 'git-first') {
+        // Same capability gate as a git-first put_page / commit_page: this
+        // pushes to origin.
+        if (ctx.remote !== false) {
+          const enabled = await ctx.engine.getConfig('writer.commit_page.enabled');
+          if (enabled !== 'true') {
+            throw new OperationError(
+              'permission_denied',
+              `remote deletes on machine-managed source '${writerSourceId}' are disabled`,
+              'An operator must set writer.commit_page.enabled=true on the brain host — a git-first delete_page commits and pushes to the source repository.',
+            );
+          }
+          if (!ctx.sourceId) {
+            throw new OperationError(
+              'permission_denied',
+              'remote deletes on a machine-managed source require an OAuth client scoped to one write source',
+            );
+          }
+        }
+        const rows = await ctx.engine.executeRaw<{ source_path: string | null }>(
+          'SELECT source_path FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL',
+          [writerSourceId, slug],
+        );
+        if (rows.length > 0) {
+          const { gitFirstPageDelete, GitPageWriteError, gitFailureCode, isRetryableGitFailure } = await import('./git-page-write.ts');
+          const protectedRaw = (await ctx.engine.getConfig('writer.commit_page.protected_slugs')) ?? '';
+          const actor = ctx.auth?.clientId ? `mcp:${ctx.auth.clientId.slice(0, 8)}` : (ctx.remote === false ? 'cli' : 'mcp');
+          const authorIdentity = await resolveGitIdentity(ctx.engine, ctx.auth);
+          try {
+            const res = await gitFirstPageDelete(ctx.engine, {
+              sourceId: writerSourceId,
+              slug,
+              relPath: rows[0].source_path,
+              actor,
+              ...(authorIdentity ? { authorIdentity } : {}),
+              protectedSlugs: protectedRaw.split(',').map((x: string) => x.trim()).filter(Boolean),
+            });
+            gitFirst = { committed: true, head_after: res.head_after, path: res.path };
+          } catch (e) {
+            // File already absent from git: the invariant holds, tombstone the row.
+            if (e instanceof GitPageWriteError && e.code === 'nothing_to_commit') {
+              gitFirst = { committed: false };
+            } else {
+              const detail = e instanceof Error ? e.message : String(e);
+              throw new OperationError(
+                gitFailureCode(e),
+                `git-first delete failed for '${slug}' on machine-managed source '${writerSourceId}': ${detail}`,
+                isRetryableGitFailure(e)
+                  ? 'The repository was momentarily unavailable. Retry the same delete.'
+                  : undefined,
+              );
+            }
+          }
+        }
+      }
+    }
+
     // v0.26.5: rewired from hard-delete to soft-delete. The hard-delete primitive
     // (engine.deletePage) is now reserved for purgeDeletedPages and explicit
     // tests. softDeletePage returns null when the slug is unknown OR already
@@ -1637,7 +1720,12 @@ const delete_page: Operation = {
       }
       return { status: 'already_soft_deleted', slug, deleted_at: existing.deleted_at };
     }
-    return { status: 'soft_deleted', slug, recoverable_until: 'now + 72h via restore_page' };
+    return {
+      status: 'soft_deleted',
+      slug,
+      recoverable_until: 'now + 72h via restore_page',
+      ...(gitFirst ? { git: gitFirst } : {}),
+    };
   },
   cliHints: { name: 'delete', positional: ['slug'] },
 };

@@ -490,6 +490,44 @@ export async function childTableOrphansCheck(engine: BrainEngine): Promise<Check
  * complete, and that must be visible before the portal (KS-B/KS-E) serves any
  * client-confidential source.
  */
+/**
+ * Privileges the request role needs on read-support objects outside the
+ * 11 covered corpus tables. Returns human-readable gaps (empty = healthy).
+ * Objects that don't exist on this schema are skipped, not reported.
+ */
+export async function missingRequestRoleGrants(engine: BrainEngine): Promise<string[]> {
+  const rows = await engine.executeRaw<{
+    seq_select: boolean | null; seq_usage: boolean | null;
+    takes_select: boolean | null; takes_policy: boolean;
+    page_aliases: boolean | null; slug_aliases: boolean | null;
+  }>(
+    `SELECT
+       CASE WHEN to_regclass('public.page_generation_clock_seq') IS NULL THEN NULL
+            ELSE has_sequence_privilege('gbrain_request', 'page_generation_clock_seq', 'SELECT') END AS seq_select,
+       CASE WHEN to_regclass('public.page_generation_clock_seq') IS NULL THEN NULL
+            ELSE has_sequence_privilege('gbrain_request', 'page_generation_clock_seq', 'USAGE') END AS seq_usage,
+       CASE WHEN to_regclass('public.takes') IS NULL THEN NULL
+            ELSE has_table_privilege('gbrain_request', 'takes', 'SELECT') END AS takes_select,
+       (to_regclass('public.takes') IS NULL OR EXISTS (
+          SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = 'takes'
+            AND policyname = 'ks_source_isolation')) AS takes_policy,
+       CASE WHEN to_regclass('public.page_aliases') IS NULL THEN NULL
+            ELSE has_table_privilege('gbrain_request', 'page_aliases', 'SELECT') END AS page_aliases,
+       CASE WHEN to_regclass('public.slug_aliases') IS NULL THEN NULL
+            ELSE has_table_privilege('gbrain_request', 'slug_aliases', 'SELECT') END AS slug_aliases`,
+  );
+  const r = rows[0];
+  if (!r) return [];
+  const gaps: string[] = [];
+  if (r.seq_select === false) gaps.push('SELECT on page_generation_clock_seq');
+  if (r.seq_usage === false) gaps.push('USAGE on page_generation_clock_seq');
+  if (r.takes_select === false) gaps.push('SELECT on takes');
+  if (r.takes_policy === false) gaps.push('ks_source_isolation policy on takes');
+  if (r.page_aliases === false) gaps.push('SELECT on page_aliases');
+  if (r.slug_aliases === false) gaps.push('SELECT on slug_aliases');
+  return gaps;
+}
+
 export async function checkRlsEnforcement(engine: BrainEngine): Promise<Check> {
   const COVERED_TABLES = [
     'pages', 'content_chunks', 'artifacts', 'links', 'timeline_entries',
@@ -531,6 +569,21 @@ export async function checkRlsEnforcement(engine: BrainEngine): Promise<Check> {
         message:
           `RLS partially provisioned: gbrain_request exists but only ${present}/${COVERED_TABLES.length} ` +
           'covered-table policies are present. Re-run migration v125 (`gbrain apply-migrations --yes`) to heal.',
+      };
+    }
+    // Support objects the remote read paths touch beyond the 11 corpus
+    // tables (v126/v127/v130). A missing grant here does not leak anything —
+    // it fails closed with "permission denied" on the remote query path —
+    // but it breaks search/takes for every scoped caller, so surface it.
+    const gaps = await missingRequestRoleGrants(engine);
+    if (gaps.length > 0) {
+      return {
+        name: 'rls_enforcement',
+        status: 'warn',
+        message:
+          `RLS active, but gbrain_request is missing: ${gaps.join(', ')}. Remote query/takes paths ` +
+          'that touch these fail with "permission denied". Run `gbrain apply-migrations --yes` ' +
+          '(v126/v127/v130) to heal.',
       };
     }
     return {

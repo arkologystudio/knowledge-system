@@ -2448,9 +2448,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         }
         const slugs = batch.map(p => pathSlugMap.get(p) ?? resolveSlugForPath(p));
 
-        // Phase B: batch delete (1 round-trip per batch).
+        // Phase B: batch SOFT-delete (1 round-trip per batch). A removed file
+        // tombstones its page (recoverable via restore_page; the autopilot
+        // purge hard-deletes after the window) rather than destroying it, so
+        // a mistaken `git rm` is reversible and a revert resurrects the page.
         try {
-          const deleted = await engine.deletePages(slugs, deleteScopedOpts);
+          const deleted = await engine.softDeletePages(slugs, deleteScopedOpts);
           // D6: only push slugs that were actually deleted. Filters phantom
           // slugs (paths in filtered.deleted but with no DB row) so
           // downstream extract/embed don't waste lookups.
@@ -2465,8 +2468,8 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // (matching the existing import-loop pattern at sync.ts:~1350).
           for (let j = 0; j < slugs.length; j++) {
             try {
-              await engine.deletePage(slugs[j], deleteScopedOpts);
-              pagesAffected.push(slugs[j]);
+              const hit = await engine.softDeletePage(slugs[j], deleteScopedOpts);
+              if (hit) pagesAffected.push(slugs[j]);
               await markCompleted(batch[j]);
             } catch (perSlugErr) {
               failedFiles.push({
@@ -3387,18 +3390,46 @@ async function performFullSync(
         && isSyncable(r.source_path, reconcileSyncOpts)
         && !current.has(r.source_path))
       .map(r => r.slug);
+
+    // Machine-managed (git-first) sources: the repository IS the truth, so a
+    // live markdown page with no backing file is stale even when its
+    // source_path is NULL. That is exactly the shape of a page written by a
+    // git-first put_page / commit_page (indexed via importFromContent, which
+    // records no source_path) or imported before source_path existed — the
+    // rule-1 guard above spares them forever, which is why removing such a
+    // file never reached the index. Unmanaged sources keep rule 1: there a
+    // NULL source_path legitimately means "hand-authored, not from a file".
+    // Guarded on a non-empty tree so a broken checkout can't sweep a source.
+    const { isManagedSource } = await import('../core/writer-mode.ts');
+    if (current.size > 0 && await isManagedSource(engine, sid)) {
+      const liveSlugs = new Set<string>(rows
+        .filter(r => r.source_path != null && current.has(r.source_path))
+        .map(r => r.slug));
+      for (const rel of current) liveSlugs.add(resolveSlugForPath(rel));
+      const orphanRows = await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM pages
+          WHERE source_id = $1 AND source_path IS NULL AND deleted_at IS NULL
+            AND page_kind = 'markdown'`,
+        [sid],
+      );
+      for (const r of orphanRows) {
+        if (!liveSlugs.has(r.slug)) staleSlugs.push(r.slug);
+      }
+    }
+
     if (staleSlugs.length > 0) {
       const deleteScopedOpts = { sourceId: sid };
       for (let i = 0; i < staleSlugs.length; i += DELETE_BATCH_SIZE) {
         const batch = staleSlugs.slice(i, i + DELETE_BATCH_SIZE);
         try {
-          const deleted = await engine.deletePages(batch, deleteScopedOpts);
+          // Soft-delete, matching the incremental path (recoverable window).
+          const deleted = await engine.softDeletePages(batch, deleteScopedOpts);
           reconciledDeletes += deleted.length;
         } catch {
           // Per-slug fallback on a batch blip (mirrors the incremental delete
           // loop). A stale page that won't delete is best-effort, not fatal.
           for (const slug of batch) {
-            try { await engine.deletePage(slug, deleteScopedOpts); reconciledDeletes++; }
+            try { if (await engine.softDeletePage(slug, deleteScopedOpts)) reconciledDeletes++; }
             catch { /* best-effort */ }
           }
         }

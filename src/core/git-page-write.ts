@@ -275,6 +275,115 @@ function commitMessage(subject: string, actor: string, sourceId: string): string
   return `${cleanSubject}\n\nKnowledge-Actor: ${safeActor(actor)}\nKnowledge-Source: ${sourceId}`;
 }
 
+/**
+ * Shared preamble for every git-first mutation, run INSIDE the repo lock:
+ * refuse a dirty tree or detached HEAD, fast-forward to origin, and (on a
+ * machine-managed clone) refuse while local commits are ahead of origin.
+ */
+async function prepareCheckout(
+  engine: BrainEngine,
+  repoPath: string,
+  sourceId: string,
+): Promise<{ branch: string; head: string }> {
+  if (isWorkingTreeDirty(repoPath)) {
+    throw new GitPageWriteError('repo_dirty', 'source checkout has uncommitted changes');
+  }
+  const branch = git(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD'], 10_000);
+  if (!branch || branch === 'HEAD') {
+    throw new GitPageWriteError('repo_unavailable', 'source checkout is on detached HEAD');
+  }
+  const pull = divergenceSafePull(repoPath, branch);
+  if (pull.status === 'skipped_dirty') {
+    throw new GitPageWriteError('repo_dirty', 'source checkout became dirty before pull');
+  }
+  if (pull.status === 'conflict_aborted') {
+    throw new GitPageWriteError('repo_conflict', pull.detail);
+  }
+
+  const head = git(repoPath, ['rev-parse', 'HEAD'], 10_000);
+
+  // ONE POLICY PER CLONE.
+  //
+  // `divergenceSafePull` rebases, so a stray local commit sitting in the
+  // checkout would be replayed and PUSHED by this write — publishing an
+  // operator's untidy commit to origin, unindexed and unreviewed. On a
+  // machine-managed source the sync loop's policy for that same commit is the
+  // opposite: quarantine it to a rescue ref and discard it. Whichever ran
+  // first would win, which is a coin toss deciding whether a stray commit
+  // becomes canonical wiki content.
+  //
+  // Refusing here leaves exactly one policy in force on a managed clone —
+  // sync's — and the next converge (within 5 minutes) clears the condition
+  // unattended, so this is a pause rather than a wedge.
+  if (await isManagedSource(engine, sourceId)) {
+    const ahead = git(repoPath, ['rev-list', '--count', `origin/${branch}..HEAD`], 10_000);
+    if (ahead !== '0') {
+      throw new GitPageWriteError(
+        'repo_conflict',
+        `machine-managed checkout is ${ahead} commit(s) ahead of origin/${branch}. ` +
+          `Writing now would rebase and push those commits. The sync loop quarantines ` +
+          `them instead; retry after the next convergence (within 5 minutes).`,
+      );
+    }
+  }
+  return { branch, head };
+}
+
+/**
+ * Push `committedHead` to origin. On failure, ask the remote whether the ref
+ * landed anyway; if it did, the write succeeded. Otherwise hard-reset to the
+ * pre-write `head` so a failed write leaves nothing behind, then throw.
+ */
+function pushOrRollback(repoPath: string, branch: string, head: string, committedHead: string): void {
+  try {
+    git(repoPath, [
+      '-c', 'http.followRedirects=false',
+      'push', ...GIT_SSRF_SUBCOMMAND_FLAGS, 'origin', `HEAD:${branch}`,
+    ], 180_000);
+  } catch (e) {
+    // Roll the commit back. Leaving it behind was the pre-existing behaviour
+    // and it is worse than it looks: the checkout is left CLEAN but one commit
+    // ahead of origin — the exact divergent state this whole design exists to
+    // prevent — and because `divergenceSafePull` rebases, the NEXT successful
+    // write replays and pushes this commit. The caller was told its write
+    // failed and no index row was created, yet the content reaches
+    // `origin/main` later, unindexed and unattributed.
+    //
+    // Reset to the pre-write commit so a failed write leaves nothing at all.
+    // `--hard` is safe here and nowhere else: we are inside the repo lock, we
+    // verified the tree was clean before writing, and the only change since is
+    // the one file we just wrote.
+    // Did the push actually land? A remote can accept the ref and the client
+    // still see a network error on the response. Rolling back then would
+    // discard a commit that IS live on origin, and report a success as a
+    // failure. Ask the remote before touching anything.
+    let landed = false;
+    try {
+      const remoteRef = git(repoPath, [
+        '-c', 'http.followRedirects=false',
+        'ls-remote', 'origin', `refs/heads/${branch}`,
+      ], 30_000);
+      landed = remoteRef.startsWith(committedHead);
+    } catch {
+      landed = false;                      // cannot tell → treat as not landed
+    }
+    if (landed) return;
+
+    let rollback = 'rolled back';
+    try {
+      git(repoPath, ['reset', '--hard', head], 30_000);
+    } catch (resetErr) {
+      // Report the failure to roll back rather than hiding it — a mirror left
+      // ahead of origin is something an operator needs to know about.
+      rollback = `ROLLBACK FAILED (${redactGitError(resetErr instanceof Error ? resetErr.message : String(resetErr))}); commit ${committedHead.slice(0, 12)} is local-only and will be replayed by the next write`;
+    }
+    throw new GitPageWriteError(
+      'push_failed',
+      `push failed (${rollback}): ${redactGitError(e instanceof Error ? e.message : String(e))}`,
+    );
+  }
+}
+
 export async function gitFirstPageWrite(
   engine: BrainEngine,
   input: GitPageWriteInput,
@@ -297,47 +406,7 @@ export async function gitFirstPageWrite(
     }
     const releaseLock = () => lock.release();
     try {
-      if (isWorkingTreeDirty(repoPath)) {
-        throw new GitPageWriteError('repo_dirty', 'source checkout has uncommitted changes');
-      }
-      const branch = git(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD'], 10_000);
-      if (!branch || branch === 'HEAD') {
-        throw new GitPageWriteError('repo_unavailable', 'source checkout is on detached HEAD');
-      }
-      const pull = divergenceSafePull(repoPath, branch);
-      if (pull.status === 'skipped_dirty') {
-        throw new GitPageWriteError('repo_dirty', 'source checkout became dirty before pull');
-      }
-      if (pull.status === 'conflict_aborted') {
-        throw new GitPageWriteError('repo_conflict', pull.detail);
-      }
-
-      const head = git(repoPath, ['rev-parse', 'HEAD'], 10_000);
-
-      // ONE POLICY PER CLONE.
-      //
-      // `divergenceSafePull` rebases, so a stray local commit sitting in the
-      // checkout would be replayed and PUSHED by this write — publishing an
-      // operator's untidy commit to origin, unindexed and unreviewed. On a
-      // machine-managed source the sync loop's policy for that same commit is the
-      // opposite: quarantine it to a rescue ref and discard it. Whichever ran
-      // first would win, which is a coin toss deciding whether a stray commit
-      // becomes canonical wiki content.
-      //
-      // Refusing here leaves exactly one policy in force on a managed clone —
-      // sync's — and the next converge (within 5 minutes) clears the condition
-      // unattended, so this is a pause rather than a wedge.
-      if (await isManagedSource(engine, input.sourceId)) {
-        const ahead = git(repoPath, ['rev-list', '--count', `origin/${branch}..HEAD`], 10_000);
-        if (ahead !== '0') {
-          throw new GitPageWriteError(
-            'repo_conflict',
-            `machine-managed checkout is ${ahead} commit(s) ahead of origin/${branch}. ` +
-              `Writing now would rebase and push those commits. The sync loop quarantines ` +
-              `them instead; retry after the next convergence (within 5 minutes).`,
-          );
-        }
-      }
+      const { branch, head } = await prepareCheckout(engine, repoPath, input.sourceId);
 
       const filePath = join(repoPath, `${slug}.md`);
       if (!isWriteTargetContained(filePath, repoPath)) {
@@ -396,59 +465,107 @@ export async function gitFirstPageWrite(
       }
 
       const committedHead = git(repoPath, ['rev-parse', 'HEAD'], 10_000);
-      try {
-        git(repoPath, [
-          '-c', 'http.followRedirects=false',
-          'push', ...GIT_SSRF_SUBCOMMAND_FLAGS, 'origin', `HEAD:${branch}`,
-        ], 180_000);
-      } catch (e) {
-        // Roll the commit back. Leaving it behind was the pre-existing behaviour
-        // and it is worse than it looks: the checkout is left CLEAN but one commit
-        // ahead of origin — the exact divergent state this whole design exists to
-        // prevent — and because `divergenceSafePull` rebases, the NEXT successful
-        // write replays and pushes this commit. The caller was told its write
-        // failed and no index row was created, yet the content reaches
-        // `origin/main` later, unindexed and unattributed.
-        //
-        // Reset to the pre-write commit so a failed write leaves nothing at all.
-        // `--hard` is safe here and nowhere else: we are inside the repo lock, we
-        // verified the tree was clean before writing, and the only change since is
-        // the one file we just wrote.
-        // Did the push actually land? A remote can accept the ref and the client
-        // still see a network error on the response. Rolling back then would
-        // discard a commit that IS live on origin, and report a success as a
-        // failure. Ask the remote before touching anything.
-        let landed = false;
-        try {
-          const remoteRef = git(repoPath, [
-            '-c', 'http.followRedirects=false',
-            'ls-remote', 'origin', `refs/heads/${branch}`,
-          ], 30_000);
-          landed = remoteRef.startsWith(committedHead);
-        } catch {
-          landed = false;                      // cannot tell → treat as not landed
-        }
-        if (landed) {
-          return { ...base, head_after: committedHead, committed: true, pushed: true };
-        }
-
-        let rollback = 'rolled back';
-        try {
-          git(repoPath, ['reset', '--hard', head], 30_000);
-        } catch (resetErr) {
-          // Report the failure to roll back rather than hiding it — a mirror left
-          // ahead of origin is something an operator needs to know about.
-          rollback = `ROLLBACK FAILED (${redactGitError(resetErr instanceof Error ? resetErr.message : String(resetErr))}); commit ${committedHead.slice(0, 12)} is local-only and will be replayed by the next write`;
-        }
-        throw new GitPageWriteError(
-          'push_failed',
-          `push failed (${rollback}): ${redactGitError(e instanceof Error ? e.message : String(e))}`,
-        );
-      }
-
+      pushOrRollback(repoPath, branch, head, committedHead);
       return { ...base, head_after: committedHead, committed: true, pushed: true };
     } finally {
       releaseLock();
+    }
+  });
+}
+
+export interface GitPageDeleteInput {
+  sourceId: string;
+  slug: string;
+  /**
+   * Repo-relative path of the page's backing file when the index knows it
+   * (`pages.source_path`). Falls back to `<slug>.md`, which is where a
+   * git-first put_page writes.
+   */
+  relPath?: string | null;
+  commitMessage?: string;
+  actor: string;
+  protectedSlugs?: readonly string[];
+  authorIdentity?: GitIdentity;
+}
+
+export interface GitPageDeleteResult {
+  source_id: string;
+  slug: string;
+  path: string;
+  head_before: string;
+  head_after: string;
+  committed: true;
+  pushed: true;
+}
+
+/**
+ * Git-first page delete: `git rm` the page's file, commit and PUSH, before the
+ * caller tombstones the index row. Mirrors gitFirstPageWrite's invariant in the
+ * other direction — on a machine-managed source the index may never claim a
+ * page is gone while it is still in `origin`, or the next sync re-imports it.
+ *
+ * Throws `nothing_to_commit` when the file is already absent from the checkout:
+ * git already agrees the page is gone, so the caller may proceed to the index.
+ */
+export async function gitFirstPageDelete(
+  engine: BrainEngine,
+  input: GitPageDeleteInput,
+): Promise<GitPageDeleteResult> {
+  const slug = validateSlug(input.slug);
+  if (matchesSlug(slug, input.protectedSlugs ?? [])) {
+    throw new GitPageWriteError(
+      'protected_path',
+      `remote deletes are disabled for protected slug '${slug}'`,
+    );
+  }
+  const repoPath = await resolveRepoPath(engine, input.sourceId);
+  if (!existsSync(repoPath) || !statSync(repoPath).isDirectory() || !existsSync(join(repoPath, '.git'))) {
+    throw new GitPageWriteError('repo_unavailable', `not a git checkout: ${repoPath}`);
+  }
+  const rel = (input.relPath && input.relPath.trim()) || `${slug}.md`;
+
+  return serializeForRepo(repoPath, async () => {
+    const lock = await acquireRepoLock(repoPath, { timeoutMs: PAGE_WRITE_LOCK_WAIT_MS });
+    if (!lock) {
+      throw new GitPageWriteError('repo_dirty', 'another git operation is in progress on this checkout');
+    }
+    try {
+      const { branch, head } = await prepareCheckout(engine, repoPath, input.sourceId);
+
+      const filePath = join(repoPath, rel);
+      if (!isWriteTargetContained(filePath, repoPath)) {
+        throw new GitPageWriteError('invalid_content', 'resolved page path escapes source checkout');
+      }
+      if (!existsSync(filePath)) {
+        throw new GitPageWriteError('nothing_to_commit', `${rel} is not in the checkout`);
+      }
+
+      try {
+        git(repoPath, ['rm', '--quiet', '--', rel], 30_000);
+        git(
+          repoPath,
+          ['commit', '-m', commitMessage(input.commitMessage ?? `brain(delete_page): ${slug}`, input.actor, input.sourceId)],
+          60_000,
+          gitIdentityEnv(input.authorIdentity),
+        );
+      } catch (e) {
+        try { git(repoPath, ['reset', '--hard', head], 10_000); } catch { /* best effort */ }
+        throw new GitPageWriteError('commit_failed', redactGitError(e instanceof Error ? e.message : String(e)));
+      }
+
+      const committedHead = git(repoPath, ['rev-parse', 'HEAD'], 10_000);
+      pushOrRollback(repoPath, branch, head, committedHead);
+      return {
+        source_id: input.sourceId,
+        slug,
+        path: relative(repoPath, filePath),
+        head_before: head,
+        head_after: committedHead,
+        committed: true,
+        pushed: true,
+      };
+    } finally {
+      lock.release();
     }
   });
 }
