@@ -16,6 +16,9 @@ BEGIN;
 DROP INDEX IF EXISTS idx_links_source;
 DROP INDEX IF EXISTS idx_links_origin;
 ALTER TABLE links DROP CONSTRAINT IF EXISTS links_from_to_type_source_origin_unique;
+-- v129's links RLS policy reads origin_page_id, so the column can't drop while
+-- it exists. A pre-v0.13 brain never had the policy; walk-forward re-creates it.
+DROP POLICY IF EXISTS ks_source_isolation ON links;
 ALTER TABLE links DROP COLUMN IF EXISTS link_source;
 ALTER TABLE links DROP COLUMN IF EXISTS origin_page_id;
 
