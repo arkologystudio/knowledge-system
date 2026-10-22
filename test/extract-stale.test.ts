@@ -18,6 +18,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtract } from '../src/commands/extract.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../src/core/link-extraction.ts';
 import type { PageInput } from '../src/core/types.ts';
+import { __liveReporterCountForTest } from '../src/core/progress.ts';
 
 let engine: PGLiteEngine;
 
@@ -235,6 +236,7 @@ describe('gbrain extract --stale', () => {
     // NON-swallowing (no try/catch), so the throw must propagate AND no page in
     // the batch may be stamped (stamp runs only AFTER a successful flush).
     const origBatch = engine.addLinksBatch.bind(engine);
+    const liveBefore = __liveReporterCountForTest();
     let threw = false;
     (engine as unknown as { addLinksBatch: unknown }).addLinksBatch = async () => { throw new Error('__flush_boom__'); };
     try {
@@ -245,6 +247,9 @@ describe('gbrain extract --stale', () => {
       (engine as unknown as { addLinksBatch: unknown }).addLinksBatch = origBatch;
     }
     expect(threw).toBe(true);
+    // The aborted sweep must still release its progress reporter, or it leaks
+    // into every later file sharing this bun process.
+    expect(__liveReporterCountForTest()).toBe(liveBefore);
     // Pages whose edges were lost are NOT stamped fresh — they stay stale.
     expect(await stampOf('people/alice')).toBeNull();
     expect(await stampOf('companies/acme')).toBeNull();
