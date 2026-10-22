@@ -2,6 +2,26 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.30] - 2026-10-19
+
+### Fixed
+
+- **`extract --stale` always closes its progress phase.** When a batch write
+  failed mid-sweep, the error propagated (as intended, leaving the batch
+  unstamped) but the progress reporter stayed registered with the
+  process-level signal handler for the rest of the process. It is now
+  finished on every exit path. This was also what turned CI's test shard 5 red.
+- **Live workers are no longer hidden when the process time zone differs from
+  the system's.** The worker registry's PID-reuse check read a process's start
+  time as a zone-less local timestamp, so under a different `TZ` (for example
+  `bun test`, which runs in UTC) a live worker looked as if it had started
+  after it registered and was dropped from the list. The check now uses the
+  process's elapsed time, which carries no time zone.
+
+### To take advantage of v0.43.0.30
+
+No action needed.
+
 ## [0.43.0.29] - 2026-10-19
 
 ### Added

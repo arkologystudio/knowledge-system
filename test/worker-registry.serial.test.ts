@@ -43,6 +43,18 @@ describe('classifyLiveness (Codex #9)', () => {
   });
 });
 
+describe('parseEtimeMs (PID-reuse guard input)', () => {
+  test('parses every ps etime shape; rejects junk', async () => {
+    const { parseEtimeMs } = await reg();
+    expect(parseEtimeMs('00:07')).toBe(7_000);
+    expect(parseEtimeMs('  12:34\n')).toBe((12 * 60 + 34) * 1000);
+    expect(parseEtimeMs('01:02:03')).toBe((3600 + 120 + 3) * 1000);
+    expect(parseEtimeMs('38-12:40:04')).toBe((38 * 86400 + 12 * 3600 + 40 * 60 + 4) * 1000);
+    expect(parseEtimeMs('Mon Oct 19 11:44:17 2026')).toBeNull();
+    expect(parseEtimeMs('')).toBeNull();
+  });
+});
+
 describe('register + read round trip', () => {
   test('registerWorker writes under gbrainPath; readWorkers returns the live worker', async () => {
     const { registerWorker, readWorkers, workerRegistryDir } = await reg();
