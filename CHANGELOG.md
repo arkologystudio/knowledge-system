@@ -2,6 +2,21 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.43.0.30] - 2026-10-22
+
+### Fixed
+
+- **`extract --stale` releases its progress reporter when a batch fails.** A
+  failed link or timeline write still stops the sweep and leaves the batch
+  unstamped, as before, but the progress reporter is now always closed. In a
+  long-running process (`gbrain serve`, the autopilot worker) a failed sweep
+  previously left the reporter registered, so a later Ctrl-C or SIGTERM
+  printed an abort line for a phase that had already ended.
+
+### To take advantage of v0.43.0.30
+
+Nothing to do; upgrade as usual.
+
 ## [0.43.0.29] - 2026-10-19
 
 ### Added
